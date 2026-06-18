@@ -1,0 +1,29 @@
+# Model checkpoints (large binary training artifacts, regenerable via run_train.bat)
+biw_poc/src/model/checkpoints*/
+
+# Generated mesh/visualization outputs (large binary, regenerable via run_reconstruct.bat)
+*.ply
+
+# Generated STP/STEP data (kept locally; only the curated 15-file sample under
+# biw_poc/data/filled/ is tracked for repo-portability / reference)
+*.stp
+*.step
+!biw_poc/data/filled/*.stp
+
+# HDF5 training datasets (regenerable via run_midsurface_sampler.bat)
+*.h5
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs / scratch
+*.log
+
+# Claude Code local settings (machine-local, not project source)
+.claude/
+
+# OS
+Thumbs.db
+.DS_Store

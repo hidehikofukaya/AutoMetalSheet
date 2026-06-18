@@ -1,0 +1,136 @@
+# biw_poc Stage B/C model configuration
+# (CLAUDE.md section 13, Round 6, R7-01..R7-02)
+
+# Stage B: VecSet Autoencoder architecture
+vecset_ae:
+  token_dim:    384
+  n_tokens:     256    # FPS centers -> encoder tokens
+  k_neighbors:   32    # kNN group size per center (mini-PointNet input)
+  n_latents:    128    # learnable cross-attn queries -> latent code Z
+  enc_layers:     6    # self-attn encoder depth
+  dec_layers:     2    # cross-attn decoder depth
+  n_heads:        6
+  n_freqs:        8    # QueryDecoder Fourier positional encoding bands (R7-05)
+  # FPS/kNN: pure-PyTorch implementation, no pytorch3d/torch-cluster
+  # (neither is installed in this conda env -- verified at Stage B kickoff)
+  # R7-05: QueryDecoder Fourier-encodes query_xyz (NeRF-style sin/cos bands)
+  # before its positional MLP. A plain Linear(3,h) on raw xyz suffered
+  # coordinate-MLP spectral bias -- near-surface UDF MAE plateaued at an
+  # identical ~0.42-0.44mm across 3 independent training configs, matching
+  # the theoretical MAE of a model that ignores local position and predicts
+  # the near-band's median (~0.5mm). n_freqs=8 -> highest band 2^7*pi~400,
+  # matched to resolving ~1mm features at the R7-02 normalization scale.
+
+# Stage B: training
+train:
+  near_dist_mm:   2.0   # gt_udf below this counts as "near" for loss weighting
+  near_weight:    1.0
+  far_weight:     0.2
+  clip_dist_mm:   5.0   # truncated-distance clamp on pred/gt UDF before L1 (R7-03)
+  lambda_grad:    0.5   # weight of the gradient-direction cosine loss vs UDF L1
+  lr:             2.0e-4
+  n_query_sample: 8192  # queries subsampled per item per step (of ~10240 stored)
+  # R7-02: per-part coordinate normalization (center + isotropic rescale to
+  # ~[-1,1]) is applied unconditionally in dataset.py -- raw STEP coordinates
+  # are absolute BIW-assembly world-space mm, hundreds of mm from the
+  # origin, which starves small-weight-init MLPs (confirmed empirically: an
+  # un-normalized single-part overfit run did not converge at all).
+  # R7-03: clip_dist_mm truncates the UDF loss (DeepSDF/NDF-style). Raw
+  # far-field query targets run up to ~200mm; without clamping, a 1500-epoch
+  # single-part overfit run drove udf_l1 from 378mm->0.74mm while near_mae
+  # (the metric Stage C actually depends on) stayed stuck at ~0.42-0.44mm
+  # the whole run -- the network was spending its capacity fitting far-field
+  # magnitude instead of the zero level set. clip_dist_mm must be >=
+  # near_dist_mm so near-surface points are never affected by the clamp.
+
+# Stage C: reconstruction
+reconstruct:
+  grid_res:      96     # dense grid resolution in normalized [-1,1]^3 cube
+  band_factor:    3.0   # near-surface candidate count = band_factor * grid_res^2 (R7-06)
+  n_proj_iters:   5      # gradient-projection (Newton) iterations onto zero level set
+  nbr_sz:        20      # pyvista reconstruct_surface() neighborhood size
+  refine_rounds:  4      # R7-08/R7-13: subdivide-and-reproject density refinement rounds
+  conf_threshold: 0.0    # R7-10/R7-13: learned-confidence gate (0.0 = effectively disabled;
+                          # see R7-13 note below for why OOD suppression is delegated to the
+                          # deterministic input_dist/prune_dist gates instead)
+  input_dist_threshold_mm: 10.0   # R7-11/R7-13: kNN-distance-to-input-cloud OOD gate
+  prune_dist_threshold_mm: 20.0   # R7-12/R7-13: prune mesh vertices farther than this
+                                   # from the candidate cloud fed into reconstruct_surface()
+  # Marching cubes is NOT used: an unsigned field has no sign change to
+  # interpolate, so MC on raw UDF would extract a doubled/offset shell
+  # rather than the true zero level set (this is the documented reason a
+  # UDF -- not an SDF -- was chosen at all, see CLAUDE.md R6-01).
+  # R7-06: candidate selection is rank-based (smallest-UDF top_k), not an
+  # absolute distance threshold. R7-03's truncated-distance loss gives the
+  # network zero incentive to predict UDF values beyond clip_dist_mm, so a
+  # trained model's predicted UDF can plateau at a small, roughly uniform
+  # ceiling across the ENTIRE [-1,1]^3 grid -- an absolute band threshold
+  # against that ceiling misclassified 99.6% of the grid as "near surface"
+  # (confirmed empirically at grid_res=48), driving reconstruct_surface()'s
+  # runtime from seconds to hours. A 2-manifold mid-surface intersects
+  # O(grid_res^2) cells of a grid_res^3 grid regardless of UDF calibration,
+  # so target_k = band_factor * grid_res^2 bounds reconstruct_surface()'s
+  # input deterministically.
+  # Output "solid" is an OPEN double-shell (+-thickness/2 offset along the
+  # reconstructed mid-surface's vertex normals); boundary loops are NOT
+  # capped/stitched into a watertight solid (R6-05 scope: mesh-only, no
+  # parametric/watertight CAD output for this PoC).
+  # R7-08: refine_rounds applies 1-to-4 triangle subdivision to the coarse
+  # reconstruct_surface() mesh, snapping each new edge-midpoint onto the
+  # zero level set via gradient_project() -- NOT by feeding more points back
+  # into reconstruct_surface() (VTK's Hoppe algorithm scales worse than
+  # linearly: 5x points took 57x longer in testing, making that approach
+  # impractical past ~150k points). This fixes the *interior* density floor
+  # (gradient_project only corrects points perpendicular to the surface, so
+  # tangential/along-surface spacing stayed pinned to the coarse grid
+  # spacing, ~10mm at grid_res=96, without this refinement). It does NOT fix
+  # boundary-region extrapolation (see CLAUDE.md R7-08 note: Recon->GT stays
+  # ~55-75mm regardless of refine_rounds -- that is a separate, still-open
+  # root cause). Validated on body002 (single-part overfit): GT->Recon mean
+  # mm at refine_rounds=0/1/2/3 -> 7.20/3.64/2.08/1.34 (median: 7.22/3.37/
+  # 1.75/1.03), runtime 9.9s/10.7s/13.8s/25.6s. refine_rounds=3 meets the
+  # ~1-2mm interior-accuracy target with runtime still well under a minute.
+  #
+  # R7-13 (CLAUDE.md Round "holey mesh" investigation, 2026-06-18): the
+  # symptom "虫食い" (scattered small holes/missing coverage across the WHOLE
+  # part, not just at boundaries) was diagnosed with a new diagnostic tool
+  # (diagnose_holes.py) using TRUE point-to-surface distance (trimesh
+  # closest_point against a densely/evenly resampled GT surface) -- NOT
+  # naive vertex-to-vertex nearest-neighbor distance, which conflates real
+  # topological gaps with ordinary low-vertex-density triangulation
+  # interpolation and gives a misleadingly alarming reading. Root cause:
+  # refine_rounds (mesh density) is the DOMINANT lever for closing true
+  # coverage gaps, not solely R7-12's prune_dist_threshold_mm "any-bad-
+  # vertex-kills-triangle" rule (that rule IS a real, secondary contributor
+  # to the large-gap tail, confirmed by gap% shrinking monotonically as
+  # prune_dist_threshold_mm is loosened 12->20->disabled). Disabling pruning
+  # entirely is NOT viable: it reopens TD-16's original boundary ghost-
+  # overshoot problem at near-full severity (Recon->GT mean 27.28mm, max
+  # 188.07mm at prune=None). A joint (prune_dist_threshold_mm, refine_rounds)
+  # Pareto sweep on body002 identified prune=20mm + refine_rounds=4 as the
+  # accepted trade-off, approved by the user (2026-06-18, "採用する(推奨)"):
+  #   true gap>5mm:    5.3% -> 1.1%
+  #   gap mean:        1.43mm -> 0.89mm
+  #   overshoot mean:  8.94mm -> 9.53mm  (negligible regression)
+  #   overshoot max:   46.95mm -> 46.42mm (flat/slightly better)
+  #   mesh size cost:  ~200k -> ~1.23M vertices, ~382k -> ~2.43M triangles
+  # Residual (accepted, not yet zero): true gap>5mm is 1.1%, not 0% --
+  # tracked as an accepted residual limitation, not a new TD entry, since
+  # it is a large improvement over the pre-fix 5.3% and further gains would
+  # require disproportionate mesh-size growth (refine_rounds=5 is
+  # impractical: 3M+ vertices). See also diagnose_outliers.py (the
+  # complementary Recon->GT ghost-overshoot diagnostic, TD-16) vs.
+  # diagnose_holes.py (this GT->Recon coverage-gap diagnostic).
+  #
+  # R7-13 follow-up (defaults-consistency fix, 2026-06-18, user-approved
+  # "この不整合を修正する(推奨)"): reconstruct.py's main() CLI previously
+  # defaulted conf_threshold=0.5 and input_dist_threshold_mm=None(disabled),
+  # which diverged from EVERY validated R7-11/R7-12/R7-13 run (all of which
+  # used conf_threshold=0.0, input_dist_threshold_mm=10mm) -- those stale
+  # defaults were never actually exercised against the validated production
+  # pipeline. Fixed to conf_threshold=0.0 (Round 8's Deep Ensembles work
+  # found the learned confidence head's own calibration unreliable as a
+  # standalone OOD signal, so suppression is delegated to the deterministic
+  # input_dist/prune_dist gates instead) and input_dist_threshold_mm=10mm,
+  # matching the values this whole file's documented metrics were measured
+  # under.

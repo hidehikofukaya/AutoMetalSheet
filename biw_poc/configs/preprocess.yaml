@@ -1,0 +1,35 @@
+# biw_poc preprocess configuration
+
+paths:
+  mesh_generater_output: C:\Users\hide2\IdeaBox\Mesh_Generater\output
+  poc_data_root:         C:\Users\hide2\IdeaBox\AutoMetalSheet\biw_poc\data
+
+hole_filler:
+  jig_diam_mm:   5.0    # <= this: fill silently (jig/pilot holes)
+  bolt_diam_mm: 15.0    # <= this: fill + record in JSON (bolt/fastener)
+  # > bolt_diam_mm: keep as-is (lightening holes, design features)
+
+annotator:
+  tessellation_deflection_mm: 0.15   # triangle edge length limit for mesh
+  ray_cast_max_depth_mm:      20.0   # max ray depth for mid-surface projection
+  partner_search_radius_mm:    5.0   # warn if partner nearest point is farther
+
+# Stage A (CLAUDE.md section 13, Round 6, R6-01..R6-06)
+midsurface_sampler:
+  max_depth_factor:     3.0    # wall-face exclusion = thickness * this (R6-02)
+  n_points:            8192    # training input point cloud size
+  n_query_near:        8192    # near-surface UDF query points
+  n_query_far:          2048    # far (bbox-uniform) UDF query points
+  noise_std_mm:          0.2    # gaussian noise on input points
+  band_factor:           5.0    # near-query band = thickness * this
+  # GT UDF distance backend: trimesh.proximity (open3d not installed -- see CLAUDE.md sec.13)
+
+constraint_types:
+  - weld_spot
+  - bolt
+  - rivet
+  - glue
+
+# PoC part selection (10 parts: 2 easy, 3 medium, 3 hard, 2 stress)
+# Fill in part numbers after selecting from hierarchy.json survey
+poc_parts: []
