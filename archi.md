@@ -9,8 +9,8 @@ document_role: normative_ghmr_specification
 normative_scope: "§0〜§0I"
 decision_log: AGENTS.md
 historical_context_only: CLAUDE.md
-audit_input: archi_audit.md
-audit_status: "reviewed_with_additional_findings"
+audit_input: "archi_audit.md v3 (target commit 563b751)"
+audit_status: "reviewed_and_integrated_with_conditions"
 legacy_draft_scope: "§1〜§16; obsolete and excluded from implementation/RAG"
 ```
 
@@ -139,11 +139,27 @@ ADAPTIVE_BASELINE:
 | boundary edge | 2,140 | 17,745 |
 | 最小角 | 0.0358° | 0.0001° |
 | angle p1 | 3.02° | 1.47° |
-| aspect ratio p95 | 13.1 | 29.8 |
+| altitude aspect ratio p95 | 13.1 | 29.8 |
 
 これは旧profile・単一部品・manifest不在のlegacy evidenceであり、
 GHMRの正式baseline値ではない。ただし「一様細分化で被覆指標が改善しても、
 面積・境界・要素品質が悪化しうる」ことを独立に裏付ける。
+
+この表の`altitude aspect ratio`は、三角形ごとに
+
+```text
+l_max = 最長辺
+h_min = 2 * triangle_area / l_max
+altitude_aspect_ratio = l_max / h_min = l_max^2 / (2 * triangle_area)
+```
+
+で計算し、全要素を等重みとしたp95である。実装識別子を
+`triangle_altitude_aspect_ratio_v1`としてmanifestへ保存する。
+面積が`area_numeric_floor`以下の要素は比率を`+∞`として品質違反に数え、
+p95計算から黙って除外しない。percentileは線形補間なしのnearest-rank法とする。
+これはlegacy比較用のプロジェクト指標であり、ソルバー固有の品質定義を
+代替しない。2026-06-21に保存済みPLYへnearest-rank法で再適用し、
+coarse `13.12789`、refine3 `29.83010`を再現した。
 
 ### 0.4 実STP 15部品から測定したメッシュ規模
 
@@ -377,9 +393,30 @@ delta_local = [delta_t1, delta_t2, delta_n]
 ```
 
 法線符号は入力点群法線と整合させる。主方向が不安定な平坦・等方パッチでは、
-境界/feature方向を第1接線に使い、それもない場合は複数回転augmentationを行う。
-学習・評価にランダムSO(3)回転を入れ、回転後に戻した予測差を測る
-equivariance regression testを必須とする。
+境界/feature方向を第1接線に使う。それもない場合、`t1/t2`は一意ではなく、
+法線周りのSO(2)自由度を持つ「ゲージ」として扱う。単一の任意軸を正解として
+固定せず、複数回転augmentationと次の二系統の回帰試験を必須とする。
+
+```text
+global SO(3) equivariance:
+  パッチ全体をランダム回転
+  -> 局所フレーム再推定
+  -> 予測
+  -> world座標へ逆変換
+  -> 元予測との差を測定
+
+in-plane frame consistency:
+  安定した境界/feature方向を持たない平坦・等方パッチだけを対象
+  -> 法線nを固定
+  -> t1/t2を法線周りに複数角度で再サンプリング
+  -> 各予測をworld座標へ戻す
+  -> tangential/normal成分のばらつきを別々に測定
+```
+
+許容値は`global_equivariance_limit`と`in_plane_consistency_limit`として
+学習開始前にschema-validated profileへ固定する。未設定なら学習・評価を
+開始しない。試験不合格パッチは評価母数から除外せずR1 hard violationとして
+数え、運用推論では当該領域を`MANUAL_REVIEW`へ送る。
 
 頂点特徴:
 
@@ -724,17 +761,35 @@ all required gates pass and only soft target remains:
 ##### split選択
 
 候補辺`e`は単一の重み付きpriorityへ潰さず、辞書式tupleで比較する。
+連続値を生の浮動小数点で比較せず、評価器の数値分解能以上のtierへ量子化する。
 
 ```text
-rank(e) = (
-  kernel_eligible,
-  boundary_constraint_regression_zero,
-  expected_geometry_gain,
-  expected_cae_gain,
-  -predicted_vertex_cost,
-  -predicted_runtime
-)
+geometry_tier(e) = stable_tier(expected_geometry_gain, eps_geom, guard_geom)
+cae_tier(e)      = stable_tier(expected_cae_gain, eps_cae, guard_cae)
+vertex_cost_tier(e) = stable_tier(predicted_vertex_cost, eps_vertex_cost, guard_cost)
+runtime_tier(e)     = stable_tier(predicted_runtime, eps_runtime, guard_runtime)
+
+comparison order:
+  kernel_eligible                         descending
+  boundary_constraint_regression_zero     descending
+  geometry_tier(e)                        descending
+  cae_tier(e)                             descending
+  vertex_cost_tier(e)                     ascending
+  runtime_tier(e)                         ascending
+  canonical_operation_id                  ascending
 ```
+
+全`eps_*`と`guard_*`はschema-validated configで必須とする。`eps_*`は
+対応評価量の再現性試験で観測した数値変動幅より十分大きくし、
+`guard_*`はtier境界付近のヒステリシス帯とする。帯内では、同じ操作lineageに
+前回tierがあれば維持し、なければ改善量は保守的に低いtier、コストは高いtierへ
+丸める。モデル出力はranking前に規定decimalへ固定小数点化し、生floatを
+comparatorへ渡さない。
+
+`canonical_operation_id`は入力artifact hash、操作種別、永続lineage vertex ID
+から作り、一時的な配列indexを使わない。量子化後の値、境界帯判定、
+比較順、選択順位をAuditEventへ保存する。同一artifact/profileでtier列または
+選択hashが一致しなければR0 determinism gate不合格とする。
 
 ただし優先度が高くても、次を満たさない辺はsplitしない。
 
@@ -887,6 +942,29 @@ rollback後のhashが対象hashと一致しなければ`FAILED_NUMERICALLY`と�
 
 学習済みstop headは初期フェーズでは使用しない。停止は決定論的に行う。
 
+実行単位とPhase評価単位の状態名前空間を分離する。
+
+```text
+RefinementRunStatus:
+  RUNNING
+  PASS
+  PASS_WITH_WARNINGS
+  INFEASIBLE_MESH_BUDGET
+  INFEASIBLE_GEOMETRY
+  INSUFFICIENT_EVIDENCE
+  OUT_OF_DISTRIBUTION
+  STALLED_SAFE
+  OSCILLATION_DETECTED
+  MANUAL_REVIEW
+  FAILED_NUMERICALLY
+
+PhaseGateStatus:
+  TECHNICAL_GO
+  CONDITIONAL_GO
+  NO_GO
+  PHASE_INSUFFICIENT_VALIDATION_DATA
+```
+
 ```text
 RUNNING
   ├─ required gates pass + soft targets pass
@@ -903,6 +981,8 @@ RUNNING
   │    → STALLED_SAFE
   ├─ split/collapse or metric cycle detected
   │    → OSCILLATION_DETECTED
+  ├─ policy requires human confirmation before commit
+  │    → MANUAL_REVIEW
   └─ numeric error or rollback integrity failure
        → FAILED_NUMERICALLY
 ```
@@ -950,6 +1030,9 @@ OUT_OF_DISTRIBUTION:
 
 FAILED_NUMERICALLY:
   数値例外、非有限値、またはrollback整合性検査失敗
+
+MANUAL_REVIEW:
+  自動判定ではcommitできず、人間の承認・修正・棄却が必要
 ```
 
 停止パラメータのPoC初期値:
@@ -1045,6 +1128,8 @@ units: mm
 * disconnected component
 
 `Jacobian`、`warpage`、`skewness`を一般名だけで扱わない。要素型ごとの定義と閾値を`solver_profile.yaml`へ固定する。クアッド要素のwarpageやJacobianは、クアッド生成フェーズで別途導入する。
+以下の汎用gateでいう`aspect ratio`は
+`triangle_altitude_aspect_ratio_v1 = l_max²/(2A)`を指す。
 
 研究PoCのmesh quality gate初期値:
 
@@ -1254,8 +1339,10 @@ Go条件:
   inverted/invalid triangles: 増加ゼロ
   surface area inflation: 5%以内
   same budget: target 250k vertices / 60秒
-  every held-out part: new hard violation = 0
-  paired-bootstrap 95% CI of primary improvement excludes 0
+  every out-of-fold part: new hard violation = 0
+  family-cluster paired-bootstrap 95% CI of primary improvement excludes 0
+  global SO(3) equivariance p95 <= profile.global_equivariance_limit
+  in-plane frame consistency p95 <= profile.in_plane_consistency_limit
 ```
 
 ### Phase R2: Hierarchical Context
@@ -1289,10 +1376,10 @@ Go条件:
 ```text
 S3 adaptive sizing:
   same p95 CAD error as S0 or better
-  vertex count <= 0.5 * S0
+  vertex count ratio vs S0 <= threshold(THR-R3-VERTEX-REDUCTION-001)
   split-collapse oscillation rate <= 1% of operated edges
   budget-exhausted rate reported by family
-  new hard violation = 0 on every held-out part
+  new hard violation = 0 on every out-of-fold part
 ```
 
 ### Phase R4: Limited Topology Repair
@@ -1320,7 +1407,8 @@ Go条件:
 ```text
 solver pre-check error = 0
 reference mesh convergence:
-  displacement/reaction/eigenvalue difference <= 5%
+  displacement/reaction/eigenvalue difference
+    <= threshold(THR-R5-MESH-CONVERGENCE-001)
 stress/strain-energy criteria:
   solver profile defines threshold before execution
 ```
@@ -1369,6 +1457,9 @@ report:
 `input/GT`のような混在表記は禁止し、CAD_GT、input_evidence、field_evidenceを
 別指標として報告する。
 `evaluator_numeric_tolerance`は実行前にprofileへ固定し、結果を見て変更しない。
+三角形の汎用比較では`triangle_altitude_aspect_ratio_v1`を用いる。
+別定義を使うソルバーprofileは、関数名・式・単位・実装versionを明示し、
+同じ`aspect ratio`名で異なる式を混在させない。
 
 面積比だけでは局所膨張と欠損が相殺されるため、局所面積Jacobian、
 向き反転面積、自己重複を独立ゲートとする。
@@ -1397,15 +1488,47 @@ AI方式はB1/B2を次の統計契約で超えた場合のみ採用する。
 
 ```text
 comparison unit: part（seedではない）
-primary analysis: paired bootstrap 95% CI
+primary analysis: part-family cluster paired bootstrap 95% CI
 aggregation: part-family macro average + worst-family result
 budget: same vertex and wall-time budget
-hard condition: every held-out part has zero new hard violation
+hard condition: every out-of-fold part has zero new hard violation
 ```
 
 PoCの6部品程度の評価はsmoke testであり、一般化Go判定には使わない。
-R1 technical Goには最低5 held-out parts・3 part familiesを要求し、
-サンプル不足時は`INSUFFICIENT_VALIDATION_DATA`として次Phaseへ進まない。
+既存15部品を固定train/test分割で消費せず、`source_part_id`とpart familyを
+group keyとした外側cross-validationを使う。原CADから作った全劣化variant、
+mesh variant、seed違いは必ず同じfoldへ置き、データ漏洩を禁止する。
+
+```text
+outer evaluation:
+  preferred = leave-one-part-family-out
+  fallback = grouped K-fold（各test foldが未見source_part_idのみ）
+
+inner model selection:
+  outer-train内だけでfamily-aware grouped validation
+  hyperparameter selection, threshold calibration, early stoppingを完結
+  outer-testのmetric/labelをモデル選択に使用禁止
+
+technical Go minimum:
+  out-of-fold paired results >= max(8 parts, ceil(0.5 * eligible_parts))
+  represented part families >= 3
+  every evaluated part has zero new hard violation
+  family-cluster paired-bootstrap 95% CI of primary improvement excludes 0
+  a-priori power analysis meets required sample size
+```
+
+既存15部品は可能な限り全てout-of-fold評価し、最低8部品だけを選んで
+有利な結果を作らない。最小検出対象差、想定分散、有意水準、検出力を
+実験前に登録し、power analysisが要求する部品数を満たせない場合は
+`PhaseGateStatus.PHASE_INSUFFICIENT_VALIDATION_DATA`として次Phaseへ進まない。
+この内部cross-validationはR1 technical Go用であり、外部一般化や生産Goには
+別時点で取得したprospective shadow setを要求する。
+
+`eligible_parts`はモデル結果を見る前に、読込可能性、GroundTruthMeshContract、
+必須属性の充足だけで事前登録する。除外理由と対象hashを凍結し、評価処理失敗や
+予測失敗を事後除外しない。power analysisの分散推定にはR0/pilotだけを使い、
+最終out-of-fold結果を見て必要標本数を下げない。power analysisは最終解析と
+同じfamily-cluster単位、事前登録した最小検出差、片側/両側、有意水準、検出力を使う。
 
 サイズ制御の比較条件:
 
@@ -1417,6 +1540,39 @@ S3: 曲率 + feature + solver + budget sizing field
 ```
 
 S3はS0より少ない頂点数で同等以上のp95幾何誤差を達成することをGo条件とする。
+
+### 0E.3 数値閾値の来歴管理
+
+Phase Go/No-Go、SafetyKernel、評価器で使う数値閾値は、名前のない
+magic numberとして実装しない。次の記録をthreshold registryへ必須化する。
+
+```text
+ThresholdRecord:
+  threshold_id
+  value
+  unit
+  metric_definition_id
+  scope
+  basis: measured | literature | solver_documentation | policy | provisional
+  source_reference
+  calibrated_on_dataset
+  effective_config_version
+  owner
+  approved_by
+  reconsideration_condition
+```
+
+`basis=provisional`の閾値は実験開始値であり、正式Go条件として凍結する前に
+再校正と承認を要する。本文のGo条件は`threshold_id`だけを参照し、実行時の値は
+run manifestに固定したversion付きthreshold registry snapshotから解決する。
+本文・コード・solver profileへの値の重複記載を禁止する。
+
+初期registryには次を暫定値として登録するが、これらは規範本文の固定値ではない。
+
+| threshold_id | 初期値 | basis | 再校正条件 |
+|---|---:|---|---|
+| THR-R3-VERTEX-REDUCTION-001 | 0.50 ratio vs S0 | provisional internal PoC efficiency target | R0 Pareto curve取得後、R3実験計画凍結前 |
+| THR-R5-MESH-CONVERGENCE-001 | 5% | provisional engineering screening value; solver保証値ではない | solver/element/analysis profileごとの収束試験後、R5実行前 |
 
 ---
 
@@ -1435,7 +1591,7 @@ S3はS0より少ない頂点数で同等以上のp95幾何誤差を達成する�
 | 平滑化でビード/曲げ線が消える | 高 | feature flags、曲率適応、接線/法線分離、局所freeze |
 | 開境界を穴として閉じる | 高 | boundary semantic classifier成立前は自動穴修復禁止 |
 | CAE品質改善で幾何から離れる | 中 | 辞書式制約、normal/tangent分離、幾何budget |
-| 合成欠損と実欠損の分布差 | 中 | part-family holdout、実データshadow評価 |
+| 合成欠損と実欠損の分布差 | 中 | part-family grouped outer CV、実データshadow評価 |
 | 拘束点2点で形状が一意に決まるという誤解 | 高 | 拘束点数を固定要件にせず、可観測性スコアを導入 |
 
 ### 拘束点数について
@@ -1603,7 +1759,7 @@ YAML、CLI、Python関数のデフォルトを重複定義しない。
 すべての実行入口は`ReconstructionProfile`を必須引数とし、
 CLI/API内の独立したデフォルト値を禁止する。設定欠落時は実行拒否する。
 
-### 0I.6 Claude監査への対応判断
+### 0I.6 Claude監査第2版への対応判断
 
 `archi_audit.md`第2版を入力として再監査した結果:
 
@@ -1648,6 +1804,25 @@ approval_status
 
 今回の`archi_audit.md`第2版はtarget commit/hashを持たないため、
 有用なレビュー入力ではあるが、正式な承認済み監査証跡とは扱わない。
+
+### 0I.7 Claude監査第3版への対応判断
+
+`archi_audit.md`第3版（対象commit `563b751`）の追加指摘を次の通り反映する。
+
+| 監査指摘 | 判断 | 反映 |
+|---|---|---|
+| legacy aspect ratioを再現できない | 採用 | `triangle_altitude_aspect_ratio_v1 = l_max²/(2A)`、要素等重みp95、実装IDを明記 |
+| SO(3)試験だけでは局所`t1/t2`曖昧性を検出できない | 採用 | global SO(3)とin-plane SO(2) consistencyの二系統へ分離し、R1 gateへ追加 |
+| `rank(e)`の連続値比較が数値ノイズに弱い | 採用 | `eps_geom/eps_cae`によるtier量子化とcanonical tie-breakを追加 |
+| held-out 5部品では統計的に弱い | 設計変更して採用 | 固定8部品holdoutではなくpart-family外側CV、最低8 out-of-fold部品・3 family、事前power analysisを採用 |
+| `INSUFFICIENT_VALIDATION_DATA`の状態名前空間が曖昧 | 採用 | `RefinementRunStatus`と`PhaseGateStatus`を分離し、`PHASE_INSUFFICIENT_VALIDATION_DATA`へ改名 |
+| R3/R5数値条件の根拠不足 | 採用 | `ThresholdRecord`を必須化し、50%・5%を暫定PoC閾値として再校正条件付きで登録 |
+
+第3版はtarget git commitを持つため第2版より追跡性が高い。ただし
+`target_sha256`がなく、reviewerとapprovalが未確定であるため、引き続き
+有用なレビュー入力であって正式な承認済み監査証跡ではない。
+本統合時点の監査入力ファイルSHA-256は
+`BD810778BDBF658532AAA77322CBF29166DBAEC9448CD586B667C098996F4B5D`である。
 
 ---
 

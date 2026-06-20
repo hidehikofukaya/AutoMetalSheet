@@ -1165,6 +1165,13 @@ body002_r711r712_stage_refine3_midsurface.ply
 この値はmanifest不在・単一部品のlegacy evidenceであり、正式baselineではない。
 一様細分化が被覆改善と同時に面積・境界・要素品質を悪化させうる根拠として使う。
 
+ここでのaspect ratioは
+`triangle_altitude_aspect_ratio_v1 = longest_edge / minimum_altitude
+= longest_edge² / (2 * triangle_area)`であり、全三角形を等重みとしたp95。
+ソルバー固有定義ではなくlegacy比較用のプロジェクト指標である。
+2026-06-21に保存済みPLYへnearest-rank法で同式を再適用し、
+coarse `13.12789`、refine3 `29.83010`を再現した。
+
 ### 監査で採用した先行研究の位置づけ
 
 - Neural Subdivision: LocalMeshRefinerに直接近い構造的根拠
@@ -1180,3 +1187,64 @@ R0の実装着手は可能。ただし最初に以下を実装する。
 3. fail-closed evidence gate
 4. 状態機械とAuditEvent
 5. SafetyKernel故障注入・rollback整合試験
+
+---
+
+## 21. archi_audit.md 第3版への統合レビュー（Round 14）
+
+### 記録日: 2026-06-21
+
+### 監査評価
+
+第3版はcommit `563b751`を対象としており、第2版より追跡性が向上した。
+追加6論点はいずれも設計の再現性・決定性・検証妥当性を改善するため採用する。
+ただし、8部品を固定holdoutにすると既存15部品の学習データが7部品まで減るため、
+部品ファミリ単位の外側cross-validationへ置き換えて採用する。
+
+### 確定判断
+
+| 判断ID | 内容 |
+|---|---|
+| R14-01 | legacy表のaspect ratioを`triangle_altitude_aspect_ratio_v1 = l_max²/(2A)`、三角形等重みp95として定義し、実装IDをmanifestに保存する。 |
+| R14-02 | LocalMeshRefinerの回転試験をglobal SO(3) equivarianceと、平坦・等方パッチに対するin-plane SO(2) frame consistencyへ分離する。両方をR1 technical Go条件に含める。 |
+| R14-03 | `rank(e)`の予測改善量は`eps_geom/eps_cae`でtier量子化し、最後はcanonical operation IDで全順序を確定する。生floatの微小差でトポロジーを変えない。 |
+| R14-04 | R1評価は`source_part_id`・part family単位の外側cross-validationとする。最低out-of-fold 8部品またはeligible部品の50%の大きい方、3 family、事前power analysisを要求する。 |
+| R14-05 | `RefinementRunStatus`と`PhaseGateStatus`を別型とし、標本不足は`PhaseGateStatus.PHASE_INSUFFICIENT_VALIDATION_DATA`で表す。 |
+| R14-06 | 数値閾値は`ThresholdRecord`で来歴、根拠、データ、版、承認者、再検討条件を管理する。R3の50%とR5の5%は暫定PoC値であり、保証値として扱わない。 |
+| R14-07 | 第3版監査はtarget commitを持つがtarget SHA-256と承認済みreviewerを欠くため、正式承認証跡ではなくレビュー入力として保持する。 |
+| R14-08 | `eligible_parts`はモデル結果を見る前にデータ契約だけで固定し、評価・予測失敗を事後除外しない。power analysisはR0/pilot分散で事前登録する。 |
+| R14-09 | outer evaluationの内側にfamily-aware grouped validationを設け、hyperparameter・閾値・early stoppingをouter-testから隔離する。 |
+| R14-10 | CIとpower analysisはpart単純独立ではなくfamily-cluster単位で実施し、family内相関を反映する。 |
+| R14-11 | rankingの全連続値を固定小数点tier化し、境界guard band、永続lineage ID、正式な比較方向を定義する。 |
+| R14-12 | Go条件はthreshold IDのみを参照し、値はmanifest固定のversion付きregistry snapshotを単一正本とする。 |
+
+監査入力`archi_audit.md`の統合時SHA-256:
+`BD810778BDBF658532AAA77322CBF29166DBAEC9448CD586B667C098996F4B5D`
+
+### R1統計契約
+
+```text
+outer validation:
+  preferred = leave-one-part-family-out
+  fallback = grouped K-fold
+  group leakage = prohibited across source CAD variants
+
+inner model selection:
+  family-aware grouped validation inside outer-train only
+  outer-test use for tuning = prohibited
+
+minimum analyzable out-of-fold results:
+  parts >= max(8, ceil(0.5 * eligible_parts))
+  part families >= 3
+
+technical Go:
+  zero new hard violation on every evaluated part
+  family-cluster paired-bootstrap 95% CI excludes zero
+  matching family-cluster a-priori power analysis requirement is met
+
+otherwise:
+  PhaseGateStatus.PHASE_INSUFFICIENT_VALIDATION_DATA
+```
+
+既存15部品は可能な限り全てout-of-fold評価へ回す。R1 technical Goは内部妥当性の
+判定であり、外部一般化・生産Goには将来取得するprospective shadow setを別途要求する。
