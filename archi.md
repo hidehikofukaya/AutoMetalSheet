@@ -1,8 +1,29 @@
 # 拘束点条件付き再帰型UDFメッシュ生成アーキテクチャ
 
-> 初版素案: 2026-06-20  
-> 実現可能性レビュー・改訂: 2026-06-20  
+> 初版素案: 2026-06-20
+> 実現可能性レビュー・改訂: 2026-06-20
 > 対応する既存判断: `CLAUDE.md` §13〜§17（R6-01〜R7-13、R9-01）
+
+```yaml
+document_role: normative_ghmr_specification
+normative_scope: "§0〜§0I"
+decision_log: AGENTS.md
+historical_context_only: CLAUDE.md
+audit_input: archi_audit.md
+audit_status: "reviewed_with_additional_findings"
+legacy_draft_scope: "§1〜§16; obsolete and excluded from implementation/RAG"
+```
+
+文書の優先順位:
+
+1. 本書§0〜§0I: GHMRの現行規範仕様
+2. `AGENTS.md`: 採用判断・変更履歴
+3. `archi_audit.md`: 特定時点の監査入力。規範仕様を上書きしない
+4. `CLAUDE.md`: 過去の調査・実験履歴。規範参照禁止
+
+監査で安全機構が確認されても、「安全性が担保済み」とは表現しない。
+検査網羅性、故障注入、原子的rollback試験を通過するまでは
+「安全機構が設計されている」に留める。
 
 ## 0. 結論
 
@@ -57,6 +78,72 @@
 * 入力点群距離ゲートと候補点群距離ゲートは、ゴースト抑制に実際に有効だった。
 * `refine_rounds=4`は被覆穴を減らす一方、約123万頂点・243万三角形まで膨張する。したがって全頂点Transformerは現実的でない。
 * 点間最近傍距離だけでは、しわ、反転、重複面、面積膨張を検出できない。point-to-surfaceと面品質の両方が必要である。
+* R7-14のbody002実測では、面積比が`refine_rounds=0/1/2/3/4`で
+  `0.97/1.51/1.98/3.26/6.96`倍へ増加し、`refine_rounds=3`で最近傍GT面法線と
+  逆向きの三角形が面積ベース約49%、粗メッシュが38非連結成分になった。
+  したがって点距離改善だけでは細分化を正当化できない。
+* R7-15の接線Laplacian平滑化は実験コードとして存在するが、
+  `process()`/CLIから`smooth_iters`の設定は渡されず、現行通常経路では
+  `smooth_iters=0`で無効である。また再投影が再び独立Newton更新になるため、
+  採用済みの根治策とは扱わない。
+
+### 0.3.1 現行Stage C設定の位置づけ
+
+コード上には「唯一の本番デフォルト」は存在しない。
+
+| 入口 | refine | smooth | confidence | input gate | prune |
+|---|---:|---:|---:|---:|---:|
+| `reconstruct.py` CLI | 4 | 0（CLI露出なし） | 0.0 | 10mm | 20mm |
+| `process()` Python API | 0 | 0 | 0.5 | disabled | disabled |
+| `configs/model.yaml` | 4 | 設定なし | 0.0 | 10mm | 20mm |
+
+さらに現行コードは`configs/model.yaml`を実行時に読み込まない。
+したがってCLI値、Python関数デフォルト、YAML記述を「本番設定」と総称しない。
+GHMR Phase R0では、完全な設定を明示した次の比較profileとして固定する。
+
+```text
+LEGACY_R713:
+  grid_res=96
+  band_factor=3
+  n_proj_iters=5
+  nbr_sz=20
+  refine_rounds=4
+  smooth_iters=0
+  conf_threshold=0
+  input_dist_threshold_mm=10
+  prune_dist_threshold_mm=20
+
+COARSE_GATED:
+  LEGACY_R713と同一、ただしrefine_rounds=0
+
+ADAPTIVE_BASELINE:
+  COARSE_GATED出力
+  + SizingAndBudgetController
+  + deterministic adaptive remesher
+```
+
+`LEGACY_R713`は既知欠陥を持つ比較用profileであり、合格済み基準ではない。
+`COARSE_GATED`と`ADAPTIVE_BASELINE`の面積比、反転面積率、component数、
+双方向point-to-surface誤差を各対象部品で実測してから、R1の基準を確定する。
+
+保存済み旧R7-11/R7-12出力（`refine_rounds=3`,
+`input_dist=10mm`, `prune_dist=12mm`）を2026-06-20に再計測した参考値:
+
+| 指標 | coarse | refine3 |
+|---|---:|---:|
+| 頂点 / 三角形 | 4,080 / 6,300 | 208,881 / 400,363 |
+| 面積 | 344,634mm² | 950,094mm² |
+| coarse比 | 1.00 | 2.76 |
+| vertex-connected component | 29 | 31 |
+| face-connected component | 41 | 46 |
+| boundary edge | 2,140 | 17,745 |
+| 最小角 | 0.0358° | 0.0001° |
+| angle p1 | 3.02° | 1.47° |
+| aspect ratio p95 | 13.1 | 29.8 |
+
+これは旧profile・単一部品・manifest不在のlegacy evidenceであり、
+GHMRの正式baseline値ではない。ただし「一様細分化で被覆指標が改善しても、
+面積・境界・要素品質が悪化しうる」ことを独立に裏付ける。
 
 ### 0.4 実STP 15部品から測定したメッシュ規模
 
@@ -160,11 +247,14 @@ flowchart TD
     J --> L["Error/Quality Estimator"]
     P["Sizing & Budget Controller<br/>h_target(x) / vertex budget"] --> L
     L -->|local resolution insufficient<br/>and budget available| M["Deterministic Remesher<br/>split/collapse/flip"]
-    L -->|sufficient| N["Stop Gate"]
-    L -->|budget exhausted| Q["PASS_WITH_WARNINGS<br/>or MANUAL_REVIEW"]
+    L --> N["Terminal Decision Gate"]
+    N -->|all required gates pass| O["PASS / PASS_WITH_WARNINGS"]
+    N -->|budget exhausted + required violation| Q["INFEASIBLE_MESH_BUDGET"]
+    N -->|evidence unavailable / OOD| R["INSUFFICIENT_EVIDENCE<br/>or OUT_OF_DISTRIBUTION"]
+    N -->|safe improvement unavailable| S["STALLED_SAFE"]
     M --> F
     K --> F
-    N --> O["CAE Mesh Export + Audit Report"]
+    O --> T["CAE Mesh Candidate Export + Audit Report"]
 ```
 
 ### 0A.3 コンポーネント境界
@@ -202,6 +292,54 @@ IndependentEvidence:
 
 現行R7-11/R7-12の成功を一般化した層であり、GHMRの安全性の中心になる。
 
+証拠ゲートは**fail-closed**とする。必要数の候補点がゲートを通らない場合、
+未ゲート空間へフォールバックしてはならない。
+
+```text
+if supported_candidate_count < minimum_required:
+  stop_status = INSUFFICIENT_EVIDENCE
+  output = no committed mesh
+
+minimum_required =
+  max(
+    2 * reconstruction_neighborhood_size,
+    0.25 * target_candidate_count
+  )
+```
+
+現行`reconstruct.py`の「候補不足時に全グリッドへ戻す」挙動は、
+LEGACY比較profileにのみ残る既知の危険挙動であり、GHMRへ継承しない。
+
+#### B2. NoveltyAndSupportGate
+
+未知トポロジーや訓練分布外形状に対し、局所SafetyKernelだけでは
+「局所的に妥当だが大域的に誤った修正」を検出できないため、
+ラウンド開始前とcommit前にsupport判定を行う。
+
+```text
+NoveltyEvidence:
+  topology signature:
+    component count, boundary-loop count, genus proxy
+  geometry distribution:
+    bbox aspect, area, curvature histogram, edge-length histogram
+  observation support:
+    input density, largest unsupported geodesic radius
+  model/evidence disagreement:
+    UDF vs input cloud vs candidate cloud
+  optional learned embedding distance:
+    kNN/Mahalanobis distance to train-part-family
+```
+
+学習embedding距離単独では安全判定しない。決定論的support不足または
+複数証拠の不一致が校正済み閾値を超えた場合は、次へ遷移する。
+
+```text
+OUT_OF_DISTRIBUTION
+MANUAL_REVIEW
+```
+
+閾値はtrain setではなくpart-family holdoutで校正し、risk-coverage曲線を保存する。
+
 #### C. MeshPatchBuilder
 
 全メッシュを、1パッチあたり概ね2,000〜8,000頂点の重なり付き局所グラフへ分割する。
@@ -209,14 +347,39 @@ IndependentEvidence:
 * パッチ中心: 曲率、品質違反、境界、拘束点、UDF残差の高い領域を優先
 * halo: 2〜3 ringを付与
 * 境界頂点: パッチ間で共有IDを保持
-* 予測統合: halo内は距離重み付き平均、拘束点は平均しない
+* 予測統合: 全パッチ予測を集約後、共有頂点を1回だけ更新する。halo内は距離重み付き平均、拘束点は平均しない
 * 大域情報: 部品全体の低解像度トークン64〜256個だけを各パッチへ条件付け
 
 これにより計算量を全頂点数に対して概ね線形に保つ。
 
+継ぎ目は変位不連続だけでなく、法線・曲率・辺長比を検査する。
+R2の継ぎ目ゲートに失敗した場合は、次の順序でフォールバックする。
+
+1. haloを1 ring拡大して再推論
+2. パッチ中心をずらして再分割
+3. 共有頂点近傍だけ決定論的接線平滑化
+4. それでも不合格なら当該領域をfreezeし`MANUAL_REVIEW`
+
+フォールバック後も全体SafetyKernelを再実行し、局所合格だけでcommitしない。
+
 #### D. LocalMeshRefiner
 
 初期実装はMesh Transformerではなく、辺ベースMessage Passing GNNとする。
+
+各パッチはワールド座標を直接入力しない。ロバスト推定したパッチ法線`n`と
+接線基底`t1, t2`から右手系局所フレームを作り、位置・相対位置・出力変位を
+このフレームで表現する。
+
+```text
+R_patch = [t1, t2, n]
+x_local = R_patch^T (x_world - patch_center)
+delta_local = [delta_t1, delta_t2, delta_n]
+```
+
+法線符号は入力点群法線と整合させる。主方向が不安定な平坦・等方パッチでは、
+境界/feature方向を第1接線に使い、それもない場合は複数回転augmentationを行う。
+学習・評価にランダムSO(3)回転を入れ、回転後に戻した予測差を測る
+equivariance regression testを必須とする。
 
 頂点特徴:
 
@@ -257,11 +420,24 @@ feature-edge flag
 ```text
 delta_tangent[2]
 delta_normal[1]
-step_confidence
 optional_remesh_priority
 ```
 
 法線・接線成分を分離する。法線方向は幾何整合、接線方向は要素品質改善を主目的とし、役割を混同しない。
+
+初期Phaseでは`step_confidence`を出力しない。将来追加する場合も、
+line-searchの初期ステップ幅と再処理優先度にのみ使用し、SafetyKernelの
+accept/rejectやPASS判定には使用しない。
+
+予測変位は局所サイズで制限する。
+
+```text
+|delta_tangent| <= 0.25 * h_target
+|delta_normal|  <= 0.25 * h_target
+```
+
+初期モデルは絶対変位を一から学習せず、決定論的Taubin/Laplacian更新に対する
+残差を学習する。これによりR1の比較対象と学習対象を一致させる。
 
 #### E. DeterministicSafetyKernel
 
@@ -532,25 +708,32 @@ h_budget ≈ sqrt(A / (0.866 * V_max))
 ```
 
 局所サイズ要求から推定した必要頂点数が予算を超える場合、黙って粗くせず、
-次のいずれかへ遷移する。
+次の条件分岐で遷移する。
 
 ```text
-INFEASIBLE_MESH_BUDGET
-PASS_WITH_WARNINGS
-MANUAL_REVIEW
+required geometry/quality violation remains:
+  -> INFEASIBLE_MESH_BUDGET
+
+required evidence is unavailable:
+  -> INSUFFICIENT_EVIDENCE
+
+all required gates pass and only soft target remains:
+  -> PASS_WITH_WARNINGS
 ```
 
 ##### split選択
 
-候補辺`e`の優先度:
+候補辺`e`は単一の重み付きpriorityへ潰さず、辞書式tupleで比較する。
 
 ```text
-priority(e) =
-  w_error   * normalized_local_error
-  + w_size  * max(0, length(e)/h_target(e) - 1)
-  + w_feat  * feature_importance
-  + w_cae   * quality_gain_estimate
-  - w_cost  * predicted_vertex_cost
+rank(e) = (
+  kernel_eligible,
+  boundary_constraint_regression_zero,
+  expected_geometry_gain,
+  expected_cae_gain,
+  -predicted_vertex_cost,
+  -predicted_runtime
+)
 ```
 
 ただし優先度が高くても、次を満たさない辺はsplitしない。
@@ -576,7 +759,7 @@ e_chord = |m_projected - m|
 split候補条件:
 
 ```text
-length(e) > 1.4 * h_target(e)
+length(e) > split_ratio * h_target(e)
 or e_chord > chord_tolerance
 or local_bidirectional_error > hausdorff_tolerance
 ```
@@ -625,7 +808,7 @@ split上限とcollapse正規化は必ず同時導入する。
 collapse追加条件:
 
 ```text
-length(e) < 0.6 * h_target(e)
+length(e) < collapse_ratio * h_target(e)
 e_chord < 0.4 * chord_tolerance
 local_bidirectional_error < 0.5 * hausdorff_tolerance
 post-collapse minimum angle >= 20 deg
@@ -633,6 +816,9 @@ post-collapse minimum angle >= 20 deg
 
 splitされた辺とその1-ringは2 sweepの間collapse禁止とする。
 `h_target`はround間で急変させず、EMA `alpha=0.25`で更新する。
+
+初期値は`split_ratio=4/3`、`collapse_ratio=4/5`へ統一する。
+最終値は`(1.25,0.80) / (1.33,0.80) / (1.40,0.70)`の感度試験で決める。
 
 ### 0A.4 状態モデル
 
@@ -660,37 +846,82 @@ RefinementRun:
   budget_before
   budget_after
   split_rejection_reasons
+  current_state
+  state_version
+  terminal_reason_codes[]
 ```
 
 メッシュ本体を毎回DBへ入れる必要はない。内容ハッシュ付きartifactとして保存し、イベントから参照する。
 
-### 0A.5 停止判定
+状態遷移とcommit/rollbackは追記専用イベントとして記録する。
+
+```text
+AuditEvent:
+  event_id
+  run_id
+  sequence_no
+  timestamp_utc
+  actor_type
+  actor_id
+  state_before
+  state_after
+  trigger
+  rule_ids[]
+  parent_mesh_hash
+  candidate_mesh_hash
+  committed_mesh_hash
+  rollback_target_hash
+  rollback_result_hash
+  decision
+  reason_codes[]
+  approval_record_id
+  schema_version
+  previous_event_hash
+```
+
+`sequence_no`と`previous_event_hash`で欠落・並べ替えを検出する。
+rollback後のhashが対象hashと一致しなければ`FAILED_NUMERICALLY`とし、
+そのrunの成果物を下流へ渡さない。
+
+### 0A.5 状態機械と停止判定
 
 学習済みstop headは初期フェーズでは使用しない。停止は決定論的に行う。
 
 ```text
-stop if any:
-  round >= max_rounds
-  improvement below epsilon for 2 rounds
-  all patches satisfy geometry + topology + quality gates
-  unsafe patch ratio exceeds threshold -> MANUAL_REVIEW
-  vertex/face/time/VRAM budget exhausted
+RUNNING
+  ├─ required gates pass + soft targets pass
+  │    → PASS
+  ├─ required gates pass + soft targets only fail
+  │    → PASS_WITH_WARNINGS
+  ├─ required violation remains + mesh/time/VRAM budget exhausted
+  │    → INFEASIBLE_MESH_BUDGET
+  ├─ geometry requirements are mutually incompatible
+  │    → INFEASIBLE_GEOMETRY
+  ├─ required evidence unavailable or OOD threshold exceeded
+  │    → INSUFFICIENT_EVIDENCE / OUT_OF_DISTRIBUTION
+  ├─ safe applicable operation does not exist
+  │    → STALLED_SAFE
+  ├─ split/collapse or metric cycle detected
+  │    → OSCILLATION_DETECTED
+  └─ numeric error or rollback integrity failure
+       → FAILED_NUMERICALLY
 ```
 
-終了状態は最低でも次を区別する。
+全終了状態はterminalとし、自動再開を禁止する。
+`MANUAL_REVIEW`から再実行する場合は新しいrunを作り、次を必須とする。
 
 ```text
-PASS
-PASS_WITH_WARNINGS
-MANUAL_REVIEW
-INFEASIBLE
-FAILED_NUMERICALLY
-INFEASIBLE_MESH_BUDGET
-STALLED_SAFE
-OSCILLATION_DETECTED
+review_id
+reviewer
+decision: approve | modify_and_rerun | reject
+approved_or_modified_mesh_hash
+reason
+timestamp_utc
 ```
 
-`no accepted operation`や`max_rounds`はPASS理由ではない。
+`no accepted operation`、`max_rounds`、改善停滞はPASS理由ではない。
+それぞれ、全品質合格、候補不在、全候補競合、SafetyKernel全拒否、
+予算不足、振動のどれかへ分類する。
 
 ```text
 PASS:
@@ -702,12 +933,37 @@ PASS_WITH_WARNINGS:
 INFEASIBLE_MESH_BUDGET:
   未解決違反があり、サイズ/時間/VRAM予算が枯渇
 
+INFEASIBLE_GEOMETRY:
+  保護境界・拘束・幾何公差・トポロジー要求を同時に満たせない
+
 STALLED_SAFE:
   未解決違反があるが、安全に適用できる候補がない
 
 OSCILLATION_DETECTED:
   split/collapseまたは品質指標が周期状態になった
+
+INSUFFICIENT_EVIDENCE:
+  自動処理に必要な独立証拠が不足
+
+OUT_OF_DISTRIBUTION:
+  校正済みsupport/novelty閾値を超過
+
+FAILED_NUMERICALLY:
+  数値例外、非有限値、またはrollback整合性検査失敗
 ```
+
+停止パラメータのPoC初期値:
+
+```text
+max_rounds = 8
+max_line_search_retries = 3
+improvement_epsilon_ratio = 0.02
+stagnation_rounds = 2
+unsafe_patch_ratio_for_manual_review = 0.05
+oscillation_window = 4
+```
+
+これらはschema-validated configに置き、未設定なら実行を開始しない。
 
 ---
 
@@ -739,15 +995,19 @@ L = λu Ludf + λcae Lcae + λtopology Ltopology + ...
 点ではなく面への距離を基本とする。
 
 ```text
-L_cover     = GT/input samples -> mesh point-to-surface distance
-L_overshoot = mesh samples -> input/evidence surface distance
+L_cad_cover      = CAD_GT samples -> mesh point-to-surface distance
+L_cad_overshoot  = mesh samples -> CAD_GT point-to-surface distance
+L_input_support  = input_evidence <-> mesh point-to-surface distance
+L_field          = UDF residual and gradient/normal disagreement
 L_normal    = robust normal consistency
 L_area      = local area distortion
 L_edge      = target edge-length distribution
 L_budget    = soft cost near, but never beyond, the hard mesh budget
 ```
 
-実データ推論時にはGTがないため、`L_cover`の代理として入力点群被覆、局所密度、拘束、UDF残差を併用する。
+学習時のCAD_GT損失と、推論時のinput/field evidence損失を混同しない。
+実データ推論時にはCAD_GTがないため、入力点群被覆、局所密度、拘束、
+UDF残差を独立した代理証拠として併用する。
 
 ### 0B.3 トポロジー損失
 
@@ -821,6 +1081,30 @@ explicit解析では最小要素が時間刻みを支配するため、`h_floor`
 
 実運用メッシュの「正しい編集履歴」は通常存在しないため、教師を合成する。
 
+#### GT契約
+
+「高品質GT中立面」を生成器名だけで定義しない。
+
+```text
+GroundTruthMeshContract:
+  source_cad_hash
+  extraction_method_version
+  manual_edit_history
+  coordinate_frame
+  units
+  feature_protection_records
+  topology checks
+  bidirectional CAD-surface distance
+  normal consistency
+  reviewer
+  approval_status
+```
+
+GTは少なくとも、非多様体・自己交差・縮退要素ゼロ、保護境界一致、
+CAD参照面との双方向距離閾値を満たすこと。入力と同じ生成器の出力だけで
+評価すると循環評価になるため、CAD面への直接距離または独立手法による
+監査メッシュを評価基準に含める。
+
 ```text
 高品質GT中立面
   ├─ 頂点ノイズ
@@ -840,6 +1124,27 @@ GTへの対応付け + 決定論的最良操作
 
 Phase 1は、GTと頂点対応を維持できる摂動だけを使う。これにより頂点変位の教師を一意に定義できる。
 
+ただしランダムな合成摂動だけでは、現行パイプライン固有の系統誤差を再現できない。
+教師データを次の2系統に分ける。
+
+```text
+SyntheticCorruptionCorpus:
+  頂点ノイズ、接線しわ、法線オフセット、不均一密度、edge flip
+
+PipelineFailureReplayCorpus:
+  LEGACY_R713や意図的に緩めたgate/profileから生成
+  - cut locus近傍の系統的外挿
+  - 独立Newton射影による折り畳み
+  - reconstruct_surface由来の疎領域外挿
+  - prune由来の境界ループ・component断片化
+  - サイズ場を無視した過細分化
+```
+
+Replay corpusは、実際の入力、設定hash、中間mesh、失敗分類、評価指標を保存する。
+初期はデータ不足のため比率を固定せず、各mini-batchに両corpusが含まれる
+stratified samplingとする。十分な部品数が蓄積した後に、holdout性能を見ながら
+混合比を決定する。
+
 Phase 2でsplit/collapse/flipを追加し、操作ラベルはヒューリスティックな「唯一の正解」ではなく、操作後の品質改善量を教師とするランキング学習にする。
 
 split/collapse学習時は、同じ形状に複数の予算を与える。
@@ -856,15 +1161,26 @@ budget condition:
 割った効率も教師に含める。
 
 ```text
-utility(operation) =
-  geometry_gain
-  + quality_gain
-  - lambda_cost * added_vertices
+operation target:
+  eligibility:
+    hard safety and topology preservation
+  lexicographic rank:
+    1. geometry gain
+    2. CAE quality gain
+    3. fewer added vertices
+    4. shorter runtime
 ```
 
-ただしハード上限違反操作はutilityによらず不正解とする。
+単一`lambda_cost`によるスカラーutilityを主教師にしない。
+ハード不適格候補はranking対象へ入れず、reject理由付きhard negativeとして保存する。
+
+1-step教師だけでは再帰推論時の分布を覆えないため、accepted meshを次ラウンドへ
+入力した2〜4 round rolloutデータを追加する。初期teacher-forcing後は、
+モデル自身の軌跡から失敗状態を収集するDAgger型のデータ更新を行う。
 
 Phase 3の穴修復では、合成欠損の作り方が実欠損分布と一致する保証がないため、必ず実データで別評価する。
+同じ制約はPhase 1のノイズ・しわにも適用し、PipelineFailureReplayCorpusを
+含まない評価結果を実パイプラインへの汎化根拠として扱わない。
 
 ### 0C.2 カリキュラム
 
@@ -906,8 +1222,20 @@ split unit:
 Go条件:
 
 ```text
-評価器が既知のしわ・反転・穴を再現性高く検出できる
-同じ入力・seed・configでartifact hashが一致する
+known injected defects:
+  recall = 100%
+  false-negative count = 0
+
+determinism:
+  deterministic CPU kernels:
+    byte-identical artifact hash = 100%
+  GPU end-to-end:
+    topology hash match = 100%
+    coordinate hash after 1e-6mm quantization = 100%
+    metric deviation within evaluator numeric tolerance
+
+legacy defect detection:
+  saved coarse/refine outputsの面積膨張、極小角、component増加を検出
 ```
 
 ### Phase R1: Learned Fixed-Topology Refiner
@@ -925,7 +1253,9 @@ Go条件:
   p95 point-to-surface error: 20%以上改善
   inverted/invalid triangles: 増加ゼロ
   surface area inflation: 5%以内
-  runtime: 1M verticesで5分以内（目標、GPU 1枚）
+  same budget: target 250k vertices / 60秒
+  every held-out part: new hard violation = 0
+  paired-bootstrap 95% CI of primary improvement excludes 0
 ```
 
 ### Phase R2: Hierarchical Context
@@ -938,7 +1268,10 @@ Go条件:
 
 ```text
 拘束周辺誤差が非拘束R1より改善
-パッチ継ぎ目のp95変位不連続が許容値以下
+shared vertex position mismatch = numerical zero
+seam displacement discontinuity p95 <= 0.1 * local h_target
+smooth-region seam normal difference p95 <= 5 deg
+all fallback attempts fail -> MANUAL_REVIEW, not PASS
 ```
 
 ### Phase R3: Deterministic Adaptive Remeshing
@@ -951,17 +1284,46 @@ Go条件:
 * `h_floor`未満の新規辺を作る操作は禁止
 * split/collapseヒステリシスとサイズ場growth ratioを検証
 
+Go条件:
+
+```text
+S3 adaptive sizing:
+  same p95 CAD error as S0 or better
+  vertex count <= 0.5 * S0
+  split-collapse oscillation rate <= 1% of operated edges
+  budget-exhausted rate reported by family
+  new hard violation = 0 on every held-out part
+```
+
 ### Phase R4: Limited Topology Repair
 
 * 対象を「小さな内部穴」「孤立小成分」など明確な型に限定
 * 開境界を穴と誤認しない境界分類器を先に成立させる
 * 自動コミットせず、候補提示 + CP確認から開始する
 
+Go条件:
+
+```text
+functional-hole false closure = 0
+protected boundary modification = 0
+reviewer approval required for every topology transaction
+```
+
 ### Phase R5: Solver-specific CAE Export
 
 * solver profileを固定
 * property、thickness、material、normal orientationを付与
 * 実ソルバーのpre-checkをCIまたはバッチ検証へ接続
+
+Go条件:
+
+```text
+solver pre-check error = 0
+reference mesh convergence:
+  displacement/reaction/eigenvalue difference <= 5%
+stress/strain-energy criteria:
+  solver profile defines threshold before execution
+```
 
 ---
 
@@ -971,17 +1333,52 @@ Go条件:
 
 | 分類 | 指標 |
 |---|---|
-| 被覆 | input/GT→mesh point-to-surface mean, p95, p99, max |
-| 外れ値 | mesh→input/GT mean, p95, p99, max |
+| CAD再現被覆 | CAD_GT→mesh point-to-surface mean, p95, p99, max |
+| CAD再現外れ値 | mesh→CAD_GT point-to-surface mean, p95, p99, max |
+| 入力証拠整合 | input_evidence↔mesh point-to-surface mean, p95, p99, max |
+| Field整合 | UDF residual、gradient/normal disagreement。CAD精度とは別表示 |
 | 法線 | normal error median, p95、反転面積率 |
-| 面積 | reconstructed/GT area ratio、局所面積歪み |
-| トポロジー | component、boundary loop、non-manifold、self-intersection |
+| 面積 | reconstructed/CAD_GT area ratio、accepted-round area ratio、局所面積Jacobian p1/p99 |
+| トポロジー | vertex/face-connected component、boundary loop、non-manifold、self-intersection |
 | 品質 | minimum angle、aspect ratio、edge transition、invalid count |
 | 安定性 | seed分散、roundごとの単調性、rollback率 |
 | サイズ制御 | min/p01/p05 edge length、`length/h_target`分布、growth ratio違反、split/collapse往復率 |
 | 計算量 | peak VRAM、wall time、頂点あたり処理時間、頂点/面予算消費率 |
 
 平均Chamferだけで合否を決めない。
+
+幾何距離の正式評価器:
+
+```text
+sampling:
+  triangle area-uniform
+  fixed seed
+  >= 100,000 samples / part / direction
+
+distance:
+  sample point -> closest point on opposite triangle surface
+  vertex-to-vertex distance is debug-only
+
+report:
+  mean, median, p95, p99, max
+  boundary-distance strata
+  feature-region strata
+```
+
+評価器の実装・バージョン・sample seedもmanifestへ保存する。
+`input/GT`のような混在表記は禁止し、CAD_GT、input_evidence、field_evidenceを
+別指標として報告する。
+`evaluator_numeric_tolerance`は実行前にprofileへ固定し、結果を見て変更しない。
+
+面積比だけでは局所膨張と欠損が相殺されるため、局所面積Jacobian、
+向き反転面積、自己重複を独立ゲートとする。
+
+```text
+cumulative area ratio vs CAD_GT: 0.95..1.05
+per accepted round area ratio: 0.98..1.02
+inverted area ratio: 0
+local area Jacobian outside solver profile: 0 hard violations
+```
 
 ### 0E.2 比較実験
 
@@ -996,7 +1393,19 @@ L2: L1 + constraints
 L3: L2 + adaptive remeshing priority
 ```
 
-AI方式はB1/B2を有意に超えた場合のみ採用する。
+AI方式はB1/B2を次の統計契約で超えた場合のみ採用する。
+
+```text
+comparison unit: part（seedではない）
+primary analysis: paired bootstrap 95% CI
+aggregation: part-family macro average + worst-family result
+budget: same vertex and wall-time budget
+hard condition: every held-out part has zero new hard violation
+```
+
+PoCの6部品程度の評価はsmoke testであり、一般化Go判定には使わない。
+R1 technical Goには最低5 held-out parts・3 part familiesを要求し、
+サンプル不足時は`INSUFFICIENT_VALIDATION_DATA`として次Phaseへ進まない。
 
 サイズ制御の比較条件:
 
@@ -1048,7 +1457,7 @@ boundary/feature coverage
 
 GHMRは現行UDFを前提に進められるが、FieldEvidenceProviderは交換可能にする。
 
-候補:
+Field/UDF候補:
 
 * [DUDF (CVPR 2024)](https://arxiv.org/abs/2402.08876): ゼロレベル集合の非微分可能性を緩和する。現行UDFとのA/B試験候補。
 * [LevelSetUDF (ICCV 2023)](https://openaccess.thecvf.com/content/ICCV2023/papers/Zhou_Learning_a_More_Continuous_Zero_Level_Set_in_Unsigned_Distance_ICCV_2023_paper.pdf): 滑らかな非ゼロレベル集合を利用する候補。
@@ -1057,20 +1466,39 @@ GHMRは現行UDFを前提に進められるが、FieldEvidenceProviderは交換�
 
 これらはGHMRの代替ではなく、GHMRへ供給する初期メッシュまたは場の品質を改善する交換可能コンポーネントである。
 
+局所メッシュ学習の参照:
+
+* [Neural Subdivision (SIGGRAPH 2020)](https://arxiv.org/abs/2005.01819):
+  決定論的な細分化トポロジーと、局所パッチ条件付きの頂点位置予測を分離する。
+  LocalMeshRefinerに最も直接近い。ただし本案件のUDF誤差・CAEゲート・2k〜8k
+  パッチ規模を保証するものではない。
+* [MeshCNN (SIGGRAPH 2019)](https://arxiv.org/abs/1809.05910):
+  三角形メッシュの辺上で畳み込み・poolingを行う設計根拠。
+  主用途は分類・segmentationであり、頂点変位回帰の直接実証ではない。
+* [SubdivNet](https://arxiv.org/abs/2106.02285):
+  subdivision connectivityを利用した階層メッシュ表現。
+  任意connectivityには前処理が必要であり、そのまま採用しない。
+
+したがって文献引用は構成要素の妥当性を補強するものであり、
+GHMRの汎化性能やパッチサイズの実証を代替しない。
+
 ---
 
 ## 0H. 当面の実装単位
 
 最初のコード変更は、巨大な`Structure Memory Transformer`ではない。次の順序が最短である。
 
-1. 既存`reconstruct.py`から共通評価器とSafetyKernelを分離する。
-2. SizingAndBudgetControllerと入力極短辺collapseを実装する。
-3. `subdivide_and_project()`を一括全辺splitから局所adaptive splitへ置換する。
-4. refinement roundの前後をトランザクション化し、悪化時rollbackできるようにする。
-5. 固定トポロジーの局所パッチdatasetをGT中立面から合成する。
-6. 接線変位だけを出す小型GNNを実装する。
-7. 決定論的Laplacian/Taubin/adaptive remesh baselineと比較する。
-8. 効果が確認できてから法線変位、拘束トークン、budget-aware remesh priorityの順に追加する。
+1. `ReconstructionProfile` schema、単一設定入口、`run_manifest`を実装する。
+2. 正式point-to-surface評価器とR0 defect detectorを実装する。
+3. 状態機械、AuditEvent、fail-closed evidence gateを実装する。
+4. 既存`reconstruct.py`からSafetyKernelを分離し、故障注入・rollback試験を作る。
+5. SizingAndBudgetControllerと入力極短辺collapseを実装する。
+6. `subdivide_and_project()`を一括全辺splitから局所adaptive splitへ置換する。
+7. LEGACY_R713 / COARSE_GATED / ADAPTIVE_BASELINEを同一manifest形式で比較する。
+8. GT契約、SyntheticCorruption、PipelineFailureReplay datasetを作る。
+9. 局所フレーム・接線残差だけを出す小型GNNを実装する。
+10. rollout/hard-negativeを追加し、決定論的baselineを超えた場合だけR2へ進む。
+11. 効果確認後に法線変位、拘束トークン、budget-aware remesh rankingを追加する。
 
 この順序なら、各段階で「AIを追加した価値」が測定でき、Topology Repair Headまで作った後に根本仮説が外れていた、という高コストな失敗を避けられる。
 
@@ -1147,8 +1575,11 @@ Geometry Mesh Candidate
 | G4 | 制限付き生産 | 形状族限定、DFM監査、ソルバー相関試験 |
 | G5 | 安全関連 | Class A統計、安全プロセス、二者承認、顧客品質承認 |
 
-現行の最大約46mmの余剰形状と5mm超被覆穴約1.1%は、研究結果としては
-改善を示すが、G3以降の受入値ではない。
+R7-13の`body002`単一部品・単一checkpointにおける
+`conf=0 / input_dist=10mm / prune=20mm / refine_rounds=4`では、
+余剰形状max約46.42mm、5mm超被覆穴約1.1%と記録されている。
+ただしR7-14で面積膨張・折り畳みが判明したため、このprofileを現行合格値とは
+扱わない。研究上のlegacy comparisonに限定し、G3以降の受入値ではない。
 
 ### 0I.5 再現性
 
@@ -1168,6 +1599,55 @@ metrics
 
 YAML、CLI、Python関数のデフォルトを重複定義しない。
 設定は単一のschema-validated configから生成する。
+
+すべての実行入口は`ReconstructionProfile`を必須引数とし、
+CLI/API内の独立したデフォルト値を禁止する。設定欠落時は実行拒否する。
+
+### 0I.6 Claude監査への対応判断
+
+`archi_audit.md`第2版を入力として再監査した結果:
+
+| 監査指摘 | 判断 | 反映 |
+|---|---|---|
+| 現行デフォルト不明 | 採用 | profile化、legacy/coarse/adaptiveを分離 |
+| GNN先行研究不足 | 条件付き採用 | Neural Subdivisionを直接根拠、MeshCNN/SubdivNetを補助根拠として追加 |
+| 合成劣化と実欠陥の乖離 | 採用 | PipelineFailureReplayCorpusを追加 |
+| パッチ継ぎ目滑らかさ | 採用 | shared vertex一括更新、seam gate、4段階fallback |
+| 未知トポロジー/OOD | 採用 | NoveltyAndSupportGateをSafetyKernelから分離して追加 |
+| 15部品Stage C頂点クロスチェック | 要実験 | R0 profiling項目。実装ブロッカーではない |
+| 46mm出典不足 | 採用 | profileと単一部品条件を明記 |
+| step_confidence未定義 | 採用 | 初期出力から削除、安全判定使用禁止 |
+| R7-14定量値不足 | 採用 | 面積倍率、反転率、componentを明記 |
+
+監査が見落としていたため追加した項目:
+
+* 予算枯渇時に`PASS_WITH_WARNINGS`へ行ける矛盾を削除
+* 候補不足時のungated fallbackを禁止しfail-closed化
+* point-to-vertexとpoint-to-surface評価混在を解消
+* split/collapse閾値の文書内不一致を解消
+* GT契約、局所座標同変性、再帰rollout教師を追加
+* 状態遷移・terminal条件・監査イベントを定義
+
+したがって`archi_audit.md`第2版の「重大ブロッカーなし」はそのまま採用しない。
+本改訂後はR0着手可能、R1以降は各PhaseのGo条件を満たした場合のみ開始可能とする。
+
+正式な次回監査は行番号だけでなく、次を必須とする。
+
+```text
+target_file
+target_git_commit
+target_sha256
+normative_scope
+audit_version
+auditor
+reviewer
+audit_method
+open_findings
+approval_status
+```
+
+今回の`archi_audit.md`第2版はtarget commit/hashを持たないため、
+有用なレビュー入力ではあるが、正式な承認済み監査証跡とは扱わない。
 
 ---
 

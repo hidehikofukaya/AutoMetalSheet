@@ -1075,8 +1075,8 @@ chord_tolerance_mm = 0.5
 hausdorff_tolerance_mm = 0.5
 normal_change_limit_deg = 10
 growth_ratio = 1.3
-split_ratio = 1.4
-collapse_ratio = 0.6
+split_ratio = 1.333333
+collapse_ratio = 0.8
 target_vertices = 250_000
 target_faces = 500_000
 hard_max_vertices = 500_000
@@ -1098,3 +1098,85 @@ max_split_edge_fraction_per_sweep = 0.10
 6. 決定論的adaptive remesh baseline
 7. 固定トポロジー局所GNN
 8. budget-aware operation ranking
+
+---
+
+## 20. archi_audit.md 第2版への統合レビュー（Round 13）
+
+### 記録日: 2026-06-20
+
+### 正本優先順位
+
+1. `archi.md` §0〜§0I: GHMR現行規範仕様
+2. `AGENTS.md`: 採用判断・変更履歴
+3. `archi_audit.md`: 特定時点の監査入力。規範を上書きしない
+4. `CLAUDE.md`: 過去の調査・実験履歴。規範参照禁止
+
+### 監査評価
+
+Claude監査の「GHMRは実現可能」という総論は採用する。
+ただし「重大ブロッカーなし」は、以下の安全矛盾・実装不整合を
+見落としていたため、そのまま採用しない。
+
+### 確定判断
+
+| 判断ID | 内容 |
+|---|---|
+| R13-01 | 現行Stage Cに唯一の本番デフォルトは存在しない。CLI/API/YAMLが分裂しているため、LEGACY_R713、COARSE_GATED、ADAPTIVE_BASELINEのmanifest付きprofileへ分離する。 |
+| R13-02 | 候補点ゲート通過数不足時のungated fallbackを禁止し、`INSUFFICIENT_EVIDENCE`でfail-closed停止する。 |
+| R13-03 | 予算枯渇時、未解決必須違反があれば`PASS_WITH_WARNINGS`禁止。`INFEASIBLE_MESH_BUDGET`または`MANUAL_REVIEW`とする。 |
+| R13-04 | 状態機械をRUNNINGからのterminal遷移として定義し、terminal runの自動再開を禁止する。レビュー後は新runを作る。 |
+| R13-05 | 幾何Go/No-Go距離を面積一様sample→相手三角形面へのpoint-to-surfaceへ統一する。vertex distanceはdebug専用。 |
+| R13-06 | CAD_GT、input_evidence、field_evidenceの指標を分離し、`input/GT`混在表記を禁止する。 |
+| R13-07 | R7-14の定量値（面積0.97→6.96倍、refine3反転面積約49%、粗mesh 38 face-connected components）をlegacy evidenceとして明記する。 |
+| R13-08 | 合成教師だけでなく、LEGACY profile等から得るPipelineFailureReplayCorpusを追加する。 |
+| R13-09 | 局所GNNはパッチ局所直交フレームを使い、SO(3)回転augmentationとequivariance regression testを必須化する。 |
+| R13-10 | 1-step教師だけでなくaccepted meshからの2〜4 round rolloutとSafetyKernel rejected hard-negativeを追加する。 |
+| R13-11 | remesh教師を単一utilityへ潰さず、安全適格性→幾何→CAE→頂点コスト→時間の辞書式rankingとする。 |
+| R13-12 | Novelty/OOD判定をSafetyKernelから分離したNoveltyAndSupportGateとして実装し、超過時はabstain/CPへ送る。 |
+| R13-13 | パッチ共有頂点は全予測集約後に1回だけ更新し、継ぎ目不合格時はhalo拡大→再分割→決定論平滑化→MANUAL_REVIEWの順で処理する。 |
+| R13-14 | `step_confidence`は初期モデルから削除する。将来追加してもline-search初期値・スケジューリング専用で、安全判定に使わない。 |
+| R13-15 | GTにsource CAD hash、抽出版、手修正、feature保護、独立CAD面距離、reviewerを含むGroundTruthMeshContractを必須化する。 |
+| R13-16 | 正式監査はtarget git commit/SHA-256/normative scope/auditor/reviewer/open findingsを必須とする。現`archi_audit.md`第2版はレビュー入力であり正式承認証跡ではない。 |
+
+### 保存済みlegacy meshの再計測
+
+対象:
+
+```text
+body002_r711r712_stage_coarse_midsurface.ply
+body002_r711r712_stage_refine3_midsurface.ply
+```
+
+設定系統: `refine_rounds=3`, `input_dist=10mm`, `prune_dist=12mm`
+
+| 指標 | coarse | refine3 |
+|---|---:|---:|
+| 頂点 / 三角形 | 4,080 / 6,300 | 208,881 / 400,363 |
+| 面積 | 344,634mm² | 950,094mm² |
+| coarse比 | 1.00 | 2.76 |
+| vertex-connected components | 29 | 31 |
+| face-connected components | 41 | 46 |
+| boundary edges | 2,140 | 17,745 |
+| minimum angle | 0.0358° | 0.0001° |
+| angle p1 | 3.02° | 1.47° |
+| aspect ratio p95 | 13.1 | 29.8 |
+
+この値はmanifest不在・単一部品のlegacy evidenceであり、正式baselineではない。
+一様細分化が被覆改善と同時に面積・境界・要素品質を悪化させうる根拠として使う。
+
+### 監査で採用した先行研究の位置づけ
+
+- Neural Subdivision: LocalMeshRefinerに直接近い構造的根拠
+- MeshCNN/SubdivNet: メッシュ局所表現・階層表現の補助根拠
+- いずれもGHMRのCAE適合性、2k〜8kパッチ規模、UDF誤差への有効性を保証しない
+
+### R0着手条件
+
+R0の実装着手は可能。ただし最初に以下を実装する。
+
+1. ReconstructionProfileとrun_manifest
+2. point-to-surface正式評価器
+3. fail-closed evidence gate
+4. 状態機械とAuditEvent
+5. SafetyKernel故障注入・rollback整合試験
