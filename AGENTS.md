@@ -1020,3 +1020,81 @@ fix適用後も真の穴>5mm率は1.1%（ゼロではない）。これ以上の
 4. 接線変位のみの小型GNN
 5. Laplacian/Taubin等の決定論baseline比較
 6. 法線変位、拘束、remesh優先度の順に追加
+
+---
+
+## 19. 適応細分化上限制御の再設計（Round 12）
+
+### 記録日: 2026-06-20
+
+### 背景
+
+ユーザー指摘: 頂点細分化には、頂点間の最小距離等による上限が必要。
+
+検討の結果、全頂点間距離を一律制約にすると、折り返しや近接二面を誤って
+潰すため不適切と判断した。代わりに、トポロジー辺長、非隣接面距離、
+局所サイズ場、計算予算を分離する。
+
+### 実測
+
+実STP 15部品の粗中立面辺長:
+
+| 指標 | 実測範囲・代表値 |
+|---|---:|
+| 最小辺長 | 0〜0.024mm |
+| 部品別p01 | 0.024〜0.247mm |
+| 部品別p05 | 0.126〜0.661mm |
+| p05中央値 | 約0.37mm |
+| 中央辺長の部品間中央値 | 約1.79mm |
+
+細分化前から極短辺が存在するため、split停止だけでなく、入力時の
+duplicate merge / zero-area除去 / 安全なshort-edge collapseが必要。
+
+### 確定判断
+
+| 判断ID | 内容 |
+|---|---|
+| R12-01 | `refine_rounds`による全辺1→4一括細分化を廃止し、選択長辺の局所二分割へ移行する。 |
+| R12-02 | 全頂点間最小距離ではなく、`h_edge_min`、`d_nonlocal_min`、`h_target(x)`を別概念として管理する。 |
+| R12-03 | `h_target(x)=clamp(min(h_geometry,h_feature,h_constraint,h_solver),h_floor,h_ceiling)`の局所サイズ場をSizingAndBudgetControllerが所有する。 |
+| R12-04 | PoC初期値は`h_abs_floor=0.5mm`、solver target 2.0mm、ceiling 10mmとし、0.5/1.0/2.0mmを感度試験する。固定の製品共通値にはしない。 |
+| R12-05 | splitは辺長だけでなく弦偏差、双方向point-to-surface誤差、局所feature重要度を条件とする。 |
+| R12-06 | split/collapseは4/3と4/5程度のヒステリシス、2 sweep cooldown、target size EMAを持つ。 |
+| R12-07 | 1 sweepの頂点増加率は最大1.5倍、split辺は全辺の初期10%上限、総頂点500k/面1MをPoC初期予算とする。 |
+| R12-08 | 予算枯渇時はPASSにせず`INFEASIBLE_MESH_BUDGET`または`MANUAL_REVIEW`へ遷移する。 |
+| R12-09 | AIは操作価値とコストを予測できるが、`h_floor`、budget、SafetyKernelを上書きできない。 |
+| R12-10 | remesh操作は競合グラフで非競合バッチを作り、dry-run後に原子的commit/rollbackする。 |
+
+### PoC初期パラメータ
+
+```text
+h_abs_floor_mm = 0.5
+h_solver_default_mm = 2.0
+h_ceiling_default_mm = 10.0
+chord_tolerance_mm = 0.5
+hausdorff_tolerance_mm = 0.5
+normal_change_limit_deg = 10
+growth_ratio = 1.3
+split_ratio = 1.4
+collapse_ratio = 0.6
+target_vertices = 250_000
+target_faces = 500_000
+hard_max_vertices = 500_000
+hard_max_faces = 1_000_000
+max_vertex_growth_ratio_per_round = 1.5
+max_split_edge_fraction_per_sweep = 0.10
+```
+
+これらは実験開始値であり、solver profile・最小feature・入力分解能に応じて
+版管理された設定へ移す。
+
+### 更新後の最短実装順
+
+1. 共通評価器とSafetyKernel
+2. SizingAndBudgetController
+3. 入力極短辺の正規化collapse
+4. 全辺一括splitを局所adaptive splitへ置換
+5. transaction/rollbackと終了状態
+6. 決定論的adaptive remesh baseline
+7. 固定トポロジー局所GNN
+8. budget-aware operation ranking

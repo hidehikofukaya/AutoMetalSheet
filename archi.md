@@ -138,6 +138,7 @@
 4. **百万頂点を一括処理せず、粗い大域表現と局所パッチ処理を分離する。**
 5. **各ラウンドをトランザクションとして扱い、品質悪化時に必ずロールバックできるようにする。**
 6. **平均値ではなく、最悪側分位点と絶対禁止事象で合否判定する。**
+7. **細分化回数ではなく、局所サイズ場・幾何誤差・計算予算で細分化を停止する。**
 
 ### 0A.2 全体構成
 
@@ -157,8 +158,10 @@ flowchart TD
     I -->|reject| K["Rollback + smaller step"]
 
     J --> L["Error/Quality Estimator"]
-    L -->|local resolution insufficient| M["Deterministic Remesher<br/>split/collapse/flip"]
+    P["Sizing & Budget Controller<br/>h_target(x) / vertex budget"] --> L
+    L -->|local resolution insufficient<br/>and budget available| M["Deterministic Remesher<br/>split/collapse/flip"]
     L -->|sufficient| N["Stop Gate"]
+    L -->|budget exhausted| Q["PASS_WITH_WARNINGS<br/>or MANUAL_REVIEW"]
     M --> F
     K --> F
     N --> O["CAE Mesh Export + Audit Report"]
@@ -229,6 +232,14 @@ one-ring edge statistics
 triangle quality statistics
 boundary/frozen/anchor flags
 round index
+local p95/p99 coverage and overshoot error
+udf/input/candidate evidence disagreement
+h_target / h_floor / h_ceiling
+vertex/time/round/patch budget remaining ratio
+last split/collapse round and operation age
+rollback count and rejection reason
+feature/boundary/component id
+patch halo flag and seam discontinuity
 ```
 
 辺特徴:
@@ -265,6 +276,13 @@ Hard reject:
   known boundary crossed
   anchor displacement > tolerance
   component count changed without explicit topology transaction
+  topology link condition violated
+  protected Euler characteristic or boundary-loop count changed
+  feature/boundary/anchor attributes lost
+  duplicate face or zero-length edge introduced
+  target-length hard floor/ceiling violated
+  operation-batch conflict detected
+  patch shared-ID consistency violated
 
 Monotonic guards:
   p95 point-to-input distance does not worsen beyond budget
@@ -273,6 +291,8 @@ Monotonic guards:
 ```
 
 不採用時は更新量を`1/2`へ縮小して再試行し、規定回数失敗したパッチはfreezeして人間確認対象にする。
+remesh操作は更新量を縮小できないため、候補または競合しないバッチ単位でdry-runする。
+commit後の全体broad-phase検査に失敗した場合は、そのバッチ全体を原子的にrollbackする。
 
 #### F. DeterministicRemesher
 
@@ -287,25 +307,332 @@ flip_priority
 freeze_priority
 ```
 
+実装時は単一priorityだけでなく、候補操作ごとの改善量とコストを予測する。
+
+```text
+OperationPrediction:
+  operation_id
+  operation_type
+  expected_delta_geometry
+  expected_delta_normal
+  expected_delta_cae
+  expected_vertex_delta
+  expected_runtime_ms
+  rejection_probability
+```
+
+`rejection_probability`はスケジューリング効率のための予測であり、
+SafetyKernelを代替しない。
+
+操作候補間には競合グラフを作る。同一辺、共有頂点、共有1〜2 ring、
+パッチをまたぐ同一グローバルIDを競合とし、同一バッチへ入れない。
+
+```text
+selection order:
+  SafetyKernel eligibility
+  → boundary/constraint regression zero
+  → geometry gain
+  → CAE quality gain
+  → gain / added vertex
+  → gain / runtime
+```
+
 実際の操作は、明示した前後条件を持つ決定論的カーネルが行う。
 
 例:
 
 ```text
 split:
-  edge_length > 1.5 * target
+  edge_length > split_ratio * h_target(edge)
+  local_error > error_tolerance
+  new_edge_length >= h_floor
+  budget_allows(new_vertices)
   projected midpoint is inside evidence envelope
   no predicted self-intersection
 
 collapse:
-  edge_length < 0.5 * target
+  edge_length < collapse_ratio * h_target(edge)
   not boundary/feature/anchor edge
   topology link condition satisfied
+  geometric_error_after <= error_tolerance
+  collapse does not cross a close non-adjacent sheet
 
 flip:
   minimum angle improves
   feature/boundary semantics preserved
 ```
+
+`split_ratio`と`collapse_ratio`の間にはヒステリシスを設ける。
+
+```text
+initial:
+  split_ratio = 4/3
+  collapse_ratio = 4/5
+```
+
+同じ辺がroundごとにsplit/collapseを往復することを防ぐ。
+
+#### G. SizingAndBudgetController
+
+細分化の中心となる決定論的コンポーネント。各位置に目標辺長
+`h_target(x)`を定義し、AIから独立してsplit可能性を制限する。
+
+##### 最小距離の定義
+
+「全頂点間のユークリッド最小距離」は使わない。板金では、折り返しや
+近接した別シートが正しく存在しうるためである。
+
+次を区別する。
+
+```text
+h_edge_min:
+  同一メッシュのトポロジー上で接続された辺の最小許容長
+
+d_nonlocal_min:
+  非隣接三角形・頂点間の接近検査値
+  collapse条件ではなく自己交差/誤接続防止に使う
+
+h_target(x):
+  局所的に望ましい辺長
+```
+
+##### 局所サイズ場
+
+```text
+h_target(x) =
+  clamp(
+    min(
+      h_geometry(x),
+      h_feature(x),
+      h_constraint(x),
+      h_solver(x)
+    ),
+    h_floor(x),
+    h_ceiling(x)
+  )
+```
+
+各項:
+
+```text
+h_geometry:
+  曲率と許容弦偏差から決まる上限
+
+h_feature:
+  ビード幅、曲げ帯、穴径等を必要要素数で割った値
+
+h_constraint:
+  拘束点、境界、締結点付近の局所上限
+
+h_solver:
+  解析種別・要素型が要求する目標要素長
+
+h_floor:
+  入力分解能、数値安定性、最小有意味フィーチャから決まる絶対下限
+
+h_ceiling:
+  平坦領域でも超えてはならない最大辺長
+```
+
+曲率半径`R=1/κ`に対し、弦偏差を`δ_geo`以下にする近似は、
+
+```text
+h_geometry(x) = sqrt(8 * δ_geo / max(κ(x), κ_epsilon))
+```
+
+とする。ただし曲率推定はノイズに弱いため、1-ring値をそのまま使わず、
+ロバスト平滑化した曲率と90〜95 percentileを用いる。
+
+幅`w_feature`の形状を横断方向に最低`n_feature`要素で表す場合:
+
+```text
+h_feature = w_feature / n_feature
+n_feature initial = 4
+```
+
+##### サイズ場の勾配制限
+
+隣接要素間で急激にサイズを変えない。
+
+```text
+1 / growth_ratio <= h_i / h_j <= growth_ratio
+growth_ratio initial = 1.3
+```
+
+サイズ場をグラフ上で前後方向に伝播してからremeshへ渡す。
+
+##### 絶対下限の初期値
+
+実STP 15部品の粗中立面では、既に次の極短辺が存在した。
+
+```text
+edge minimum:       0〜0.024 mm
+part-wise p01:      0.024〜0.247 mm
+part-wise p05:      0.126〜0.661 mm
+p05 median:         約0.37 mm
+median edge median: 約1.79 mm
+```
+
+これは細分化の結果ではなく、STEPテッセレーションと中立面投影由来である。
+したがって細分化前に極短辺の正規化が必要である。
+
+現データに対するPoC初期値:
+
+```text
+h_abs_floor_mm = 0.5
+h_solver_default_mm = 2.0
+h_ceiling_default_mm = 10.0
+```
+
+ただし`0.5 mm`は製品共通定数ではない。最小フィーチャ、ソルバー要件、
+入力テッセレーション精度を確認し、`0.5 / 1.0 / 2.0 mm`の感度試験で
+決定する。入力に`h_abs_floor`未満の辺がある場合、feature/boundaryで
+なければ事前collapse候補とする。
+
+##### 計算予算
+
+細分化はサイズ条件を満たしていても、予算を超えては実行しない。
+
+```text
+MeshBudget:
+  max_vertices
+  max_faces
+  max_split_operations_per_round
+  max_vertex_growth_ratio_per_round
+  max_peak_vram_mb
+  max_wall_time_s
+  max_rounds
+```
+
+PoC初期値:
+
+```text
+target_vertices <= 250_000
+target_faces <= 500_000
+hard_max_vertices = 500_000
+hard_max_faces = 1_000_000
+hard_max_unique_edges = 1_500_000
+max_vertex_growth_ratio_per_round = 1.5
+max_split_operations_per_round = min(50_000, 0.10 * current_edges)
+target_peak_vram_mb = 4096
+hard_max_peak_vram_mb = 4915
+target_wall_time_s = 60
+hard_max_wall_time_s = 300
+```
+
+この値は現在のPC（GTX 1660 SUPER 6GB、RAM 16GB）での研究PoC向けであり、
+プロファイリング後に更新する。
+一度のroundで全辺を1→4分割する現行方式は禁止する。
+
+三角形が概ね正三角形の場合、面積`A`と頂点予算`V_max`から、
+一様メッシュで可能な辺長の目安は次で見積もれる。
+
+```text
+h_budget ≈ sqrt(A / (0.866 * V_max))
+```
+
+局所サイズ要求から推定した必要頂点数が予算を超える場合、黙って粗くせず、
+次のいずれかへ遷移する。
+
+```text
+INFEASIBLE_MESH_BUDGET
+PASS_WITH_WARNINGS
+MANUAL_REVIEW
+```
+
+##### split選択
+
+候補辺`e`の優先度:
+
+```text
+priority(e) =
+  w_error   * normalized_local_error
+  + w_size  * max(0, length(e)/h_target(e) - 1)
+  + w_feat  * feature_importance
+  + w_cae   * quality_gain_estimate
+  - w_cost  * predicted_vertex_cost
+```
+
+ただし優先度が高くても、次を満たさない辺はsplitしない。
+
+```text
+length(e) / 2 >= h_floor(e)
+estimated_error_reduction >= min_error_gain
+quality_gain_or_geometry_gain > 0
+budget remains
+```
+
+AIは`priority`の補正または改善量推定に使えるが、
+`h_floor`とbudgetを上書きできない。
+
+弦偏差は、辺中点を場へ投影した点と元中点との差として直接計測する。
+
+```text
+m = (v_i + v_j) / 2
+m_projected = project_to_evidence_surface(m)
+e_chord = |m_projected - m|
+```
+
+split候補条件:
+
+```text
+length(e) > 1.4 * h_target(e)
+or e_chord > chord_tolerance
+or local_bidirectional_error > hausdorff_tolerance
+```
+
+PoC初期値:
+
+```text
+chord_tolerance_mm = 0.5
+hausdorff_tolerance_mm = 0.5
+normal_change_limit_deg = 10
+```
+
+境界・feature・拘束領域は別profileを持てるようにする。
+
+```text
+known boundary:
+  boundary curveへ投影
+  endpoint/cornerはfreeze
+
+unknown boundary:
+  自動split/collapseせずMANUAL_REVIEW
+
+feature edge:
+  edgeを跨ぐcollapse/flip禁止
+```
+
+一律1→4三角形分割ではなく、選択した長辺の二分割と適合伝播を基本とする。
+1 sweepでsplitする辺は全辺の10%を初期上限とし、計算予算の25%上限より
+厳しい方を採用する。
+
+##### collapseと入力正規化
+
+初回ラウンド前に次を実行する。
+
+```text
+1. duplicate vertex merge within numeric tolerance
+2. zero/near-zero area triangle removal
+3. non-feature edge shorter than collapse_ratio * h_targetを候補化
+4. topology link condition、境界、法線、誤差を検証
+5. SafetyKernel通過分だけcollapse
+```
+
+極短辺を残したままsplitだけを制限すると、悪いaspect ratioが固定されるため、
+split上限とcollapse正規化は必ず同時導入する。
+
+collapse追加条件:
+
+```text
+length(e) < 0.6 * h_target(e)
+e_chord < 0.4 * chord_tolerance
+local_bidirectional_error < 0.5 * hausdorff_tolerance
+post-collapse minimum angle >= 20 deg
+```
+
+splitされた辺とその1-ringは2 sweepの間collapse禁止とする。
+`h_target`はround間で急変させず、EMA `alpha=0.25`で更新する。
 
 ### 0A.4 状態モデル
 
@@ -328,6 +655,11 @@ RefinementRun:
   metrics_after
   stop_reason
   random_seed
+  sizing_field_hash
+  mesh_budget
+  budget_before
+  budget_after
+  split_rejection_reasons
 ```
 
 メッシュ本体を毎回DBへ入れる必要はない。内容ハッシュ付きartifactとして保存し、イベントから参照する。
@@ -339,10 +671,10 @@ RefinementRun:
 ```text
 stop if any:
   round >= max_rounds
-  no accepted operation
   improvement below epsilon for 2 rounds
   all patches satisfy geometry + topology + quality gates
   unsafe patch ratio exceeds threshold -> MANUAL_REVIEW
+  vertex/face/time/VRAM budget exhausted
 ```
 
 終了状態は最低でも次を区別する。
@@ -353,6 +685,28 @@ PASS_WITH_WARNINGS
 MANUAL_REVIEW
 INFEASIBLE
 FAILED_NUMERICALLY
+INFEASIBLE_MESH_BUDGET
+STALLED_SAFE
+OSCILLATION_DETECTED
+```
+
+`no accepted operation`や`max_rounds`はPASS理由ではない。
+
+```text
+PASS:
+  全ハードゲート合格、必須品質違反なし
+
+PASS_WITH_WARNINGS:
+  全ハードゲート合格、ソフト目標のみ未達
+
+INFEASIBLE_MESH_BUDGET:
+  未解決違反があり、サイズ/時間/VRAM予算が枯渇
+
+STALLED_SAFE:
+  未解決違反があるが、安全に適用できる候補がない
+
+OSCILLATION_DETECTED:
+  split/collapseまたは品質指標が周期状態になった
 ```
 
 ---
@@ -390,6 +744,7 @@ L_overshoot = mesh samples -> input/evidence surface distance
 L_normal    = robust normal consistency
 L_area      = local area distortion
 L_edge      = target edge-length distribution
+L_budget    = soft cost near, but never beyond, the hard mesh budget
 ```
 
 実データ推論時にはGTがないため、`L_cover`の代理として入力点群被覆、局所密度、拘束、UDF残差を併用する。
@@ -431,6 +786,33 @@ units: mm
 
 `Jacobian`、`warpage`、`skewness`を一般名だけで扱わない。要素型ごとの定義と閾値を`solver_profile.yaml`へ固定する。クアッド要素のwarpageやJacobianは、クアッド生成フェーズで別途導入する。
 
+研究PoCのmesh quality gate初期値:
+
+```text
+non_manifold/self_intersection/duplicate/degenerate = 0
+unintended connected-component increase = 0
+minimum angle hard >= 10 deg
+99% of angles >= 20 deg
+maximum angle hard <= 150 deg
+aspect ratio p95 <= 5
+aspect ratio max <= 10
+90% of edges within 0.7..1.3 * h_target
+accepted-round area ratio within 0.95..1.05
+```
+
+solver profileごとの初期サイズは、ベンダー保証値ではなく収束試験開始値として
+管理する。
+
+| 用途 | global target | local target | hard floor | growth |
+|---|---:|---:|---:|---:|
+| implicit shell（Abaqus/CalculiX等） | 5mm | 2mm | 1mm | 1.30 |
+| linear/modal shell（Nastran/OptiStruct等） | 6mm | 2.5mm | 1.5mm | 1.30 |
+| explicit crash shell | 5mm | 3mm | 2mm | 1.20 |
+
+explicit解析では最小要素が時間刻みを支配するため、`h_floor`を固定値だけで
+決めず、要求最小時間刻みからも制限する。質量スケーリングが必要な場合は
+自動PASSにしない。
+
 ---
 
 ## 0C. 学習データ設計
@@ -460,6 +842,28 @@ Phase 1は、GTと頂点対応を維持できる摂動だけを使う。これ�
 
 Phase 2でsplit/collapse/flipを追加し、操作ラベルはヒューリスティックな「唯一の正解」ではなく、操作後の品質改善量を教師とするランキング学習にする。
 
+split/collapse学習時は、同じ形状に複数の予算を与える。
+
+```text
+budget condition:
+  max_vertices
+  h_abs_floor
+  target_solver_size
+  remaining_split_budget
+```
+
+モデルが「細かくすれば常に正解」と学習しないよう、品質改善量を追加頂点数で
+割った効率も教師に含める。
+
+```text
+utility(operation) =
+  geometry_gain
+  + quality_gain
+  - lambda_cost * added_vertices
+```
+
+ただしハード上限違反操作はutilityによらず不正解とする。
+
 Phase 3の穴修復では、合成欠損の作り方が実欠損分布と一致する保証がないため、必ず実データで別評価する。
 
 ### 0C.2 カリキュラム
@@ -469,7 +873,7 @@ Phase 3の穴修復では、合成欠損の作り方が実欠損分布と一致�
 | C0 | 接線方向平滑化のみ | 固定 |
 | C1 | 接線 + 制限付き法線変位 | 固定 |
 | C2 | パッチ単位反復2〜3回 | 固定 |
-| C3 | remesh優先度予測 | 決定論的操作 |
+| C3 | budget-aware remesh優先度予測 | 決定論的操作 |
 | C4 | 合成穴の修復候補 | 限定変更 |
 | C5 | 実部品の境界/欠損 | 人間確認付き |
 
@@ -493,6 +897,9 @@ split unit:
 
 * 現行`reconstruct_midsurface()`の出力を入力とする
 * 接線Laplacian、Taubin smoothing、edge flip、局所splitを比較
+* 入力極短辺のcollapse正規化を実装
+* `h_abs_floor`を0.5/1.0/2.0mmでスイープ
+* 一括全辺細分化をadaptive sizing field方式と比較
 * self-intersection、面反転、面積膨張、穴、外れ値を同一評価器で測る
 * 既存body002だけでなく、Easy/Medium/Hardを最低各2部品用意する
 
@@ -539,6 +946,10 @@ Go条件:
 * AIはsplit/collapse/flipの優先度のみ予測
 * 操作はSafetyKernel付き決定論的実装
 * 操作前後の局所品質差を全件記録
+* SizingAndBudgetControllerが`h_target(x)`と上限を所有
+* 1 roundの頂点増加率を最大1.5倍に制限
+* `h_floor`未満の新規辺を作る操作は禁止
+* split/collapseヒステリシスとサイズ場growth ratioを検証
 
 ### Phase R4: Limited Topology Repair
 
@@ -567,7 +978,8 @@ Go条件:
 | トポロジー | component、boundary loop、non-manifold、self-intersection |
 | 品質 | minimum angle、aspect ratio、edge transition、invalid count |
 | 安定性 | seed分散、roundごとの単調性、rollback率 |
-| 計算量 | peak VRAM、wall time、頂点あたり処理時間 |
+| サイズ制御 | min/p01/p05 edge length、`length/h_target`分布、growth ratio違反、split/collapse往復率 |
+| 計算量 | peak VRAM、wall time、頂点あたり処理時間、頂点/面予算消費率 |
 
 平均Chamferだけで合否を決めない。
 
@@ -586,6 +998,17 @@ L3: L2 + adaptive remeshing priority
 
 AI方式はB1/B2を有意に超えた場合のみ採用する。
 
+サイズ制御の比較条件:
+
+```text
+S0: refine_roundsによる全辺一括細分化（現行比較用）
+S1: 一律h_target + hard floor
+S2: 曲率適応h_target
+S3: 曲率 + feature + solver + budget sizing field
+```
+
+S3はS0より少ない頂点数で同等以上のp95幾何誤差を達成することをGo条件とする。
+
 ---
 
 ## 0F. 主要リスクと対策
@@ -596,6 +1019,10 @@ AI方式はB1/B2を有意に超えた場合のみ採用する。
 | 再帰処理で小さな誤差が増幅する | 高 | 各roundの単調ゲート、最大変位、accepted meshのみ次へ渡す |
 | トポロジー教師が定義できない | 高 | 初期は固定トポロジー、後に操作後品質のranking |
 | 全体Transformerのメモリ爆発 | 高 | patch GNN + coarse global tokens |
+| 細分化で頂点数が指数増加 | 高 | sizing field、hard budget、1 round増加率、全辺一括split禁止 |
+| 極短辺により品質が悪化 | 高 | 入力正規化collapse、h_floor、zero-area除去 |
+| split/collapseが振動する | 中 | 4/3と4/5のヒステリシス、操作cooldown、履歴監査 |
+| 最小頂点距離が近接二面を破壊 | 高 | adjacency edge floorとnonlocal collision distanceを分離 |
 | 平滑化でビード/曲げ線が消える | 高 | feature flags、曲率適応、接線/法線分離、局所freeze |
 | 開境界を穴として閉じる | 高 | boundary semantic classifier成立前は自動穴修復禁止 |
 | CAE品質改善で幾何から離れる | 中 | 辞書式制約、normal/tangent分離、幾何budget |
@@ -637,11 +1064,13 @@ GHMRは現行UDFを前提に進められるが、FieldEvidenceProviderは交換�
 最初のコード変更は、巨大な`Structure Memory Transformer`ではない。次の順序が最短である。
 
 1. 既存`reconstruct.py`から共通評価器とSafetyKernelを分離する。
-2. `subdivide_and_project()`の前後をトランザクション化し、悪化時rollbackできるようにする。
-3. 固定トポロジーの局所パッチdatasetをGT中立面から合成する。
-4. 接線変位だけを出す小型GNNを実装する。
-5. 決定論的Laplacian/Taubin baselineと比較する。
-6. 効果が確認できてから法線変位、拘束トークン、remesh priorityの順に追加する。
+2. SizingAndBudgetControllerと入力極短辺collapseを実装する。
+3. `subdivide_and_project()`を一括全辺splitから局所adaptive splitへ置換する。
+4. refinement roundの前後をトランザクション化し、悪化時rollbackできるようにする。
+5. 固定トポロジーの局所パッチdatasetをGT中立面から合成する。
+6. 接線変位だけを出す小型GNNを実装する。
+7. 決定論的Laplacian/Taubin/adaptive remesh baselineと比較する。
+8. 効果が確認できてから法線変位、拘束トークン、budget-aware remesh priorityの順に追加する。
 
 この順序なら、各段階で「AIを追加した価値」が測定でき、Topology Repair Headまで作った後に根本仮説が外れていた、という高コストな失敗を避けられる。
 
@@ -743,6 +1172,12 @@ YAML、CLI、Python関数のデフォルトを重複定義しない。
 ---
 
 # 初版設計素案（以下、原案を保存）
+
+> **非規範セクション / 実装参照禁止**
+> 以下は初版時点の履歴であり、現行実装は必ず本書冒頭の
+> `0. 結論`〜`0I. 安全性・運用上の境界`を参照すること。
+> 特に全辺一括細分化、AIによる直接トポロジー変更、UDFオラクル扱い、
+> 学習済み停止判断、重み付き総合品質による安全判定は採用しない。
 
 ## 1. 目的
 
