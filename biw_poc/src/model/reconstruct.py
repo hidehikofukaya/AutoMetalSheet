@@ -58,6 +58,23 @@ from vecset_ae import VecSetAE
 print = functools.partial(print, flush=True)
 
 
+class InsufficientEvidenceError(RuntimeError):
+    """Raised when deterministic evidence gates cannot support reconstruction."""
+
+
+def select_candidate_pool(gate_idx: np.ndarray, grid_count: int, minimum_required: int) -> np.ndarray:
+    """Fail closed when evidence gates leave too few candidate points."""
+    gate_idx = np.asarray(gate_idx, dtype=np.int64)
+    if len(gate_idx) < minimum_required:
+        raise InsufficientEvidenceError(
+            f"Only {len(gate_idx)} grid points pass required evidence gates; "
+            f"minimum is {minimum_required}. Ungated fallback is prohibited."
+        )
+    if np.any(gate_idx < 0) or np.any(gate_idx >= grid_count):
+        raise ValueError("gate_idx contains an out-of-range grid index")
+    return gate_idx
+
+
 def load_model(ckpt_path: pathlib.Path, device: str) -> VecSetAE:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg = ckpt["cfg"]
@@ -511,12 +528,7 @@ def reconstruct_midsurface(model, z, device, points_norm: np.ndarray, grid_res: 
         print(f"  R7-11 kNN-OOD gate: {len(ood_idx)}/{len(grid_xyz)} pts within "
               f"{input_dist_threshold_mm}mm of nearest input point")
 
-    if len(gate_idx) >= nbr_sz * 2:
-        pool_idx = gate_idx
-    else:
-        print(f"  WARNING: only {len(gate_idx)} grid pts pass the gate(s) "
-              f"(< {nbr_sz*2}), falling back to ungated grid for candidate selection")
-        pool_idx = np.arange(len(udf))
+    pool_idx = select_candidate_pool(gate_idx, len(udf), nbr_sz * 2)
 
     k = min(len(pool_idx), target_k)
     order = np.argsort(udf[pool_idx])

@@ -1248,3 +1248,48 @@ otherwise:
 
 既存15部品は可能な限り全てout-of-fold評価へ回す。R1 technical Goは内部妥当性の
 判定であり、外部一般化・生産Goには将来取得するprospective shadow setを別途要求する。
+
+---
+
+## 22. R0 PoC開始・Go判定GUI実装（Round 15）
+
+### 記録日: 2026-06-21
+
+### 実装範囲
+
+R0第一弾を「既存・新規stage出力の証拠化、正式評価、hard gate、GUI可視化」に
+限定して開始した。adaptive remeshing、GNN、R1学習はまだ含めない。
+
+| 判断ID | 内容 |
+|---|---|
+| R15-01 | `r0_audit.yaml`を必須profileとし、評価sample数、seed、品質gate、Phase最低標本数を単一設定から読む。 |
+| R15-02 | 正式距離評価を面積一様sampleから相手三角形面への双方向point-to-surfaceとし、各方向10万点を保存する。 |
+| R15-03 | altitude aspect ratio、最小角、non-manifold、duplicate face、zero-length edge、degenerate face、component等をstage単位で保存する。 |
+| R15-04 | manifest、artifact、metrics、評価sampleをSHA-256で結び、AuditEventをhash chain化する。 |
+| R15-05 | GUIは保存済みmanifest/gate結果をread-only正本として表示し、3Dヒートマップの値でGo判定を再計算しない。 |
+| R15-06 | candidate evidence不足時のungated fallbackを廃止し、`InsufficientEvidenceError`でfail-closed停止する。 |
+| R15-07 | hard gate失敗を標本不足より優先して`NO_GO`表示し、品質合格後に標本不足なら`PHASE_INSUFFICIENT_VALIDATION_DATA`とする。 |
+| R15-08 | GUI bundle検証でhash不一致、artifact欠落、AuditEvent chain破損があれば`BUNDLE_INVALID`として緑色表示を禁止する。 |
+
+### 実データ試走
+
+保存済みbody002のcoarse/refine1/refine2/refine3へ正式評価を実施した。
+
+| stage | vertices | faces | min angle | aspect p95 | stage→reference p95 | reference→stage p95 | face components |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| coarse | 4,080 | 6,300 | 0.0358° | 13.13 | 11.65mm | 8.55mm | 41 |
+| refine1 | 14,570 | 25,109 | 0.0075° | 15.09 | 11.09mm | 6.42mm | 41 |
+| refine2 | 54,323 | 100,203 | 0.0026° | 21.04 | 11.37mm | 5.41mm | 43 |
+| refine3 | 208,881 | 400,363 | 0.0001° | 29.83 | 11.82mm | 4.77mm | 46 |
+
+被覆方向は細分化で改善する一方、最小角、aspect ratio、component数が悪化するため、
+全stageがhard quality gate不合格。これは全辺一括細分化をadaptive remeshingへ
+置換すべきというR12/R13の判断を正式評価器でも確認した結果である。
+
+### 次の実装順
+
+1. 15部品へR0 auditを展開し、part familyを確定
+2. 複数run集約とfamily-cluster統計
+3. known-defect injection suiteの拡充
+4. deterministic tangential smoothing/collapse baseline
+5. SizingAndBudgetControllerと局所adaptive split

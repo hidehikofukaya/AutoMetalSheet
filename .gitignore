@@ -20,6 +20,8 @@ __pycache__/
 
 # Logs / scratch
 *.log
+biw_poc/runs/
+biw_poc/screenshots/
 
 # Claude Code local settings (machine-local, not project source)
 .claude/

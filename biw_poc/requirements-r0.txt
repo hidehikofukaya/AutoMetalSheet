@@ -1,0 +1,17 @@
+# Versions verified on the R0 implementation workstation (2026-06-21).
+# Install PyTorch with the CUDA/CPU wheel appropriate for the target machine.
+numpy==2.3.5
+scipy==1.16.3
+trimesh==4.12.2
+pyvista==0.48.4
+pyvistaqt==0.11.4
+PyQt5==5.15.11
+h5py==3.15.1
+PyYAML==6.0.3
+pytest==8.4.2
+rtree
+
+# Verified separately:
+# torch==2.6.0+cu124
+# pythonocc-core is required only for STEP preprocessing/viewing and is best
+# installed from conda-forge because no universal pip wheel is available.

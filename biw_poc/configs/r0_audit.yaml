@@ -1,0 +1,37 @@
+profile_id: R0_OUTPUT_AUDIT
+profile_version: 1
+usage: baseline
+eligible_for_phase_go: true
+
+reconstruction:
+  grid_res: 96
+  band_factor: 3.0
+  n_proj_iters: 5
+  nbr_sz: 20
+  refine_rounds: 0
+  conf_threshold: 0.0
+  input_dist_threshold_mm: 10.0
+  prune_dist_threshold_mm: 20.0
+
+evaluation:
+  formal_evaluation: true
+  distance_definition_id: area_uniform_point_to_triangle_surface_v1
+  aspect_definition_id: triangle_altitude_aspect_ratio_v1
+  sample_count: 100000
+  sample_seed: 20260621
+  area_numeric_floor_mm2: 1.0e-12
+
+quality_gates:
+  non_manifold_edge_count_max: 0
+  degenerate_face_count_max: 0
+  duplicate_face_count_max: 0
+  zero_length_edge_count_max: 0
+  minimum_angle_deg_min: 10.0
+  altitude_aspect_ratio_p95_max: 5.0
+  altitude_aspect_ratio_max_max: 10.0
+
+phase_gate:
+  minimum_out_of_fold_parts: 8
+  minimum_part_families: 3
+  require_family_cluster_bootstrap: true
+  insufficient_data_status: PHASE_INSUFFICIENT_VALIDATION_DATA
