@@ -1340,3 +1340,43 @@ sweep 6はaspect p95が`7.8553→7.9321`へ悪化したためrollbackした。
 正式point-to-surface比較ではadaptiveの被覆p95はcoarseとほぼ同等であり、
 legacy refine3の被覆改善には届かない。次段階ではSafetyKernel下で
 投影付き局所splitを実装する。
+
+---
+
+## 24. softmin UDF引継ぎレビュー（Round 17）
+
+### 記録日: 2026-06-21
+
+### 目的
+
+メッシュ生成AIへ渡すUDFの正規GTと、R7-17 softmin実験の位置づけを整理した。
+
+### 確定判断
+
+| 判断ID | 内容 |
+|---|---|
+| R17-01 | 正規UDF GTは幾何学的hard-min距離とし、有限・非負・表面で0を契約とする。 |
+| R17-02 | `-tau*log(sum(exp(-d_i/tau)))` の生softminは負値とテセレーション依存を持つため、正規UDFではなくcut-locus/枝曖昧性の診断・補助信号として扱う。 |
+| R17-03 | `tau*softplus(gt/tau)` は `gt=0` を `tau*ln(2)` に移しゼロ集合を保存しないため、UDFの標準フロアとして採用しない。GTは微分対象ではないので、負値だけを除去する比較条件には `clamp_min(gt, 0)` を使える。 |
+| R17-04 | raw softminを保存する場合は、`query_udf`とは別の`query_softmin_raw`等に分離し、`branch_ambiguity`、`effective_branch_count`、`grad_valid`または`cut_locus_weight`を併記する。 |
+| R17-05 | raw負値GTを使う`near_mae`でbest checkpoint選択や`<0.1mm` overfit判定を行わない。学習対象に整合したphysical UDF MAEとraw診断値を分離する。 |
+| R17-06 | `query_grad`は数学的な`grad(UDF)`ではなく「点から表面へ向かう単位方向」である。外部I/Oには`gradient_convention=toward_surface`を必須とし、数学的勾配を渡す場合は符号反転する。 |
+| R17-07 | 独立gradient headとscalar UDFのautograd勾配に整合性損失を設け、通常投影経路とDCUDF経路のベクトル場を一致させる比較実験を行う。 |
+| R17-08 | 外部UDF接続契約にschema version、座標系、world-mm/normalized単位、center、scale、bounds、gradient convention、微分可能性、正式UDF/診断surrogate区分を含める。 |
+| R17-09 | softmin評価は単一部品だけで採否を決めず、同一CADの複数テセレーション、複数部品、hard-min baseline、clamp条件、曖昧性補助条件を比較する。 |
+
+### 実測根拠
+
+`softmin_r717/body002_filled_dataset.h5`では、raw softmin GTの負値率は全体約22.0%、
+NEARカテゴリ約37.3%、最小値約-2.013mmだった。`tau=1.0mm`のsoftplusフロアは
+raw 0付近を約0.693mmへ移し、真の表面距離0.5mm未満に対するMAEをhard clampの
+約0.119mmから約0.385mmへ悪化させた。
+
+### 次の実験順
+
+1. hard-min scalar UDF + hard-min toward-surface direction
+2. hard-min scalar UDF + cut-locus領域のgradient loss mask/weight
+3. hard-min scalar UDF + branch ambiguity補助ヘッド
+4. raw softmin、hard clamp、現softplus条件は研究比較群としてのみ評価
+5. 通常再構成とDCUDFの双方で双方向point-to-surface、境界距離、ghost面積、
+   component、non-manifold、投影残差、収束率を比較
