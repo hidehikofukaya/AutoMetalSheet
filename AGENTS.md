@@ -1293,3 +1293,50 @@ R0第一弾を「既存・新規stage出力の証拠化、正式評価、hard ga
 3. known-defect injection suiteの拡充
 4. deterministic tangential smoothing/collapse baseline
 5. SizingAndBudgetControllerと局所adaptive split
+
+---
+
+## 23. R0複数部品集約・bounded adaptive baseline（Round 16）
+
+### 記録日: 2026-06-21
+
+### 確定判断
+
+| 判断ID | 内容 |
+|---|---|
+| R16-01 | 単一部品runとPhase aggregateを分離し、Phase Goは複数manifest集約側で判定する。 |
+| R16-02 | 15部品のcohortを`r0_cohort.yaml`で事前固定し、欠落、重複、family不一致、事後除外をGo禁止条件とする。 |
+| R16-03 | 主性能指標は部品ごとのbaseline→candidate改善率とし、family平均を等重み集約する。 |
+| R16-04 | family-cluster paired bootstrap 10,000回、worst-family、leave-one-family-out感度を集約artifactへ保存する。 |
+| R16-05 | power analysis未達時は、統計結果が良くても`PHASE_INSUFFICIENT_VALIDATION_DATA`とする。 |
+| R16-06 | adaptive baselineは長辺のconforming local splitに限定し、汎用collapse/flipはまだ実装しない。 |
+| R16-07 | split候補は親辺だけでなく、生成される全子辺が`h_floor`以上であることを要求する。 |
+| R16-08 | 1 sweepのsplit辺割合、頂点増加率、hard max verticesを独立hard budgetとして適用する。 |
+| R16-09 | 各sweepをcandidate transactionとし、component、boundary component、短辺数、面積、最小角、aspect p95が悪化すればrollbackする。 |
+| R16-10 | adaptive baselineはUDF再投影をまだ行わないため、安全な密度制御baselineであり、幾何改善器とは扱わない。 |
+
+### body002試走
+
+設定:
+
+```text
+target_edge_mm = 8.0
+h_floor_mm = 0.5
+max_split_edge_fraction_per_sweep = 0.10
+max_vertex_growth_ratio_per_sweep = 1.5
+hard_max_vertices = 250000
+```
+
+| 出力 | 頂点 | 面 | 最小角 | aspect p95 | face components |
+|---|---:|---:|---:|---:|---:|
+| coarse | 4,080 | 6,300 | 0.0358° | 13.13 | 41 |
+| legacy refine3 | 208,881 | 400,363 | 0.0001° | 29.83 | 46 |
+| adaptive sweep5 | 11,730 | 20,281 | 0.0358° | 7.86 | 41 |
+
+sweep 6はaspect p95が`7.8553→7.9321`へ悪化したためrollbackした。
+入力由来の`h_floor < 0.5mm`辺は93本残るが、新規増加はゼロ。
+したがってterminal状態は`STALLED_SAFE`であり、入力正規化collapseが次課題。
+
+正式point-to-surface比較ではadaptiveの被覆p95はcoarseとほぼ同等であり、
+legacy refine3の被覆改善には届かない。次段階ではSafetyKernel下で
+投影付き局所splitを実装する。

@@ -27,6 +27,7 @@ def test_altitude_aspect_ratio_for_equilateral_triangle():
     result = mesh_metrics(mesh, area_floor=1.0e-12)
     assert np.isclose(result["altitude_aspect_ratio_p95"], 2.0 / np.sqrt(3.0))
     assert result["boundary_edge_count"] == 3
+    assert result["boundary_component_count"] == 1
     assert result["non_manifold_edge_count"] == 0
 
 

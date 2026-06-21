@@ -72,5 +72,46 @@ GUIはGo判定を再計算しません。`run_manifest.json`と保存済みgate�
 
 R0の証拠・可視化基盤を開始できる状態です。Technical Goには今後、
 最低8部品・3 family、nested grouped validation、family-cluster統計が必要です。
-adaptive remeshingとGNNはまだGo判定対象ではありません。
+bounded adaptive baselineは比較用に実装済みですが、投影付きadaptive remeshingと
+GNNはまだGo判定対象ではありません。
 
+## 4. 複数部品の集約
+
+15部品の対象とfamilyは`configs/r0_cohort.yaml`に事前固定しています。
+
+```powershell
+biw_poc\run_r0_aggregate.bat `
+  biw_poc\runs `
+  biw_poc\runs\r0_cohort_manifest.json `
+  coarse `
+  adaptive
+
+biw_poc\run_r0_cohort_viewer.bat `
+  biw_poc\runs\r0_cohort_manifest.json
+```
+
+集約は部品単位のpaired improvementを計算し、family平均を等重みで扱う
+family-cluster bootstrapを使用します。欠落部品、重複part ID、family不一致、
+profile/evaluator/hashの混在、power analysis未達があればTechnical Goにしません。
+
+## 5. Bounded adaptive baseline
+
+```powershell
+biw_poc\run_adaptive_baseline.bat `
+  path\to\coarse_midsurface.ply `
+  biw_poc\runs\adaptive_part001 `
+  8.0
+```
+
+このbaselineは次を実装します。
+
+- `length > 4/3 * target_edge`の長辺だけを選択
+- 共有辺を両側で同時更新するconforming split
+- 1面1splitに限定した非競合batch
+- 全生成子辺の`h_floor`検査
+- 1 sweepのsplit率・頂点増加率・総頂点数のhard limit
+- component、boundary component、短辺数、面積、最小角、aspect p95の単調gate
+- candidate mesh hash付きtransaction、失敗時rollback
+
+現時点では既存入力に含まれる極短辺をcollapseしません。残存時は
+`STALLED_SAFE`として記録し、次段階の入力正規化collapseへ引き継ぎます。

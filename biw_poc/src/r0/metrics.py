@@ -122,6 +122,19 @@ def _vertex_component_count(vertex_count: int, unique_edges: np.ndarray) -> int:
     return int(count)
 
 
+def _boundary_component_count(
+    vertex_count: int, unique_edges: np.ndarray, edge_use: np.ndarray
+) -> int:
+    boundary_edges = unique_edges[edge_use == 1]
+    if len(boundary_edges) == 0:
+        return 0
+    boundary_vertices = np.unique(boundary_edges)
+    remap = np.full(vertex_count, -1, dtype=np.int64)
+    remap[boundary_vertices] = np.arange(len(boundary_vertices))
+    compact_edges = remap[boundary_edges]
+    return _vertex_component_count(len(boundary_vertices), compact_edges)
+
+
 def _face_component_count(mesh: trimesh.Trimesh) -> int:
     face_count = len(mesh.faces)
     if face_count == 0:
@@ -153,6 +166,9 @@ def mesh_metrics(mesh: trimesh.Trimesh, area_floor: float) -> dict[str, Any]:
         "face_count": int(len(faces)),
         "surface_area_mm2": float(geometry["area"].sum()),
         "boundary_edge_count": int(np.count_nonzero(edge_use == 1)),
+        "boundary_component_count": _boundary_component_count(
+            len(mesh.vertices), unique_edges, edge_use
+        ),
         "non_manifold_edge_count": int(np.count_nonzero(edge_use > 2)),
         "duplicate_face_count": _duplicate_face_count(faces),
         "zero_length_edge_count": int(

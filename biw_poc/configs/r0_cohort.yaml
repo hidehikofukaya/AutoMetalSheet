@@ -1,0 +1,36 @@
+cohort_id: R0_REAL_STP_15_V1
+frozen_before_evaluation: true
+power_analysis_satisfied: false
+minimum_family_macro_improvement_ratio: 0.20
+
+members:
+  - part_id: A0072600002_body046
+    part_family: A0072600002
+  - part_id: A0072600002_body099
+    part_family: A0072600002
+  - part_id: A0072600081_body022
+    part_family: A0072600081
+  - part_id: A0072600450_body007
+    part_family: A0072600450
+  - part_id: A0072600450_body011
+    part_family: A0072600450
+  - part_id: A0072600529_body069
+    part_family: A0072600529
+  - part_id: A0072600529_body086
+    part_family: A0072600529
+  - part_id: A0072600592_body015
+    part_family: A0072600592
+  - part_id: A0072600592_body042
+    part_family: A0072600592
+  - part_id: A0072600592_body044
+    part_family: A0072600592
+  - part_id: A0072600592_body055
+    part_family: A0072600592
+  - part_id: A0072600592_body062
+    part_family: A0072600592
+  - part_id: A0072600592_body094
+    part_family: A0072600592
+  - part_id: A0072600592_body102
+    part_family: A0072600592
+  - part_id: A0072600592_body136
+    part_family: A0072600592
