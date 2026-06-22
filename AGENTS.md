@@ -1380,3 +1380,167 @@ raw 0付近を約0.693mmへ移し、真の表面距離0.5mm未満に対するMAE
 4. raw softmin、hard clamp、現softplus条件は研究比較群としてのみ評価
 5. 通常再構成とDCUDFの双方で双方向point-to-surface、境界距離、ghost面積、
    component、non-manifold、投影残差、収束率を比較
+
+---
+
+## 25. 第一モデル Softmin Guidance 方針（Round 18）
+
+### 記録日: 2026-06-21
+
+### 目的
+
+最終形状確定とは分離し、第一モデルで「粗い初期メッシュを安定して生成し、
+再帰的な後続ラウンドへ渡す」ことを優先する。Stage Aから第一モデルの候補探索・
+方向推定までsoftmin系の表現で統一する。
+
+### Round 17からの更新
+
+Round 17の「softminを正式なphysical UDFと呼ばない」という判断は維持する。
+一方、第一モデルの主生成信号としてsoftminを使用しないという意味には拡張しない。
+第一モデルではsoftminを `soft potential / guidance field` として正式採用する。
+
+### 確定判断
+
+| 判断ID | 内容 |
+|---|---|
+| R18-01 | 第一モデルを既存VecSet UDFモデルから独立した `SoftminGuidanceModel` とする。既存checkpointとAPIを上書きしない。 |
+| R18-02 | 第一モデルの主候補選択信号はsigned soft potentialとし、Stage Aから学習・粗メッシュ候補選択まで同じ定義を使う。 |
+| R18-03 | raw soft potentialの負値を距離や投影ステップとして直接使用しない。頂点移動量は独立した非負step-distance head、方向はsoft toward-surface direction headが担当する。 |
+| R18-04 | 第一モデルの出力は少なくとも `soft_potential`、`step_distance`、`direction_toward_surface`、`branch_ambiguity` の4系統とする。 |
+| R18-05 | 候補選択はsoft potentialの順位とambiguityを使用できるが、移動は `x_next = x + clamp(step_distance, 0, max_step) * direction` とする。負potentialによる逆走を禁止する。 |
+| R18-06 | Stage Aはsoft potentialに加え、正のhard distanceをstep-distance教師・独立評価証拠として併存保存する。これは第一モデルの候補選択をhard-minへ戻すためではない。 |
+| R18-07 | soft方向の混合ベクトルが相殺される領域では無理に投影せず、ambiguity/direction-strengthにより細分化・保留・後続ラウンドへ送る。 |
+| R18-08 | 第一モデルの完了条件は最終表面精度ではなく、粗メッシュの被覆安定性、ghost抑制、再帰処理へ渡せる連結性・安全性とする。 |
+| R18-09 | 最終形状確定、厳密境界、CAE品質保証は第二モデルまたは決定論的Geometry Finalization/SafetyKernelの責務とし、第一モデルのsoft potentialゼロ集合を最終形状と見なさない。 |
+| R18-10 | tauは固定の製品共通定数ではなく、再帰roundと局所target edge lengthに連動して縮小する。初期候補は `tau ≈ 0.25〜0.5 * local_target_edge_length` とし、実測で校正する。 |
+
+### 第一モデルの初期検証基準
+
+1. Stage Aの全出力が有限で、step distanceが非負、ambiguityが0〜1、
+   direction strengthが0〜1である。
+2. 単一部品overfitでsoft potential、step distance、direction、ambiguityの
+   各lossが減少する。
+3. 負soft potential点でも移動ステップが逆向きにならない。
+4. 同一入力・seedで粗メッシュ生成が決定的である。
+5. hard-min旧モデル、legacy softminモデル、Softmin Guidance Modelを、
+   双方向point-to-surface、被覆、ghost面積、component、non-manifold、
+   境界距離、生成失敗率で比較する。
+
+### Round 18実装・初期検証結果
+
+- 独立`SoftminGuidanceModel`、専用Dataset、学習器、1周目粗メッシュ再構成器を実装。
+- 出力はsigned potential、non-negative step distance、toward-surface direction、
+  branch ambiguity。potentialを投影量へ使用しないことを単体テストで固定。
+- Stage A H5スキーマ`stage_a.softmin_guidance.v1`を追加。旧UDF学習器がこの
+  スキーマを誤読した場合はfail-fastする。
+- 全テスト44件成功。実body002でStage A→150epoch単一部品学習→粗メッシュPLYの
+  閉ループを完走。
+- softmin候補枝は三角形単位ではなく、隣接面法線差5度以内を連結したsmooth face
+  patch単位へ変更。同一平面の再テセレーションでpotential/ambiguityが変わらない
+  回帰試験を追加。
+- 第一モデルのFPSを決定化し、同一checkpoint/入力から生成したPLYのSHA-256一致を確認。
+- consistency lossはpotential勾配normが未発達な点を除外し、初期ゼロpotentialでの
+  勾配爆発を防止。potential/step lossは予測側をclipせず回復勾配を維持する。
+
+body002縮小PoC条件:
+
+```text
+input points=2048
+queries=6144
+tau=1.0mm, k_faces=8, clip_radius=5mm
+model=96dim / 64 tokens / 32 latents / encoder 3L / decoder 2L
+train=150 epochs
+coarse grid=32, projection=3, max_step=3mm
+```
+
+初期結果:
+
+| 指標 | 値 |
+|---|---:|
+| best near potential MAE + step MAE | 1.526mm |
+| 粗メッシュ vertices / faces | 5,539 / 8,510 |
+| 面積比 Recon/GT | 0.792 |
+| GT→Recon mean / p95 | 5.95mm / 21.16mm |
+| Recon→GT mean / p95 | 6.74mm / 15.76mm |
+| connected components | 27 |
+| boundary edges / non-manifold edges | 2,660 / 0 |
+
+判断: 第一モデルの学習・生成閉ループと粗い形状被覆は成立した。ただしp95距離、
+component数、境界辺数は安定した1周目生成の最終Go水準には未達。次はtau/local
+edge連動、ambiguityを用いた再帰候補分割、component統合をSafetyKernel下で行い、
+同一body002で旧hard-min/legacy softminとの公平な比較を実施する。
+
+---
+
+## 26. UDFモデル単体の精度・確度保証（Round 19）
+
+### 記録日: 2026-06-22
+
+### 方針
+
+メッシュ生成・VTK再構成を評価経路から外し、Softmin Guidance/UDFモデル単体の
+距離場、方向場、ambiguity、入力支持範囲、候補選択、反復投影、表面被覆を測る。
+局所的にGTへ近いことと、GT全面を覆うことを別指標として扱う。
+
+### 確定判断
+
+| 判断ID | 内容 |
+|---|---|
+| R19-01 | best checkpointは変動するtraining queryではなく、固定validationで選択する。単一H5はquery holdout、複数部品の正式評価は`val_data`によるpart holdoutを使用する。 |
+| R19-02 | query holdoutは同一入力点群を共有するため部品内補間の証拠に限定し、未知部品への汎化証拠とは扱わない。 |
+| R19-03 | best選択指標へnear potential MAE、near step MAEに加えて、direction cosine errorとambiguity MAEを含める。 |
+| R19-04 | raw signed potentialの昇順だけを本番候補選択の既定にしない。`abs(potential)`、step distance、ambiguity penalty、spatial balanceを比較可能にする。 |
+| R19-05 | branch ambiguityは幾何学的な枝競合であり、epistemic uncertainty/OOD確度とは呼ばない。入力点群までの距離を独立したsupport/OOD proxyとして報告する。 |
+| R19-06 | support gate有無を必ず比較する。gateでpoint-to-GTが改善してもGT-to-points coverageが悪化する場合は合格としない。 |
+| R19-07 | 正式分析は保存query、独立dense grid、距離帯別校正、ghost/missed-near、autograd gradient整合、5ランキング、反復ごとの双方向距離を含む。 |
+| R19-08 | レポートはJSON（完全指標）、Markdown（要約）、NPZ（再解析配列）、PNG（距離場・投影・位置関係・ambiguity校正）を同時生成する。 |
+| R19-09 | 単一部品・学習内checkpointの結果は暫定診断であり、確度保証には未知CAD 30部品以上、5 family以上、複数seedのpart-level評価が必要。 |
+
+### 実装
+
+- `SoftminGuidanceDataset`へ固定query subsetと固定validation samplingを追加。
+- `train_softmin_guidance.py`へ`--val-data` / `--val-fraction`、split hash、
+  validation由来best checkpoint、train/val分離historyを追加。
+- best compositeを次へ更新:
+  `potential MAE + step MAE + 0.5 * direction cosine error
+  + 0.5 * ambiguity MAE`。
+- `reconstruct_softmin_guidance.py`へ5種類の候補ランキングとsupport gate無効化比較を追加。
+- `analyze_softmin_guidance_field.py`を新設。メッシュ生成は行わない。
+
+### body002 / Claude再学習checkpointの暫定結果
+
+対象はepoch 1928の単一部品train fallback checkpointであり、validation splitはない。
+48³ grid、候補4096点、投影5反復、GT表面sample 10,000点で測定した。
+
+| 指標 | 値 | 暫定判定 |
+|---|---:|---|
+| NEAR potential MAE / p95 | 0.152 / 0.697mm | pass |
+| NEAR step MAE / p95 | 0.204 / 0.719mm | fail |
+| NEAR clear方向 p95 / 90°超率 | 30.65° / 2.80% | p95 pass / 反転率 fail |
+| NEAR ambiguity MAE / Spearman | 0.208 / 0.520 | fail |
+| high-ambiguity AUROC / false-safe率 | 0.807 / 53.76% | fail |
+| potential > step + 0.1mm 違反率 | 15.60% | fail |
+| input cloud point→GT mean / p95 | 0.157 / 0.391mm | 局所精度は良好 |
+| GT→input cloud coverage mean / p95 | 12.958 / 69.242mm | fail |
+| GTの5mm以内をinputが覆う割合 | 72.02% | fail |
+| dense-grid ghost率（abs potential） | 2.18% | fail |
+| support gate + spatial balance 投影後 point→GT mean / p95 | 0.501 / 2.347mm | fail |
+| 同条件 GT→points coverage mean / p95 | 13.544 / 61.731mm | fail |
+| 同条件 初期比worsened率 | 7.23% | fail |
+
+暫定quality gateは17項目中3項目のみpassで、判定は`not_ready`。
+support gateなしではcoverage meanが約5.3〜6.1mmだがpoint→GT meanが約5.7〜14.6mm、
+gateありではpoint→GT meanが約0.5〜0.6mmへ改善する一方coverage meanが
+約13.5〜13.9mmへ悪化した。現在の主要課題は局所距離回帰ではなく、
+方向誤差の長い裾、ambiguity過小推定、遠方場の飽和、候補の全面被覆である。
+さらに入力点群自体がGT中央領域を欠落しており、GT→input coverage p95は
+69.24mmだった。support gate後のcoverage上限はモデルだけでなくStage A入力点群の
+欠落に支配されているため、モデル改良前に入力sampleの完全性を修正する。
+
+### 次の実験順
+
+1. 新best compositeと固定query holdoutでbody002を再学習し、旧checkpointと比較。
+2. 入力点群を面積均一sampleへ改善し、support gateによる中央領域欠落を解消。
+3. direction反転点とhigh-ambiguity見逃し点をhard-example samplingへ追加。
+4. part holdout可能な複数CADデータセットを構築し、family単位でsplitする。
+5. メッシュ生成は上記model-only gateを満たしてから再開する。

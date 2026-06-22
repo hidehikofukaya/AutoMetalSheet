@@ -45,7 +45,9 @@ import torch.nn.functional as F
 # FPS / kNN (pure PyTorch -- no pytorch3d / torch-cluster, see module docstring)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def furthest_point_sampling(xyz: torch.Tensor, n_samples: int) -> torch.Tensor:
+def furthest_point_sampling(
+    xyz: torch.Tensor, n_samples: int, deterministic_start: bool = False
+) -> torch.Tensor:
     """
     xyz: [B, N, 3]
     returns idx: [B, n_samples] long -- indices of the sampled points.
@@ -54,7 +56,11 @@ def furthest_point_sampling(xyz: torch.Tensor, n_samples: int) -> torch.Tensor:
     device = xyz.device
     idx = torch.zeros(B, n_samples, dtype=torch.long, device=device)
     dist = torch.full((B, N), float("inf"), device=device)
-    farthest = torch.randint(0, N, (B,), dtype=torch.long, device=device)
+    if deterministic_start:
+        center = xyz.mean(dim=1, keepdim=True)
+        farthest = torch.sum((xyz - center) ** 2, dim=-1).argmax(dim=-1)
+    else:
+        farthest = torch.randint(0, N, (B,), dtype=torch.long, device=device)
     batch_idx = torch.arange(B, device=device)
     for i in range(n_samples):
         idx[:, i] = farthest
@@ -118,10 +124,12 @@ class PointTokenizer(nn.Module):
     """FPS(M centers) + kNN(k) grouping + mini-PointNet -> per-group tokens."""
 
     def __init__(self, n_centers: int = 256, k: int = 32,
-                 in_extra_ch: int = 3, token_dim: int = 384, hidden: int = 128):
+                 in_extra_ch: int = 3, token_dim: int = 384, hidden: int = 128,
+                 deterministic_fps: bool = False):
         super().__init__()
         self.n_centers = n_centers
         self.k = k
+        self.deterministic_fps = deterministic_fps
         self.pointnet = MiniPointNet(in_ch=3 + in_extra_ch, out_ch=token_dim, hidden=hidden)
 
     def forward(self, points: torch.Tensor, feats: torch.Tensor | None = None):
@@ -130,7 +138,9 @@ class PointTokenizer(nn.Module):
         feats:  [B,N,Cf] optional extra per-point features (e.g. normals)
         returns tokens [B,n_centers,token_dim], center_xyz [B,n_centers,3]
         """
-        center_idx = furthest_point_sampling(points, self.n_centers)    # [B,M]
+        center_idx = furthest_point_sampling(
+            points, self.n_centers, deterministic_start=self.deterministic_fps
+        )                                                               # [B,M]
         center_xyz = index_points(points, center_idx)                   # [B,M,3]
         knn_idx = knn_gather_idx(points, center_xyz, self.k)             # [B,M,k]
         grouped_xyz = index_points(points, knn_idx)                      # [B,M,k,3]

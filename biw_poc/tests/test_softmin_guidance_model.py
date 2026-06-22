@@ -97,6 +97,26 @@ def test_decoder_activations_include_signed_and_zero_vector_fallback():
     assert torch.equal(prediction.branch_ambiguity, torch.full((1, 2), 0.5))
 
 
+def test_signed_potential_head_starts_exactly_at_zero():
+    model = _small_model()
+    prediction = model.decode(
+        torch.randn(1, 5, 3), torch.randn(1, 3, 24)
+    )
+    assert torch.equal(prediction.soft_potential, torch.zeros(1, 5))
+
+
+def test_encoder_is_deterministic_in_eval_mode():
+    torch.manual_seed(3)
+    model = _small_model().eval()
+    points = torch.randn(1, 12, 3)
+    normals = torch.nn.functional.normalize(torch.randn(1, 12, 3), dim=-1)
+
+    assert torch.equal(
+        model.encode(points, normals),
+        model.encode(points, normals),
+    )
+
+
 def test_checkpoint_metadata_is_json_serializable_and_explicit():
     metadata = build_checkpoint_metadata(_small_model())
     json.dumps(metadata)
@@ -111,9 +131,16 @@ def test_checkpoint_metadata_is_json_serializable_and_explicit():
         == "toward_surface"
     )
     assert metadata["output_contract"]["branch_ambiguity"]["activation"] == "sigmoid"
+    assert (
+        metadata["output_contract"]["branch_ambiguity"]["semantic"]
+        == "geometric_branch_competition"
+    )
+    assert metadata["output_contract"]["branch_ambiguity"]["ood_score"] is False
 
 
-def _write_guidance_h5(path: pathlib.Path, include_ambiguity: bool = True) -> None:
+def _write_guidance_h5(
+    path: pathlib.Path, include_ambiguity: bool = True, inject_nan: bool = False
+) -> None:
     n_query = 10
     query_index = np.arange(n_query, dtype=np.float32)
     points = np.array(
@@ -137,9 +164,10 @@ def _write_guidance_h5(path: pathlib.Path, include_ambiguity: bool = True) -> No
         h5_file.create_dataset("points", data=points)
         h5_file.create_dataset("normals", data=np.tile([0.0, 0.0, 1.0], (6, 1)))
         h5_file.create_dataset("query_xyz", data=query_xyz)
-        h5_file.create_dataset(
-            "query_soft_potential", data=100.0 + query_index
-        )
+        potential = 100.0 + query_index
+        if inject_nan:
+            potential[0] = np.nan
+        h5_file.create_dataset("query_soft_potential", data=potential)
         h5_file.create_dataset("query_step_distance", data=200.0 + query_index)
         h5_file.create_dataset("query_soft_direction", data=toward_surface)
         if include_ambiguity:
@@ -150,10 +178,12 @@ def _write_guidance_h5(path: pathlib.Path, include_ambiguity: bool = True) -> No
             "query_direction_strength", data=1.0 - query_index / 20.0
         )
         h5_file.create_dataset(
-            "query_category", data=np.arange(n_query, dtype=np.int64)
+            "query_category", data=np.arange(n_query, dtype=np.int64) % 3
         )
         h5_file.attrs["thickness_mm"] = 1.25
         h5_file.attrs["schema_version"] = "stage_a.softmin_guidance.v1"
+        h5_file.attrs["gradient_convention"] = "toward_surface"
+        h5_file.attrs["coordinate_unit"] = "mm"
 
 
 def test_dataset_subsamples_all_query_fields_with_one_index_and_keeps_mm(tmp_path):
@@ -171,7 +201,9 @@ def test_dataset_subsamples_all_query_fields_with_one_index_and_keeps_mm(tmp_pat
     assert torch.allclose(
         item["query_direction_strength"], 1.0 - selected_index / 20.0
     )
-    assert torch.equal(item["query_category"], selected_index.to(torch.int64))
+    assert torch.equal(
+        item["query_category"], selected_index.to(torch.int64) % 3
+    )
     assert torch.equal(
         item["query_soft_direction"].argmax(dim=-1),
         selected_index.to(torch.int64) % 3,
@@ -197,4 +229,12 @@ def test_dataset_missing_new_stage_a_field_fails_at_construction(tmp_path):
     _write_guidance_h5(path, include_ambiguity=False)
 
     with pytest.raises(KeyError, match="query_branch_ambiguity"):
+        SoftminGuidanceDataset([path], n_query_sample=None)
+
+
+def test_dataset_rejects_non_finite_guidance_at_construction(tmp_path):
+    path = tmp_path / "nan_dataset.h5"
+    _write_guidance_h5(path, inject_nan=True)
+
+    with pytest.raises(ValueError, match="non-finite"):
         SoftminGuidanceDataset([path], n_query_sample=None)

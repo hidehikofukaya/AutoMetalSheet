@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import pathlib
+from typing import Sequence
+
 import h5py
 import numpy as np
 import torch
@@ -17,7 +19,7 @@ from torch.utils.data import Dataset
 
 
 STAGE_A_SCHEMA_VERSION = "stage_a.softmin_guidance.v1"
-BASE_REQUIRED_DATASETS = ("points", "normals", "query_xyz")
+BASE_REQUIRED_DATASETS = ("points", "normals", "query_xyz", "query_category")
 GUIDANCE_REQUIRED_DATASETS = (
     "query_soft_potential",
     "query_step_distance",
@@ -51,6 +53,12 @@ def _resolve_guidance_fields(
             f"{source}: schema_version must be {STAGE_A_SCHEMA_VERSION!r}, "
             f"got {schema_version!r}"
         )
+    if h5_file.attrs.get("gradient_convention") != "toward_surface":
+        raise ValueError(
+            f"{source}: gradient_convention must be 'toward_surface'"
+        )
+    if h5_file.attrs.get("coordinate_unit") != "mm":
+        raise ValueError(f"{source}: coordinate_unit must be 'mm'")
 
     return _ResolvedFields(
         signed_potential="query_soft_potential",
@@ -88,8 +96,22 @@ def _validate_shapes(
         raise ValueError(
             f"{source}: {fields.toward_surface} must have shape [{n_query},3]"
         )
-    if "query_category" in h5_file and h5_file["query_category"].shape != (n_query,):
+    if h5_file["query_category"].shape != (n_query,):
         raise ValueError(f"{source}: query_category must have shape [{n_query}]")
+    for name in BASE_REQUIRED_DATASETS + GUIDANCE_REQUIRED_DATASETS:
+        if not np.isfinite(h5_file[name][:]).all():
+            raise ValueError(f"{source}: {name} contains non-finite values")
+    if np.any(h5_file[fields.step_distance][:] < 0):
+        raise ValueError(f"{source}: query_step_distance must be non-negative")
+    ambiguity = h5_file[fields.ambiguity][:]
+    if np.any((ambiguity < 0) | (ambiguity > 1)):
+        raise ValueError(f"{source}: query_branch_ambiguity must lie in [0,1]")
+    strength = h5_file[fields.direction_strength][:]
+    if np.any((strength < 0) | (strength > 1)):
+        raise ValueError(f"{source}: query_direction_strength must lie in [0,1]")
+    category = h5_file["query_category"][:]
+    if np.any((category < 0) | (category > 2)):
+        raise ValueError(f"{source}: query_category must use 0=near, 1=far, 2=boundary")
 
 
 class SoftminGuidanceDataset(Dataset):
@@ -101,6 +123,8 @@ class SoftminGuidanceDataset(Dataset):
         n_query_sample: int | None = 4096,
         n_points_sample: int | None = None,
         seed: int = 0,
+        query_indices: Sequence[Sequence[int] | np.ndarray | None] | None = None,
+        fixed_sampling: bool = False,
     ):
         if isinstance(h5_paths, (str, pathlib.Path)):
             root = pathlib.Path(h5_paths)
@@ -118,15 +142,65 @@ class SoftminGuidanceDataset(Dataset):
         self.n_query_sample = n_query_sample
         self.n_points_sample = n_points_sample
         self._rng = np.random.default_rng(seed)
+        self.fixed_sampling = fixed_sampling
         self._resolved_fields: list[_ResolvedFields] = []
+        self.query_counts: list[int] = []
+        self.query_indices: list[np.ndarray] = []
+        self._fixed_query_samples: list[np.ndarray | None] = []
+        self._fixed_point_samples: list[np.ndarray | None] = []
+        if query_indices is not None and len(query_indices) != len(self.h5_paths):
+            raise ValueError("query_indices must have one entry per HDF5 part")
 
         # Eager metadata validation is deliberate: incompatible Stage A files
         # fail at construction, before a training worker starts an epoch.
-        for path in self.h5_paths:
+        fixed_rng = np.random.default_rng(seed)
+        for index, path in enumerate(self.h5_paths):
             with h5py.File(path, "r") as h5_file:
                 fields = _resolve_guidance_fields(h5_file, path)
                 _validate_shapes(h5_file, path, fields)
                 self._resolved_fields.append(fields)
+                n_query = int(h5_file["query_xyz"].shape[0])
+                n_points = int(h5_file["points"].shape[0])
+                self.query_counts.append(n_query)
+
+            requested = None if query_indices is None else query_indices[index]
+            if requested is None:
+                allowed = np.arange(n_query, dtype=np.int64)
+            else:
+                allowed = np.asarray(requested, dtype=np.int64)
+                if allowed.ndim != 1 or len(allowed) == 0:
+                    raise ValueError(
+                        f"{path}: query_indices must be a non-empty 1D sequence"
+                    )
+                if np.any((allowed < 0) | (allowed >= n_query)):
+                    raise IndexError(f"{path}: query_indices are out of range")
+                if len(np.unique(allowed)) != len(allowed):
+                    raise ValueError(f"{path}: query_indices must be unique")
+                allowed = allowed.copy()
+            self.query_indices.append(allowed)
+
+            fixed_query_sample = None
+            if (
+                fixed_sampling
+                and n_query_sample is not None
+                and n_query_sample < len(allowed)
+            ):
+                positions = fixed_rng.choice(
+                    len(allowed), size=n_query_sample, replace=False
+                )
+                fixed_query_sample = allowed[positions]
+            self._fixed_query_samples.append(fixed_query_sample)
+
+            fixed_point_sample = None
+            if (
+                fixed_sampling
+                and n_points_sample is not None
+                and n_points_sample < n_points
+            ):
+                fixed_point_sample = fixed_rng.choice(
+                    n_points, size=n_points_sample, replace=False
+                )
+            self._fixed_point_samples.append(fixed_point_sample)
 
     def __len__(self) -> int:
         return len(self.h5_paths)
@@ -160,27 +234,38 @@ class SoftminGuidanceDataset(Dataset):
             )
             thickness_mm = float(h5_file.attrs.get("thickness_mm", 0.0))
 
-        if self.n_points_sample is not None and self.n_points_sample < len(points):
+        fixed_point_sample = self._fixed_point_samples[index]
+        if fixed_point_sample is not None:
+            point_index = fixed_point_sample
+            points = points[point_index]
+            normals = normals[point_index]
+        elif self.n_points_sample is not None and self.n_points_sample < len(points):
             point_index = self._rng.choice(
                 len(points), size=self.n_points_sample, replace=False
             )
             points = points[point_index]
             normals = normals[point_index]
 
-        if self.n_query_sample is not None and self.n_query_sample < len(query_xyz):
-            query_index = self._rng.choice(
-                len(query_xyz), size=self.n_query_sample, replace=False
+        query_index = self.query_indices[index]
+        fixed_query_sample = self._fixed_query_samples[index]
+        if fixed_query_sample is not None:
+            query_index = fixed_query_sample
+        elif self.n_query_sample is not None and self.n_query_sample < len(query_index):
+            positions = self._rng.choice(
+                len(query_index), size=self.n_query_sample, replace=False
             )
-            # Every query-aligned field is indexed exactly once with this same
-            # array.  Never independently sample individual supervision heads.
-            query_xyz = query_xyz[query_index]
-            signed_potential = signed_potential[query_index]
-            step_distance = step_distance[query_index]
-            toward_surface = toward_surface[query_index]
-            ambiguity = ambiguity[query_index]
-            direction_strength = direction_strength[query_index]
-            if query_category is not None:
-                query_category = query_category[query_index]
+            query_index = query_index[positions]
+
+        # Every query-aligned field is indexed exactly once with this same
+        # array. Never independently sample individual supervision heads.
+        query_xyz = query_xyz[query_index]
+        signed_potential = signed_potential[query_index]
+        step_distance = step_distance[query_index]
+        toward_surface = toward_surface[query_index]
+        ambiguity = ambiguity[query_index]
+        direction_strength = direction_strength[query_index]
+        if query_category is not None:
+            query_category = query_category[query_index]
 
         center = points.mean(axis=0, dtype=np.float64).astype(np.float32)
         extent = float(np.abs(points - center).max())
@@ -201,6 +286,7 @@ class SoftminGuidanceDataset(Dataset):
             "center": torch.from_numpy(center),
             "scale": torch.tensor(scale, dtype=torch.float32),
             "thickness_mm": torch.tensor(thickness_mm, dtype=torch.float32),
+            "query_index": torch.from_numpy(query_index.copy()),
             "source": str(path),
         }
         if query_category is not None:
@@ -225,12 +311,17 @@ def collate_softmin_guidance(batch: list[dict[str, object]]) -> dict[str, object
         "thickness_mm",
     )
     output: dict[str, object] = {
-        key: torch.stack([item[key] for item in batch], dim=0)  # type: ignore[list-item]
+        key: torch.stack(
+            [item[key] for item in batch], dim=0  # type: ignore[list-item]
+        )
         for key in tensor_keys
     }
     if all("query_category" in item for item in batch):
         output["query_category"] = torch.stack(
             [item["query_category"] for item in batch], dim=0  # type: ignore[list-item]
         )
+    output["query_index"] = torch.stack(
+        [item["query_index"] for item in batch], dim=0  # type: ignore[list-item]
+    )
     output["source"] = [item["source"] for item in batch]
     return output

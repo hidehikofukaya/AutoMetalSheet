@@ -1,0 +1,69 @@
+# Round 18 initial profile: coarse first-pass Softmin Guidance Model.
+# Values are PoC starting points, not production guarantees.
+
+stage_a:
+  schema_version: stage_a.softmin_guidance.v1
+  softmin_tau_mm: 1.0
+  softmin_k_faces: 8
+  softmin_clip_radius_mm: 5.0
+  gradient_convention: toward_surface
+
+model:
+  token_dim: 96
+  n_tokens: 64
+  k_neighbors: 32
+  n_latents: 32
+  enc_layers: 3
+  dec_layers: 2
+  n_heads: 6
+  n_freqs: 6
+
+train:
+  lr: 0.0005
+  # For one-part experiments use a deterministic query holdout. For formal
+  # evaluation replace this with val_data pointing at disjoint CAD parts.
+  val_fraction: 0.2
+  lambda_potential: 1.0
+  lambda_step: 1.0
+  lambda_direction: 0.5
+  lambda_ambiguity: 0.3
+  lambda_consistency: 0.01
+  best_potential_weight: 1.0
+  best_step_weight: 1.0
+  best_direction_weight_mm: 0.5
+  best_ambiguity_weight_mm: 0.5
+  best_metric: >
+    near_potential_mae_mm + near_step_mae_mm
+    + 0.5 * near_direction_cosine_error
+    + 0.5 * near_ambiguity_mae
+
+coarse_reconstruct:
+  grid_res: 32
+  candidate_factor: 3.0
+  projection_iterations: 3
+  input_dist_threshold_mm: 15.0
+  ranking_mode: abs_potential_ambiguity
+  analysis_recommended_candidate: spatial_balanced
+  ambiguity_penalty_mm: 2.0
+  max_step_mm: 3.0
+  ambiguity_damping: 1.0
+  prune_dist_threshold_mm: 20.0
+
+mesh_free_analysis:
+  grid_res: 48
+  candidate_count: 4096
+  projection_iterations: 5
+  coverage_samples: 10000
+  input_dist_threshold_mm: 10.0
+  compare_ood_gate: true
+  ranking_modes:
+    - raw_signed
+    - abs_potential
+    - step_distance
+    - abs_potential_plus_ambiguity
+    - spatial_balanced
+
+safety_contract:
+  signed_potential_used_for_step: false
+  final_surface_semantics: false
+  fail_closed_on_insufficient_evidence: true

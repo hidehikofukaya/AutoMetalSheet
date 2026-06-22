@@ -142,8 +142,13 @@ class SoftminGuidanceDecoder(nn.Module):
         )
 
         # Start the positive step head close to zero, as in VecSetAE's UDF
-        # head, while keeping potential signed and ambiguity neutral.
+        # head. The signed potential row is initialized exactly at zero:
+        # even a small normalized-space random output becomes tens of mm
+        # after per-part rescaling, which can start outside the truncated
+        # training band and destabilize the first updates.
         with torch.no_grad():
+            self.head[-1].weight[0].zero_()
+            self.head[-1].bias[0] = 0.0
             self.head[-1].bias[1] = -5.0
 
     def forward(
@@ -213,6 +218,7 @@ class SoftminGuidanceModel(nn.Module):
             k=k_neighbors,
             in_extra_ch=extra_channels,
             token_dim=token_dim,
+            deterministic_fps=True,
         )
         self.token_pos_enc = PositionalMLP(token_dim)
         self.encoder = TransformerEncoder(
@@ -323,6 +329,9 @@ class SoftminGuidanceModel(nn.Module):
                 "branch_ambiguity": {
                     "activation": "sigmoid",
                     "range": "[0, 1]",
+                    "semantic": "geometric_branch_competition",
+                    "epistemic_uncertainty": False,
+                    "ood_score": False,
                 },
             },
         }

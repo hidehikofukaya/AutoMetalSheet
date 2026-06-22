@@ -68,6 +68,13 @@ class MidSurfaceUDFDataset(Dataset):
     def __getitem__(self, idx):
         path = self.h5_paths[idx]
         with h5py.File(path, "r") as f:
+            schema_version = f.attrs.get("schema_version")
+            if schema_version == "stage_a.softmin_guidance.v1":
+                raise ValueError(
+                    f"{path} is a Softmin Guidance dataset. "
+                    "Use SoftminGuidanceDataset/train_softmin_guidance.py; "
+                    "query_udf is a signed ranking potential, not a physical UDF."
+                )
             points = f["points"][:]
             normals = f["normals"][:]
             query_xyz = f["query_xyz"][:]
