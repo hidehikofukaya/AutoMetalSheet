@@ -1,0 +1,934 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>Hole Filler — AutoMetalSheet</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  display: flex;
+  height: 100vh;
+  overflow: hidden;
+  background: #1a1a1e;
+  color: #d4d4d8;
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  font-size: 13px;
+}
+
+/* ===== Sidebar ===== */
+#sidebar {
+  width: 280px;
+  min-width: 280px;
+  background: #1e1e24;
+  border-right: 1px solid #2e2e38;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.sidebar-header {
+  padding: 14px 16px 10px;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: #a1a1aa;
+  border-bottom: 1px solid #2e2e38;
+  text-transform: uppercase;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.sidebar-header .badge {
+  font-size: 10px;
+  background: #4f46e5;
+  color: #fff;
+  border-radius: 3px;
+  padding: 1px 5px;
+  letter-spacing: 0;
+}
+
+.section {
+  padding: 10px 14px;
+  border-bottom: 1px solid #2e2e38;
+}
+
+.section-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: #71717a;
+  text-transform: uppercase;
+  margin-bottom: 8px;
+}
+
+select {
+  width: 100%;
+  background: #27272a;
+  color: #d4d4d8;
+  border: 1px solid #3f3f46;
+  border-radius: 4px;
+  padding: 5px 8px;
+  font-size: 13px;
+  cursor: pointer;
+}
+select:focus { outline: none; border-color: #6366f1; }
+
+label.check-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+  cursor: pointer;
+  user-select: none;
+}
+label.check-row:hover { color: #f4f4f5; }
+label.check-row input[type=checkbox] { cursor: pointer; accent-color: #6366f1; }
+
+.slider-row { margin-top: 6px; }
+.slider-row .slider-label {
+  display: flex;
+  justify-content: space-between;
+  color: #a1a1aa;
+  margin-bottom: 4px;
+  font-size: 12px;
+}
+input[type=range] { width: 100%; accent-color: #6366f1; }
+
+#meshInfo { line-height: 1.8; color: #a1a1aa; font-size: 12px; }
+#meshInfo .val { color: #d4d4d8; }
+
+/* ===== Holes list ===== */
+#holesList {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.hole-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px;
+  border-radius: 3px;
+  font-size: 12px;
+}
+.hole-item .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.dot-filled { background: #22c55e; }
+.dot-open   { background: #ef4444; }
+.dot-skipped{ background: #a78bfa; }
+.hole-meta  { color: #71717a; font-size: 11px; margin-left: auto; white-space: nowrap; }
+.hole-toggle-row { display: flex; gap: 6px; margin-bottom: 5px; }
+.hole-toggle-row button {
+  font-size: 10px; padding: 2px 6px; border-radius: 3px; border: 1px solid #3f3f46;
+  background: #27272a; color: #a1a1aa; cursor: pointer;
+}
+.hole-toggle-row button:hover { background: #3f3f46; color: #d4d4d8; }
+.hole-item input[type=checkbox] { cursor: pointer; accent-color: #6366f1; flex-shrink: 0; }
+
+/* ===== Fill panel ===== */
+#fillPanel { }
+
+.fill-status-box {
+  background: #111116;
+  border: 1px solid #2e2e38;
+  border-radius: 4px;
+  padding: 8px;
+  font-size: 11px;
+  color: #71717a;
+  min-height: 48px;
+  max-height: 130px;
+  overflow-y: auto;
+  font-family: monospace;
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin-top: 6px;
+}
+.fill-status-box .ok   { color: #22c55e; }
+.fill-status-box .err  { color: #ef4444; }
+.fill-status-box .info { color: #60a5fa; }
+
+.progress-bar-wrap {
+  background: #27272a;
+  border-radius: 3px;
+  height: 4px;
+  margin-top: 6px;
+  overflow: hidden;
+  display: none;
+}
+.progress-bar { height: 100%; background: #4f46e5; width: 0%; transition: width 0.3s; }
+.progress-bar.indeterminate {
+  width: 40% !important;
+  animation: slide 1.2s infinite ease-in-out;
+}
+@keyframes slide {
+  0%   { margin-left: -40%; }
+  100% { margin-left: 100%; }
+}
+
+/* ===== Part meta ===== */
+#partMeta { line-height: 1.8; color: #a1a1aa; font-size: 12px; }
+#partMeta .val { color: #d4d4d8; }
+
+/* ===== Buttons ===== */
+.btn {
+  display: block;
+  width: 100%;
+  padding: 8px;
+  background: #4f46e5;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.btn:hover:not(:disabled) { background: #4338ca; }
+.btn:active:not(:disabled) { background: #3730a3; }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.btn-success { background: #16a34a; }
+.btn-success:hover:not(:disabled) { background: #15803d; }
+
+.btn-secondary {
+  background: #27272a;
+  color: #d4d4d8;
+  border: 1px solid #3f3f46;
+  margin-top: 6px;
+}
+.btn-secondary:hover:not(:disabled) { background: #3f3f46; }
+
+.btn-row { display: flex; gap: 6px; }
+.btn-row .btn { flex: 1; }
+
+#status-sidebar {
+  padding: 8px 14px;
+  font-size: 11px;
+  color: #71717a;
+  min-height: 28px;
+}
+
+/* ===== Viewport ===== */
+#viewport {
+  flex: 1;
+  position: relative;
+  background: #111116;
+}
+#viewport canvas { display: block; width: 100% !important; height: 100% !important; }
+
+#loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(17,17,22,0.85);
+  font-size: 15px;
+  color: #a1a1aa;
+  z-index: 10;
+  letter-spacing: 0.05em;
+}
+#loading.hidden { display: none; }
+
+#viewport-status {
+  position: absolute;
+  bottom: 10px;
+  left: 10px;
+  font-size: 11px;
+  color: #52525b;
+  pointer-events: none;
+}
+
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 3px; }
+</style>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+
+<body>
+<!-- ===== Sidebar ===== -->
+<aside id="sidebar">
+  <div class="sidebar-header">
+    Hole Filler
+    <span class="badge">STP</span>
+  </div>
+
+  <!-- Part select -->
+  <div class="section">
+    <div class="section-title">Part</div>
+    <select id="partSelect"><option value="">— loading —</option></select>
+  </div>
+
+  <!-- Display -->
+  <div class="section">
+    <div class="section-title">Display</div>
+    <label class="check-row"><input type="checkbox" id="chkFilled" checked> Filled mesh</label>
+    <label class="check-row"><input type="checkbox" id="chkOriginal"> Original mesh</label>
+    <label class="check-row"><input type="checkbox" id="chkEdges" checked> Edges</label>
+    <label class="check-row"><input type="checkbox" id="chkAnnotations" checked> Holes</label>
+    <label class="check-row"><input type="checkbox" id="chkDiagnostic"> <span style="color:#fbbf24">壁面検出</span> <span style="font-size:10px;color:#52525b">(赤=壁,黄=境界,水=内側)</span></label>
+    <div class="slider-row">
+      <div class="slider-label">
+        <span>Edge angle</span>
+        <span><span id="edgeAngleVal">10</span>°</span>
+      </div>
+      <input type="range" id="edgeAngle" min="1" max="89" value="10">
+    </div>
+  </div>
+
+  <!-- Fill panel -->
+  <div class="section" id="fillPanel">
+    <div class="section-title">Hole Fill (STP)</div>
+
+    <button class="btn" id="detectBtn" disabled style="margin-bottom:4px">① Detect Holes (STP)</button>
+    <div class="btn-row" style="margin-bottom:4px">
+      <button class="btn btn-success" id="fillSelectedBtn" disabled>② Fill Selected</button>
+      <button class="btn" id="fillAllBtn" disabled>Fill All</button>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-secondary" id="reloadMeshBtn" style="margin-top:0" disabled>Reload</button>
+    </div>
+
+    <div class="progress-bar-wrap" id="progressWrap">
+      <div class="progress-bar indeterminate" id="progressBar"></div>
+    </div>
+    <div class="fill-status-box" id="fillLog">—</div>
+  </div>
+
+  <!-- Holes list -->
+  <div class="section">
+    <div class="section-title">Holes</div>
+    <div id="holesList">—</div>
+  </div>
+
+  <!-- Mesh info -->
+  <div class="section">
+    <div class="section-title">Mesh Info</div>
+    <div id="meshInfo">—</div>
+  </div>
+
+  <!-- Part meta -->
+  <div class="section">
+    <div class="section-title">Part Info</div>
+    <div id="partMeta">—</div>
+  </div>
+
+  <!-- Actions -->
+  <div class="section">
+    <button class="btn" id="screenshotBtn">Screenshot</button>
+    <button class="btn btn-secondary" id="resetCameraBtn">Reset Camera</button>
+  </div>
+
+  <div id="status-sidebar"></div>
+</aside>
+
+<!-- ===== 3D Viewport ===== -->
+<main id="viewport">
+  <div id="loading">Loading...</div>
+  <div id="viewport-status">Drag to rotate · Scroll to zoom · Right-drag to pan</div>
+</main>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ===== Scene =====
+const viewport = document.getElementById('viewport');
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setClearColor(0x111116);
+viewport.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 1e7);
+camera.position.set(0, 0, 3000);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.screenSpacePanning = true;
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+const dir1 = new THREE.DirectionalLight(0xffffff, 0.8);
+dir1.position.set(1, 2, 3);
+scene.add(dir1);
+const dir2 = new THREE.DirectionalLight(0x8888cc, 0.4);
+dir2.position.set(-2, -1, -1);
+scene.add(dir2);
+
+const groups = {
+  filled: new THREE.Group(),
+  original: new THREE.Group(),
+  edges: new THREE.Group(),
+  annotations: new THREE.Group(),
+  diagnostic: new THREE.Group(),
+};
+Object.values(groups).forEach(g => scene.add(g));
+
+const MAT = {
+  filled: new THREE.MeshPhongMaterial({ color: 0x4a7ab5, specular: 0x224488, shininess: 40, side: THREE.DoubleSide }),
+  original: new THREE.MeshPhongMaterial({ color: 0x7a8a96, shininess: 20, side: THREE.DoubleSide, transparent: true, opacity: 0.5, depthWrite: false }),
+  edgeLine: new THREE.LineBasicMaterial({ color: 0x1a2a3a }),
+  holeFilled: new THREE.MeshPhongMaterial({ color: 0x22c55e, emissive: 0x0a3a18, shininess: 60 }),
+  holeOpen:   new THREE.MeshPhongMaterial({ color: 0xef4444, emissive: 0x3a0a0a, shininess: 60 }),
+  holeSkipped:new THREE.MeshPhongMaterial({ color: 0xa78bfa, emissive: 0x1a0a3a, shininess: 60 }),
+  // Diagnostic overlay materials
+  diagWall:   new THREE.MeshBasicMaterial({ color: 0xff3333, side: THREE.DoubleSide, transparent: true, opacity: 0.55, depthTest: false }),
+  diagBoundary: new THREE.LineBasicMaterial({ color: 0xffdd00, linewidth: 2, depthTest: false }),
+  diagInnerWire: new THREE.LineBasicMaterial({ color: 0x00ffff, linewidth: 2, depthTest: false }),
+};
+
+// ===== State =====
+let currentPart = null;
+let currentHolesData = null;
+let currentPartsList = [];
+let edgeAngle = 10;
+let fillJobId = null;
+let fillPollTimer = null;
+
+// ===== Resize =====
+function resize() {
+  const w = viewport.clientWidth, h = viewport.clientHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+resize();
+new ResizeObserver(resize).observe(viewport);
+
+(function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+})();
+
+// ===== Helpers =====
+function setStatus(msg) { document.getElementById('status-sidebar').textContent = msg; }
+function showLoading(show) { document.getElementById('loading').classList.toggle('hidden', !show); }
+function clearGroup(g) {
+  while (g.children.length) {
+    const c = g.children[0];
+    if (c.geometry) c.geometry.dispose();
+    if (c.material) c.material.dispose();
+    g.remove(c);
+  }
+}
+function buildGeometry(meshData) {
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(meshData.vertices, 3));
+  geo.setIndex(new THREE.Uint32BufferAttribute(meshData.indices, 1));
+  geo.computeVertexNormals();
+  return geo;
+}
+function fitCamera(bounds) {
+  const min = new THREE.Vector3(...bounds.min);
+  const max = new THREE.Vector3(...bounds.max);
+  const center = min.clone().add(max).multiplyScalar(0.5);
+  const size = max.clone().sub(min).length();
+  camera.near = size * 0.001;
+  camera.far = size * 20;
+  camera.updateProjectionMatrix();
+  camera.position.copy(center).addScaledVector(new THREE.Vector3(0.5, 0.3, 1).normalize(), size * 1.4);
+  controls.target.copy(center);
+  controls.update();
+}
+
+// ===== Render layers =====
+let _lastFilledData = null;
+function renderFilled(data) {
+  clearGroup(groups.filled);
+  if (!data) return;
+  _lastFilledData = data;
+  const geo = buildGeometry(data);
+  groups.filled.add(new THREE.Mesh(geo, MAT.filled));
+  document.getElementById('meshInfo').innerHTML =
+    `Vertices: <span class="val">${data.n_vertices.toLocaleString()}</span><br>
+     Faces: <span class="val">${data.n_faces.toLocaleString()}</span>`;
+}
+function renderOriginal(data) {
+  clearGroup(groups.original);
+  if (!data) return;
+  groups.original.add(new THREE.Mesh(buildGeometry(data), MAT.original));
+}
+function renderEdges(data) {
+  clearGroup(groups.edges);
+  if (!data) return;
+  const geo = buildGeometry(data);
+  groups.edges.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo, edgeAngle), MAT.edgeLine));
+  geo.dispose();
+}
+function renderAnnotations(holesData) {
+  clearGroup(groups.annotations);
+  if (!holesData) return;
+  (holesData.holes || []).forEach(hole => {
+    const c = hole.center_xyz, n = hole.normal_xyz;
+    const r = Math.max((hole.radius_mm || 5) * 0.4, 2);
+    const mat = hole.status === 'filled' ? MAT.holeFilled : hole.status === 'skipped' ? MAT.holeSkipped : MAT.holeOpen;
+    const sphere = new THREE.Mesh(new THREE.SphereGeometry(r, 10, 8), mat.clone());
+    sphere.position.set(...c);
+    groups.annotations.add(sphere);
+    if (n) {
+      const dir = new THREE.Vector3(...n).normalize();
+      const len = Math.max(r * 3, 8);
+      groups.annotations.add(new THREE.ArrowHelper(dir, new THREE.Vector3(...c), len, 0xfbbf24, len*0.3, len*0.2));
+    }
+  });
+}
+
+function updateHolesList(holesData) {
+  const el = document.getElementById('holesList');
+  if (!holesData || !holesData.holes?.length) { el.textContent = 'なし'; return; }
+  const holes = holesData.holes;
+  const nf = holes.filter(h => h.status === 'filled').length;
+  const no = holes.filter(h => h.status !== 'filled' && h.status !== 'skipped').length;
+  let html = `<div style="color:#a1a1aa;font-size:11px;margin-bottom:4px">
+    計${holes.length}穴 — 埋済<span style="color:#22c55e">${nf}</span>
+    ${no > 0 ? ` / 未埋<span style="color:#ef4444">${no}</span>` : ''}
+  </div>
+  <div class="hole-toggle-row">
+    <button id="holeCheckAll">All</button>
+    <button id="holeCheckNone">None</button>
+  </div>`;
+  holes.forEach(h => {
+    const dc = h.status==='filled' ? 'dot-filled' : h.status==='skipped' ? 'dot-skipped' : 'dot-open';
+    const r = h.radius_mm ? h.radius_mm.toFixed(1) : '?';
+    html += `<div class="hole-item">
+      <input type="checkbox" id="holecheck-${h.hole_id}" checked>
+      <div class="dot ${dc}"></div>
+      <span>${h.hole_id}</span>
+      <span style="color:#52525b">${h.shape||'?'}</span>
+      <span class="hole-meta">r${r}</span>
+    </div>`;
+  });
+  el.innerHTML = html;
+
+  // All / None toggle buttons
+  document.getElementById('holeCheckAll').addEventListener('click', () => {
+    holes.forEach(h => {
+      const cb = document.getElementById(`holecheck-${h.hole_id}`);
+      if (cb) cb.checked = true;
+    });
+  });
+  document.getElementById('holeCheckNone').addEventListener('click', () => {
+    holes.forEach(h => {
+      const cb = document.getElementById(`holecheck-${h.hole_id}`);
+      if (cb) cb.checked = false;
+    });
+  });
+}
+
+function getSelectedHoleIds() {
+  const ids = [];
+  document.querySelectorAll('[id^="holecheck-"]').forEach(cb => {
+    if (cb.checked) {
+      ids.push(cb.id.replace('holecheck-', ''));
+    }
+  });
+  return ids;
+}
+
+function updatePartMeta(info) {
+  const el = document.getElementById('partMeta');
+  if (!info) { el.textContent = '—'; return; }
+  const t = info.thickness_mm != null ? info.thickness_mm.toFixed(2) + ' mm' : '?';
+  const v = info.volume_mm3 != null ? (info.volume_mm3/1000).toFixed(0) + ' cm³' : '?';
+  const hasStpLabel = info.has_stp ? '<span style="color:#22c55e">✓ STP</span>' : '<span style="color:#ef4444">✗ STP</span>';
+  el.innerHTML = `
+    Tag: <span class="val">${info.tag||'?'}</span><br>
+    Thickness: <span class="val">${t}</span><br>
+    Volume: <span class="val">${v}</span><br>
+    ${hasStpLabel}
+  `;
+}
+
+// ===== Diagnostic rendering =====
+let _diagData = null;
+
+function renderDiagnostic(diagData) {
+  clearGroup(groups.diagnostic);
+  if (!diagData || !diagData.holes) return;
+  _diagData = diagData;
+
+  for (const hole of diagData.holes) {
+    // --- Wall faces (red semi-transparent mesh) ---
+    if (hole.wall_verts && hole.wall_tris && hole.wall_verts.length > 0) {
+      const verts = new Float32Array(hole.wall_verts.flat());
+      const idxs = new Uint32Array(hole.wall_tris.flat());
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(verts, 3));
+      geo.setIndex(new THREE.BufferAttribute(idxs, 1));
+      geo.computeVertexNormals();
+      groups.diagnostic.add(new THREE.Mesh(geo, MAT.diagWall.clone()));
+    }
+
+    // --- Boundary edges (yellow lines) ---
+    if (hole.boundary_segs && hole.boundary_segs.length > 0) {
+      const pts = [];
+      for (const seg of hole.boundary_segs) {
+        pts.push(...seg[0], ...seg[1]);
+      }
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+      groups.diagnostic.add(new THREE.LineSegments(geo, MAT.diagBoundary));
+    }
+
+    // --- Inner wire segments (cyan lines) ---
+    if (hole.inner_wire_segs && hole.inner_wire_segs.length > 0) {
+      const pts = [];
+      for (const seg of hole.inner_wire_segs) {
+        pts.push(...seg[0], ...seg[1]);
+      }
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+      groups.diagnostic.add(new THREE.LineSegments(geo, MAT.diagInnerWire));
+    }
+  }
+}
+
+async function loadDiagnostic() {
+  if (!currentPart) return;
+  setStatus(`Loading diagnostic for ${currentPart}...`);
+  try {
+    const res = await fetch(`/api/holes/diagnostic?part=${currentPart}`);
+    if (!res.ok) {
+      const err = await res.json();
+      setStatus(`Diag error: ${err.error}`);
+      return;
+    }
+    const data = await res.json();
+    renderDiagnostic(data);
+    setStatus(`Diagnostic: ${data.holes.length} holes — 赤=壁面, 黄=境界稜線, 水=内側ワイヤ`);
+    // Log summary
+    appendFillLog('--- Diagnostic ---', 'info');
+    for (const h of data.holes) {
+      appendFillLog(`  ${h.hole_id} r=${h.radius_mm.toFixed(1)}: ${h.n_wall_faces}壁面 ${h.inner_wire_segs?.length > 0 ? h.n_inner_wires+'内側wire' : '内側wireなし'}`);
+    }
+  } catch (e) {
+    setStatus(`Diag error: ${e.message}`);
+  }
+}
+
+// ===== Load part =====
+async function loadPart(partId) {
+  if (!partId) return;
+  currentPart = partId;
+  showLoading(true);
+  setStatus(`Loading ${partId}...`);
+  stopFillPoll();
+
+  // Clear previous meshes and diagnostic on part switch
+  clearGroup(groups.original);
+  clearGroup(groups.diagnostic);
+  _diagData = null;
+  // Reset diagnostic checkbox (diagnostic must be re-loaded for new part)
+  const chkDiag = document.getElementById('chkDiagnostic');
+  if (chkDiag) chkDiag.checked = false;
+
+  // Update fill buttons
+  const info = currentPartsList.find(p => p.part_id === partId);
+  document.getElementById('detectBtn').disabled = !info?.has_stp;
+  const canFill = !!(info?.has_stp && info?.has_holes);
+  document.getElementById('fillSelectedBtn').disabled = !canFill;
+  document.getElementById('fillAllBtn').disabled = !canFill;
+  document.getElementById('reloadMeshBtn').disabled = false;
+  updatePartMeta(info);
+
+  try {
+    const [filledData, holesData] = await Promise.all([
+      fetch(`/api/mesh?part=${partId}&type=filled`).then(r => r.ok ? r.json() : null),
+      fetch(`/api/holes?part=${partId}`).then(r => r.ok ? r.json() : null),
+    ]);
+    currentHolesData = holesData;
+    renderFilled(filledData);
+    if (document.getElementById('chkEdges').checked) renderEdges(filledData);
+    if (document.getElementById('chkAnnotations').checked) renderAnnotations(holesData);
+    groups.filled.visible = document.getElementById('chkFilled').checked;
+    groups.edges.visible = document.getElementById('chkEdges').checked;
+    groups.annotations.visible = document.getElementById('chkAnnotations').checked;
+    if (filledData) fitCamera(filledData.bounds);
+    updateHolesList(holesData);
+    setStatus(`${partId} loaded`);
+  } catch (e) {
+    setStatus(`Error: ${e.message}`);
+  } finally {
+    showLoading(false);
+  }
+}
+
+// ===== Parts list =====
+async function initPartsList() {
+  const res = await fetch('/api/parts');
+  currentPartsList = await res.json();
+  const sel = document.getElementById('partSelect');
+  sel.innerHTML = '';
+  currentPartsList.forEach(p => {
+    const opt = document.createElement('option');
+    opt.value = p.part_id;
+    const tag = p.tag ? ` [${p.tag}]` : '';
+    const stp = p.has_stp ? '' : ' [no-stp]';
+    const holes = p.n_holes > 0 ? ` • ${p.n_filled}/${p.n_holes}穴` : '';
+    opt.textContent = `${p.part_id}${tag}${stp}${holes}`;
+    if (!p.has_filled) opt.style.color = '#52525b';
+    sel.appendChild(opt);
+  });
+  const first = currentPartsList.find(p => p.has_filled);
+  if (first) { sel.value = first.part_id; loadPart(first.part_id); }
+}
+
+// ===== Fill operations =====
+function appendFillLog(msg, cls = '') {
+  const box = document.getElementById('fillLog');
+  if (box.textContent === '—') box.textContent = '';
+  const span = document.createElement('span');
+  if (cls) span.className = cls;
+  span.textContent = msg + '\n';
+  box.appendChild(span);
+  box.scrollTop = box.scrollHeight;
+}
+
+function setProgressVisible(show) {
+  document.getElementById('progressWrap').style.display = show ? 'block' : 'none';
+}
+
+function stopFillPoll() {
+  if (fillPollTimer) { clearInterval(fillPollTimer); fillPollTimer = null; }
+  fillJobId = null;
+}
+
+async function startFill(fillAll = false) {
+  if (!currentPart) return;
+  document.getElementById('fillLog').textContent = '';
+  setProgressVisible(true);
+  document.getElementById('fillSelectedBtn').disabled = true;
+  document.getElementById('fillAllBtn').disabled = true;
+
+  const selectedIds = fillAll ? null : getSelectedHoleIds();
+  const label = fillAll ? 'all holes' : `${selectedIds?.length ?? 0} selected hole(s)`;
+  appendFillLog(`▶ Starting fill for ${currentPart} (${label})...`, 'info');
+
+  const body = { part_id: currentPart };
+  if (!fillAll && selectedIds && selectedIds.length > 0) {
+    body.hole_ids = selectedIds;
+  }
+
+  try {
+    const res = await fetch('/api/fill', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!res.ok) { appendFillLog(`✗ ${data.error}`, 'err'); setProgressVisible(false); return; }
+
+    fillJobId = data.job_id;
+    appendFillLog(`  Job ${fillJobId} started`, 'info');
+
+    // Poll
+    let lastLogLen = 0;
+    fillPollTimer = setInterval(async () => {
+      try {
+        const sr = await fetch(`/api/fill_status/${fillJobId}`);
+        const job = await sr.json();
+
+        // Append new log lines
+        const logLines = job.log || [];
+        for (let i = lastLogLen; i < logLines.length; i++) {
+          appendFillLog('  ' + logLines[i]);
+        }
+        lastLogLen = logLines.length;
+
+        if (job.status === 'done') {
+          stopFillPoll();
+          setProgressVisible(false);
+          const r = job.result || {};
+          appendFillLog(`✓ Done: ${r.holes_filled}/${r.holes_attempted} holes filled`, 'ok');
+          if (r.boundary_edges === 0) {
+            appendFillLog(`  be=0 ✓  ${r.n_vertices?.toLocaleString()} verts, ${r.n_faces?.toLocaleString()} faces`, 'ok');
+          } else if (r.boundary_edges > 0) {
+            appendFillLog(`  ⚠ be=${r.boundary_edges} (non-watertight)`, 'err');
+          }
+          // Reload mesh
+          document.getElementById('reloadMeshBtn').disabled = false;
+          await reloadCurrentMesh();
+        } else if (job.status === 'error') {
+          stopFillPoll();
+          setProgressVisible(false);
+          appendFillLog(`✗ Error: ${job.error}`, 'err');
+          const info = currentPartsList.find(p => p.part_id === currentPart);
+          const canFill = !!(info?.has_stp && info?.has_holes);
+          document.getElementById('fillSelectedBtn').disabled = !canFill;
+          document.getElementById('fillAllBtn').disabled = !canFill;
+        }
+      } catch (e) {
+        appendFillLog(`poll error: ${e.message}`, 'err');
+      }
+    }, 800);
+  } catch (e) {
+    appendFillLog(`✗ ${e.message}`, 'err');
+    setProgressVisible(false);
+  }
+}
+
+async function reloadCurrentMesh() {
+  if (!currentPart) return;
+  showLoading(true);
+  setStatus(`Reloading ${currentPart}...`);
+  try {
+    const [filledData, holesData] = await Promise.all([
+      fetch(`/api/mesh?part=${currentPart}&type=filled&_=${Date.now()}`).then(r => r.ok ? r.json() : null),
+      fetch(`/api/holes?part=${currentPart}`).then(r => r.ok ? r.json() : null),
+    ]);
+    currentHolesData = holesData;
+    renderFilled(filledData);
+    if (document.getElementById('chkEdges').checked) renderEdges(filledData);
+    if (document.getElementById('chkAnnotations').checked) renderAnnotations(holesData);
+    updateHolesList(holesData);
+    setStatus(`${currentPart} reloaded`);
+    // Re-enable fill buttons
+    const info = currentPartsList.find(p => p.part_id === currentPart);
+    const canFill = !!(info?.has_stp && info?.has_holes);
+    document.getElementById('fillSelectedBtn').disabled = !canFill;
+    document.getElementById('fillAllBtn').disabled = !canFill;
+  } catch (e) {
+    setStatus(`Reload error: ${e.message}`);
+  } finally {
+    showLoading(false);
+  }
+}
+
+// ===== UI Events =====
+document.getElementById('partSelect').addEventListener('change', e => loadPart(e.target.value));
+
+document.getElementById('chkFilled').addEventListener('change', e => {
+  groups.filled.visible = e.target.checked;
+});
+document.getElementById('chkOriginal').addEventListener('change', async e => {
+  if (e.target.checked && groups.original.children.length === 0 && currentPart) {
+    showLoading(true);
+    const d = await fetch(`/api/mesh?part=${currentPart}&type=original`).then(r => r.ok ? r.json() : null);
+    renderOriginal(d);
+    showLoading(false);
+  }
+  groups.original.visible = e.target.checked;
+});
+document.getElementById('chkEdges').addEventListener('change', async e => {
+  if (e.target.checked && groups.edges.children.length === 0 && _lastFilledData) {
+    renderEdges(_lastFilledData);
+  }
+  groups.edges.visible = e.target.checked;
+});
+document.getElementById('chkAnnotations').addEventListener('change', e => {
+  if (e.target.checked && groups.annotations.children.length === 0) renderAnnotations(currentHolesData);
+  groups.annotations.visible = e.target.checked;
+});
+
+let _edgeTimer = null;
+document.getElementById('edgeAngle').addEventListener('input', e => {
+  edgeAngle = parseInt(e.target.value, 10);
+  document.getElementById('edgeAngleVal').textContent = edgeAngle;
+  clearTimeout(_edgeTimer);
+  _edgeTimer = setTimeout(() => {
+    if (_lastFilledData && document.getElementById('chkEdges').checked) renderEdges(_lastFilledData);
+  }, 300);
+});
+
+document.getElementById('resetCameraBtn').addEventListener('click', () => {
+  const child = groups.filled.children[0];
+  if (child?.geometry) {
+    child.geometry.computeBoundingBox();
+    const bb = child.geometry.boundingBox;
+    fitCamera({ min: bb.min.toArray(), max: bb.max.toArray() });
+  }
+});
+
+document.getElementById('chkDiagnostic').addEventListener('change', async e => {
+  groups.diagnostic.visible = e.target.checked;
+  if (e.target.checked && groups.diagnostic.children.length === 0) {
+    await loadDiagnostic();
+  }
+});
+
+document.getElementById('detectBtn').addEventListener('click', async () => {
+  if (!currentPart) return;
+  document.getElementById('fillLog').textContent = '';
+  document.getElementById('detectBtn').disabled = true;
+  appendFillLog(`▶ Detecting holes in ${currentPart}...`, 'info');
+  try {
+    const res = await fetch('/api/detect_holes', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ part_id: currentPart }),
+    });
+    const data = await res.json();
+    if (!res.ok) { appendFillLog(`✗ ${data.error}`, 'err'); return; }
+    appendFillLog(`✓ Found ${data.n_holes} hole(s)`, 'ok');
+    data.holes?.forEach(h => {
+      appendFillLog(`  ${h.hole_id}  r=${h.radius_mm.toFixed(1)}mm  ${h.shape}`);
+    });
+    // Reload holes list
+    const hd = await fetch(`/api/holes?part=${currentPart}`).then(r => r.ok ? r.json() : null);
+    currentHolesData = hd;
+    updateHolesList(hd);
+    if (document.getElementById('chkAnnotations').checked) renderAnnotations(hd);
+    // Enable fill buttons
+    document.getElementById('fillSelectedBtn').disabled = false;
+    document.getElementById('fillAllBtn').disabled = false;
+  } catch (e) {
+    appendFillLog(`✗ ${e.message}`, 'err');
+  } finally {
+    document.getElementById('detectBtn').disabled = false;
+  }
+});
+
+document.getElementById('fillSelectedBtn').addEventListener('click', () => startFill(false));
+document.getElementById('fillAllBtn').addEventListener('click', () => startFill(true));
+document.getElementById('reloadMeshBtn').addEventListener('click', reloadCurrentMesh);
+
+// ===== Screenshot =====
+document.getElementById('screenshotBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('screenshotBtn');
+  btn.disabled = true; btn.textContent = 'Saving...';
+  try {
+    renderer.render(scene, camera);
+    const payload = {
+      image: renderer.domElement.toDataURL('image/png'),
+      part_id: currentPart,
+      camera: { position: camera.position.toArray(), target: controls.target.toArray(), fov: camera.fov },
+      display_state: {
+        filled: document.getElementById('chkFilled').checked,
+        original: document.getElementById('chkOriginal').checked,
+        edges: document.getElementById('chkEdges').checked,
+        annotations: document.getElementById('chkAnnotations').checked,
+        edge_angle: edgeAngle,
+      },
+      mesh_info: _lastFilledData ? { n_vertices: _lastFilledData.n_vertices, n_faces: _lastFilledData.n_faces } : null,
+      holes_data: currentHolesData,
+    };
+    const res = await fetch('/api/screenshot', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+    });
+    const result = await res.json();
+    setStatus(`Saved: ${result.png.split('\\').pop()}`);
+  } catch (e) {
+    setStatus(`Screenshot error: ${e.message}`);
+  } finally {
+    btn.disabled = false; btn.textContent = 'Screenshot';
+  }
+});
+
+// ===== Init =====
+initPartsList();
+</script>
+</body>
+</html>
