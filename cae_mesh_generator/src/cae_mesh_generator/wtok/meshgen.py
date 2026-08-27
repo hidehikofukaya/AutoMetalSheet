@@ -187,8 +187,11 @@ def fastener_disc(part, per_fix: int = ANCHOR_PER_FIX, r: float = ANCHOR_R,
 class MeshDataset(Dataset):
     def __init__(self, parts, mesh_dir: pathlib.Path, n_pts: int,
                  augment: bool, base_seed: int = 0,
-                 anchor_per_fix: int = ANCHOR_PER_FIX):
+                 anchor_per_fix: int = ANCHOR_PER_FIX,
+                 mask_rate: float = 0.0, mask_max: float = 0.5):
         self.anchor_per_fix = anchor_per_fix
+        self.mask_rate = mask_rate
+        self.mask_max = mask_max
         self.parts = parts
         self.dir = pathlib.Path(mesh_dir)
         self.n_pts = n_pts
@@ -196,6 +199,7 @@ class MeshDataset(Dataset):
         self.base_seed = base_seed
         self.epoch = 0
         self.cache: dict = {}
+        self.outside: dict = {}
 
     def set_epoch(self, e: int) -> None:
         self.epoch = int(e)
@@ -225,9 +229,16 @@ class MeshDataset(Dataset):
         cond = frame_cond_rows(p)
         if self.anchor_per_fix:
             # free slots come from outside the disc so the density near a
-            # fastener matches the rest of the sheet
-            far = np.linalg.norm(xyz[:, None, :] - fix[None, :, :], axis=-1).min(1)
-            keep_idx = np.flatnonzero(far > ANCHOR_R / frame[2])
+            # fastener matches the rest of the sheet. The disc is centred on the
+            # fasteners, so this only needs the distance to those two points --
+            # and it never changes, so cache it per part.
+            keep_idx = self.outside.get(p.name)
+            if keep_idx is None:
+                centres, _ = to_frame(*fix_points_mm(p), frame)
+                far = np.linalg.norm(
+                    xyz[:, None, :] - centres[None, :, :], axis=-1).min(1)
+                keep_idx = np.flatnonzero(far > ANCHOR_R / frame[2])
+                self.outside[p.name] = keep_idx
             if len(keep_idx) > self.n_pts:
                 xyz, nrm = xyz[keep_idx], nrm[keep_idx]
         if self.augment and rng.random() < 0.5:
@@ -248,6 +259,18 @@ class MeshDataset(Dataset):
         # sample, so slot order carries no information the model could lean on
         pts = np.concatenate([fix[:n_fix], xyz[take]])
         nn_ = np.concatenate([fixn[:n_fix], nrm[take]])
+        # Masked training: pin a random extra set of surface points as "known"
+        # and let the model infer the rest. Pinning is already how anchors work,
+        # so a constraint point and a fastening point are the same mechanism --
+        # this keeps the model usable with any set of known points at inference.
+        if self.mask_rate > 0 and rng.random() < self.mask_rate:
+            free = self.n_pts - n_fix
+            k = int(rng.integers(1, max(2, int(free * self.mask_max))))
+            sel = n_fix + rng.permutation(free)[:k]
+            order = np.concatenate([np.arange(n_fix), sel,
+                                    np.setdiff1d(np.arange(n_fix, self.n_pts), sel)])
+            pts, nn_ = pts[order], nn_[order]
+            n_fix += k
         return {"x": torch.from_numpy(
                     np.concatenate([pts, nn_], axis=1).astype(np.float32)),
                 "cond": torch.from_numpy(cond),
@@ -377,7 +400,8 @@ def stage_train(args, out: pathlib.Path) -> None:
     train_parts, val_parts = build_splits(args)
     print(f"parts: train {len(train_parts)} val {len(val_parts)}  N={args.points}")
     md = pathlib.Path(args.dataset) / "parts"
-    tl = DataLoader(MeshDataset(train_parts, md, args.points, True),
+    tl = DataLoader(MeshDataset(train_parts, md, args.points, True,
+                                mask_rate=args.mask_rate),
                     batch_size=args.batch_size, shuffle=True, drop_last=True)
     vl = DataLoader(MeshDataset(val_parts, md, args.points, False, 555),
                     batch_size=args.batch_size)
@@ -395,7 +419,8 @@ def stage_train(args, out: pathlib.Path) -> None:
         start = ck["epoch"] + 1
         if hist_path.exists():
             history = [r for r in json.loads(hist_path.read_text()) if r["epoch"] < start]
-            best = min((r["val"] for r in history if "val" in r), default=float("inf"))
+            best = min((r["surf_mm"] for r in history if "surf_mm" in r),
+                       default=float("inf"))
         for _ in range(start - 1):
             sched.step()
         print(f"resumed at {start} (best {best:.5f})", flush=True)
@@ -433,14 +458,15 @@ def stage_train(args, out: pathlib.Path) -> None:
                 torch.manual_seed(epoch)
             ck = {"model": model.state_dict(), "opt": opt.state_dict(),
                   "args": vars(args), "epoch": epoch}
-            if row["val"] < best:
-                best = row["val"]
-                safe_save(ck, out / "best.pt")
             safe_save(ck, last)
         history.append(row)
         hist_path.write_text(json.dumps(history), encoding="utf-8")
         if epoch % args.sample_every == 0 or epoch == args.epochs:
             model.eval()
+            # select on geometry, never on the loss: the flow-matching loss is a
+            # conditional variance whose minimum is noise, and picking best.pt by
+            # it once froze a run at epoch 30 while the surface kept improving
+            # through epoch 60
             row["surf_mm"] = float(np.median([
                 chamfer_mm(generate(model, p, args.device, args.steps, 7,
                                     args.cfg_scale, args.points, args.anchor)[0],
@@ -451,6 +477,11 @@ def stage_train(args, out: pathlib.Path) -> None:
             msg += f"  val {row['val']:.5f}"
         if "surf_mm" in row:
             msg += f"  | surf {row['surf_mm']:.1f}mm"
+            if row["surf_mm"] < best:
+                best = row["surf_mm"]
+                safe_save({"model": model.state_dict(), "opt": opt.state_dict(),
+                           "args": vars(args), "epoch": epoch}, out / "best.pt")
+                msg += " *best*"
         print(msg, flush=True)
         if (time.time() - t_start) / 3600.0 > args.max_hours:
             print(f"stopping cleanly at the {args.max_hours}h budget", flush=True)
@@ -459,15 +490,21 @@ def stage_train(args, out: pathlib.Path) -> None:
 
 @torch.no_grad()
 def generate(model, part, device, steps, seed, scale, n_pts, anchor=True,
-             per_fix=ANCHOR_PER_FIX):
+             per_fix=ANCHOR_PER_FIX, known=None):
     gen = torch.Generator(device=device).manual_seed(seed)
     cond = torch.from_numpy(frame_cond_rows(part))[None].to(device)
     fx = None
+    rows = []
     if anchor:
         dp, dn = fastener_disc(part, per_fix, rng=np.random.default_rng(seed))
         f, fn = to_frame(dp, dn, fastener_frame(part))
-        fx = torch.from_numpy(np.concatenate([f, fn], axis=1).astype(np.float32)
-                              )[None].to(device)
+        rows.append(np.concatenate([f, fn], axis=1))
+    if known is not None and len(known):
+        # any point the caller already knows, in mm with its normal
+        kf, kn = to_frame(known[:, :3], known[:, 3:], fastener_frame(part))
+        rows.append(np.concatenate([kf, kn], axis=1))
+    if rows:
+        fx = torch.from_numpy(np.concatenate(rows).astype(np.float32))[None].to(device)
     x = sample(model, cond, fx, steps, gen, scale, n_pts)
     return to_world(x[0], part)
 
@@ -610,7 +647,28 @@ def stage_smoke(args, out: pathlib.Path) -> None:
     assert tail < head, "did not learn"
     print(f"loss {head:.4f} -> {tail:.4f}")
 
+    # masked training must actually vary how much is pinned
+    ds_m = MeshDataset(parts, md, args.points, True, mask_rate=1.0)
+    counts = set()
+    for e in range(6):
+        ds_m.set_epoch(e)
+        counts.update(int(ds_m[i]["n_fix"]) for i in range(4))
+    assert len(counts) > 1, f"masking pinned the same count every time: {counts}"
+    print(f"masked training: pinned-point counts seen {sorted(counts)[:6]}...")
+
     p = parts[0]
+    # a caller-supplied constraint point must be honoured exactly
+    d = np.load(md / f"{p.name}.npz")
+    span = np.maximum(d["env_hi"] - d["env_lo"], 1e-9)
+    surf = d["xyz"] * span + d["env_lo"]
+    pick = surf[[7, 900, 3000]]
+    known = np.concatenate([pick, d["normal"][[7, 900, 3000]]], axis=1)
+    kx, _ = generate(model, p, args.device, 8, 1, args.cfg_scale, args.points,
+                     args.anchor, known=known)
+    err = float(max(np.min(np.linalg.norm(kx - q, axis=1)) for q in pick))
+    print(f"caller constraint points honoured to {err:.4f}mm")
+    assert err < 1e-2, f"known points were not pinned ({err:.3f}mm)"
+
     xyz, nrm = generate(model, p, args.device, 8, 1, args.cfg_scale, args.points,
                         args.anchor)
     f = extract(xyz, nrm)
@@ -641,6 +699,9 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=48)
     ap.add_argument("--rel-attn", type=int, default=1)
     ap.add_argument("--anchor", type=int, default=1)
+    ap.add_argument("--mask-rate", type=float, default=0.5,
+                    help="fraction of training items that also pin a random set "
+                         "of known surface points (masked / inpainting training)")
     ap.add_argument("--cfg-drop", type=float, default=0.1)
     # swept at epoch 65: wire 14.3 / 13.2 / 12.2 / 13.8 / 15.0mm at scale
     # 1.0 / 1.5 / 2.0 / 3.0 / 4.0, and span ratio 0.92 -> 1.06 across it.
