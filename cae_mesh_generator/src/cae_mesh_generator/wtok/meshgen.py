@@ -46,6 +46,77 @@ CH = 6                       # xyz + normal
 
 # ---------------------------------------------------------------- data
 
+def fix_points_mm(part) -> tuple[np.ndarray, np.ndarray]:
+    """Fastening points and their axes in mm. The bins/envelope here are only the
+    storage encoding of a position that is itself legitimate input."""
+    from .plan_g import N_BINS
+    lo = np.asarray(part.env_lo, dtype=np.float64)
+    span = np.asarray(part.env_hi, dtype=np.float64) - lo
+    fx = [v for v in part.vertices if v["T"] == "FIX"]
+    P = np.stack([lo + (np.asarray(v["bin"], np.float64) + 0.5) / N_BINS * span
+                  for v in fx])
+    A = np.stack([np.asarray(v["nf"] if v["nf"] is not None else [0, 0, 1],
+                             dtype=np.float64) for v in fx])
+    return P, A / np.maximum(np.linalg.norm(A, axis=1, keepdims=True), 1e-12)
+
+
+def fastener_frame(part):
+    """Canonical frame from the fastening points ALONE -- no part geometry.
+
+      origin : midpoint of the two fasteners
+      unit   : the distance between them (part diagonal / this distance is
+               1.21-1.69 across the set, so frame coordinates land near +-0.85)
+      e1     : fastener-to-fastener direction
+      e2     : whichever fastener axis is furthest from e1, orthogonalised
+               (measured: at least 17.5 deg for every part, so never degenerate)
+
+    Replaces the envelope frame, which was the ground-truth bounding box and so
+    handed the model the part's position, orientation and extent.
+    """
+    P, A = fix_points_mm(part)
+    if len(P) < 2:
+        R = np.eye(3)
+        return (P[0] if len(P) else np.zeros(3)), R, 1.0
+    d = float(np.linalg.norm(P[1] - P[0]))
+    e1 = (P[1] - P[0]) / max(d, 1e-12)
+    cos = np.abs(A @ e1)
+    a = A[int(np.argmin(cos))]
+    e2 = a - (a @ e1) * e1
+    n2 = np.linalg.norm(e2)
+    if n2 < 1e-6:                       # never hit on this data; stay defined
+        alt = np.array([1.0, 0.0, 0.0])
+        if abs(alt @ e1) > 0.9:
+            alt = np.array([0.0, 1.0, 0.0])
+        e2 = alt - (alt @ e1) * e1
+        n2 = np.linalg.norm(e2)
+    e2 /= n2
+    return P.mean(0), np.stack([e1, e2, np.cross(e1, e2)]), max(d, 1e-9)
+
+
+def to_frame(xyz, normal, frame):
+    o, R, d = frame
+    return ((xyz - o) @ R.T) / d, normal @ R.T
+
+
+def from_frame(xyz, normal, frame):
+    o, R, d = frame
+    return (xyz * d) @ R + o, normal @ R
+
+
+def frame_cond_rows(part) -> np.ndarray:
+    """Fastening points only: their position and axis expressed in their own
+    frame, plus log of their separation. No envelope, no part geometry."""
+    P, A = fix_points_mm(part)
+    frame = fastener_frame(part)
+    Pf, Af = to_frame(P, A, frame)
+    out = np.zeros((COND_ROWS, 8), dtype=np.float32)
+    for i in range(min(len(Pf), COND_ROWS - 1)):
+        out[i] = np.concatenate([Pf[i], Af[i], [1.0, 0.0]])
+    out[COND_ROWS - 1] = np.concatenate(
+        [[np.log(frame[2]) / 10.0], np.zeros(6), [1.0]])
+    return out
+
+
 def part_cond_rows(part, vertices=None) -> np.ndarray:
     vs = vertices if vertices is not None else part.vertices
     rows = cond_features([v for v in vs if v["T"] == "FIX"], part.env_lo, part.env_hi)
@@ -76,9 +147,48 @@ def mirror(xyz, normal, fix, cond_rows, axis):
     return xyz, normal, fix, c
 
 
+ANCHOR_R = 10.0        # mm; measured exact out to here (see fastener_disc)
+ANCHOR_PER_FIX = 8
+
+
+def fastener_disc(part, per_fix: int = ANCHOR_PER_FIX, r: float = ANCHOR_R,
+                  rng=None):
+    """Points the fastener itself determines, SYNTHESISED -- never read from the
+    part.
+
+    A bolt needs a flat seat normal to its axis, and the data agrees exactly: over
+    240 fastener sites the real surface within 10mm of a fastening point deviates
+    from the ideal disc by 0.00mm at the 95th percentile, with 0.0 deg of normal
+    tilt. (At 15mm the 95th percentile tilt is already 49 deg, so 10mm is the
+    honest radius.) Feeding these in is the fastening point drawn out, not
+    ground truth: they are generated from the point and its axis alone.
+    """
+    rng = rng or np.random.default_rng(0)
+    P, A = fix_points_mm(part)
+    pts, nrm = [], []
+    for c, ax in zip(P, A):
+        e1 = np.array([1.0, 0.0, 0.0])
+        if abs(e1 @ ax) > 0.9:
+            e1 = np.array([0.0, 1.0, 0.0])
+        e1 = e1 - (e1 @ ax) * ax
+        e1 /= max(np.linalg.norm(e1), 1e-12)
+        e2 = np.cross(ax, e1)
+        rad = r * np.sqrt(rng.random(per_fix))       # uniform over the area
+        th = rng.random(per_fix) * 2 * np.pi
+        rad[0], th[0] = 0.0, 0.0                     # keep the exact centre
+        pts.append(c + rad[:, None] * (np.cos(th)[:, None] * e1
+                                       + np.sin(th)[:, None] * e2))
+        nrm.append(np.tile(ax, (per_fix, 1)))
+    if not pts:
+        return np.zeros((0, 3)), np.zeros((0, 3))
+    return np.concatenate(pts), np.concatenate(nrm)
+
+
 class MeshDataset(Dataset):
     def __init__(self, parts, mesh_dir: pathlib.Path, n_pts: int,
-                 augment: bool, base_seed: int = 0):
+                 augment: bool, base_seed: int = 0,
+                 anchor_per_fix: int = ANCHOR_PER_FIX):
+        self.anchor_per_fix = anchor_per_fix
         self.parts = parts
         self.dir = pathlib.Path(mesh_dir)
         self.n_pts = n_pts
@@ -104,20 +214,42 @@ class MeshDataset(Dataset):
         p = self.parts[i]
         rng = np.random.default_rng(
             stable_seed(self.base_seed + 999983 * self.epoch, p.name))
-        xyz, nrm = self.load(p.name)
-        fix = fix_xyz_norm(p)
-        cond = part_cond_rows(p)
-        if self.augment:
-            axis = rng.integers(0, 4) - 1
-            if axis >= 0:
-                xyz, nrm, fix, cond = mirror(xyz, nrm, fix, cond, int(axis))
+        xyz_n, nrm = self.load(p.name)
+        lo = np.asarray(p.env_lo, dtype=np.float64)
+        span = np.maximum(np.asarray(p.env_hi, dtype=np.float64) - lo, 1e-9)
+        xyz_mm = xyz_n.astype(np.float64) * span + lo      # envelope: storage only
+        frame = fastener_frame(p)
+        xyz, nrm = to_frame(xyz_mm, nrm.astype(np.float64), frame)
+        dp, dn = fastener_disc(p, self.anchor_per_fix, rng=rng)
+        fix, fixn = to_frame(dp, dn, frame)
+        cond = frame_cond_rows(p)
+        if self.anchor_per_fix:
+            # free slots come from outside the disc so the density near a
+            # fastener matches the rest of the sheet
+            far = np.linalg.norm(xyz[:, None, :] - fix[None, :, :], axis=-1).min(1)
+            keep_idx = np.flatnonzero(far > ANCHOR_R / frame[2])
+            if len(keep_idx) > self.n_pts:
+                xyz, nrm = xyz[keep_idx], nrm[keep_idx]
+        if self.augment and rng.random() < 0.5:
+            # the frame fixes e1 and e2, so only the e3 component is free to
+            # mirror -- flipping the others would just redefine the frame
+            xyz, nrm, fix = xyz.copy(), nrm.copy(), fix.copy()
+            xyz[:, 2] *= -1.0
+            nrm[:, 2] *= -1.0
+            fix[:, 2] *= -1.0
+            fixn = fixn.copy()
+            fixn[:, 2] *= -1.0
+            cond = cond.copy()
+            cond[:COND_ROWS - 1, 2] *= -1.0
+            cond[:COND_ROWS - 1, 5] *= -1.0
         n_fix = min(len(fix), self.n_pts)
         take = rng.choice(len(xyz), self.n_pts - n_fix, replace=False)
         # anchors occupy the first slots; every other slot is a random surface
         # sample, so slot order carries no information the model could lean on
         pts = np.concatenate([fix[:n_fix], xyz[take]])
-        nn_ = np.concatenate([nrm[cKD(xyz, fix[:n_fix])], nrm[take]])
-        return {"x": torch.from_numpy(np.concatenate([pts, nn_], axis=1)),
+        nn_ = np.concatenate([fixn[:n_fix], nrm[take]])
+        return {"x": torch.from_numpy(
+                    np.concatenate([pts, nn_], axis=1).astype(np.float32)),
                 "cond": torch.from_numpy(cond),
                 "n_fix": n_fix}
 
@@ -173,16 +305,14 @@ def anchor_keep(n_fix: torch.Tensor, N: int) -> torch.Tensor:
 
 
 def flow_loss(model, batch, anchor: bool, p_drop: float, w_normal: float = 0.2):
-    x1 = batch["x"] * 2.0 - 1.0                 # xyz in [0,1] -> [-1,1]
-    x1 = torch.cat([x1[..., :3], batch["x"][..., 3:]], dim=-1)   # normals already signed
+    x1 = batch["x"]          # already in the fastener frame: coords ~ +-0.85
     x0 = torch.randn_like(x1)
     B, N, _ = x1.shape
     t = torch.rand(B, device=x1.device)
     xt = (1 - t[:, None, None]) * x0 + t[:, None, None] * x1
     keep = anchor_keep(batch["n_fix"], N)
     if anchor:
-        pos = torch.where(keep[..., None], x1, xt)
-        xt = torch.cat([pos[..., :3], xt[..., 3:]], dim=-1)   # pin position only
+        xt = torch.where(keep[..., None], x1, xt)   # the disc fixes both
     drop = (torch.rand(B, device=x1.device) < p_drop) if (p_drop > 0 and model.training) else None
     v = model(xt, t, batch["cond"], drop)
     target = x1 - x0
@@ -203,7 +333,7 @@ def sample(model, cond, fix_xyz, steps=48, gen=None, scale=1.0, n_pts=256):
     x = torch.randn(B, n_pts, CH, device=dev, generator=gen)
     n_fix = fix_xyz.shape[1] if fix_xyz is not None else 0
     if n_fix:
-        x[:, :n_fix, :3] = fix_xyz * 2.0 - 1.0
+        x[:, :n_fix] = fix_xyz            # position and normal are both implied
     dt = 1.0 / steps
     for k in range(steps):
         t = torch.full((B,), k * dt, device=dev)
@@ -215,18 +345,17 @@ def sample(model, cond, fix_xyz, steps=48, gen=None, scale=1.0, n_pts=256):
             v = model(x, t, cond)
         x = x + v * dt
         if n_fix:
-            x[:, :n_fix, :3] = fix_xyz * 2.0 - 1.0
+            x[:, :n_fix] = fix_xyz
     return x
 
 
 def to_world(x, part):
-    """model output -> (points mm, unit normals)"""
-    lo = np.asarray(part.env_lo, dtype=np.float64)
-    span = np.maximum(np.asarray(part.env_hi, dtype=np.float64) - lo, 1e-9)
-    xyz = ((x[..., :3].clamp(-1, 1).cpu().numpy() + 1.0) / 2.0) * span + lo
-    nrm = x[..., 3:].cpu().numpy()
+    """model output (fastener frame) -> (points mm, unit normals). The envelope
+    is never consulted: the frame comes from the fastening points alone."""
+    xyz = x[..., :3].cpu().numpy().astype(np.float64)
+    nrm = x[..., 3:].cpu().numpy().astype(np.float64)
     nrm = nrm / np.maximum(np.linalg.norm(nrm, axis=-1, keepdims=True), 1e-9)
-    return xyz, nrm
+    return from_frame(xyz, nrm, fastener_frame(part))
 
 
 # ---------------------------------------------------------------- stages
@@ -270,6 +399,12 @@ def stage_train(args, out: pathlib.Path) -> None:
         for _ in range(start - 1):
             sched.step()
         print(f"resumed at {start} (best {best:.5f})", flush=True)
+    # the loss is a conditional variance and plateaus long before the geometry
+    # does, so probe the actual surface error during training as well
+    probe_gt = {}
+    for p in val_parts[: args.probe_parts]:
+        d = np.load(md / f"{p.name}.npz")
+        probe_gt[p.name] = d["xyz"] * np.maximum(d["env_hi"] - d["env_lo"], 1e-9)             + d["env_lo"]
     t_start = time.time()
     for epoch in range(start, args.epochs + 1):
         tl.dataset.set_epoch(epoch)
@@ -288,10 +423,14 @@ def stage_train(args, out: pathlib.Path) -> None:
                "seconds": round(time.time() - t0, 1)}
         if epoch % args.val_every == 0 or epoch == args.epochs:
             model.eval()
+            # flow_loss draws t and x0 at random, so an unseeded val score moves
+            # by more than the training signal does and picks best.pt by luck
             with torch.no_grad():
+                torch.manual_seed(1234)
                 row["val"] = float(np.mean(
                     [float(flow_loss(model, to_device(b, args.device), args.anchor, 0.0))
                      for b in vl]))
+                torch.manual_seed(epoch)
             ck = {"model": model.state_dict(), "opt": opt.state_dict(),
                   "args": vars(args), "epoch": epoch}
             if row["val"] < best:
@@ -300,9 +439,18 @@ def stage_train(args, out: pathlib.Path) -> None:
             safe_save(ck, last)
         history.append(row)
         hist_path.write_text(json.dumps(history), encoding="utf-8")
+        if epoch % args.sample_every == 0 or epoch == args.epochs:
+            model.eval()
+            row["surf_mm"] = float(np.median([
+                chamfer_mm(generate(model, p, args.device, args.steps, 7,
+                                    args.cfg_scale, args.points, args.anchor)[0],
+                           probe_gt[p.name])
+                for p in val_parts[: args.probe_parts]]))
         msg = f"epoch {epoch}: loss {row['train']:.5f} ({row['seconds']}s)"
         if "val" in row:
             msg += f"  val {row['val']:.5f}"
+        if "surf_mm" in row:
+            msg += f"  | surf {row['surf_mm']:.1f}mm"
         print(msg, flush=True)
         if (time.time() - t_start) / 3600.0 > args.max_hours:
             print(f"stopping cleanly at the {args.max_hours}h budget", flush=True)
@@ -310,10 +458,16 @@ def stage_train(args, out: pathlib.Path) -> None:
 
 
 @torch.no_grad()
-def generate(model, part, device, steps, seed, scale, n_pts, anchor=True):
+def generate(model, part, device, steps, seed, scale, n_pts, anchor=True,
+             per_fix=ANCHOR_PER_FIX):
     gen = torch.Generator(device=device).manual_seed(seed)
-    cond = torch.from_numpy(part_cond_rows(part))[None].to(device)
-    fx = torch.from_numpy(fix_xyz_norm(part))[None].to(device) if anchor else None
+    cond = torch.from_numpy(frame_cond_rows(part))[None].to(device)
+    fx = None
+    if anchor:
+        dp, dn = fastener_disc(part, per_fix, rng=np.random.default_rng(seed))
+        f, fn = to_frame(dp, dn, fastener_frame(part))
+        fx = torch.from_numpy(np.concatenate([f, fn], axis=1).astype(np.float32)
+                              )[None].to(device)
     x = sample(model, cond, fx, steps, gen, scale, n_pts)
     return to_world(x[0], part)
 
@@ -372,9 +526,71 @@ def stage_eval(args, out: pathlib.Path) -> None:
                                               indent=1), encoding="utf-8")
 
 
+def check_no_envelope_leak(parts) -> None:
+    """Nothing but the fastening points may reach the model or the decode.
+
+    The envelope is how a FIX position is *stored* (a quantised bin inside it),
+    so the test re-quantises into a different box that keeps every fastening
+    point at the same millimetre position. Condition, anchors and decode must
+    then be bit-for-bit unmoved. This is the check that would have caught the
+    ground-truth bounding box serving as the coordinate frame.
+    """
+    from .plan_g import N_BINS
+    worst = 0.0
+    for p in parts[:6]:
+        before_cond = frame_cond_rows(p)
+        before_fix, _ = to_frame(*fix_points_mm(p), fastener_frame(p))
+        x = torch.randn(8, CH)
+        before_world = to_world(x, p)[0]
+
+        lo0, hi0 = np.array(p.env_lo), np.array(p.env_hi)
+        mm = {id(v): lo0 + (np.asarray(v["bin"], float) + 0.5) / N_BINS * (hi0 - lo0)
+              for v in p.vertices if v["T"] == "FIX"}
+        pad = 0.37 * (hi0 - lo0) + 5.0
+        lo1, hi1 = lo0 - pad, hi0 + pad
+        old_bins = {id(v): v["bin"] for v in p.vertices if v["T"] == "FIX"}
+        p.env_lo, p.env_hi = lo1, hi1
+        for v in p.vertices:
+            if v["T"] == "FIX":
+                b = (mm[id(v)] - lo1) / (hi1 - lo1) * N_BINS - 0.5
+                v["bin"] = tuple(int(round(c)) for c in b)
+        try:
+            assert np.allclose(before_cond, frame_cond_rows(p), atol=1e-3),                 f"{p.name}: condition moved with the envelope"
+            after_fix, _ = to_frame(*fix_points_mm(p), fastener_frame(p))
+            assert np.allclose(before_fix, after_fix, atol=1e-3),                 f"{p.name}: anchor coords moved with the envelope"
+            # re-quantising into a 1.7x looser box moves each fastening point by
+            # up to a bin, which propagates through the frame; a real leak moved
+            # the decode by ~100mm, so 1mm separates the two cases cleanly
+            drift = float(np.abs(before_world - to_world(x, p)[0]).max())
+            worst = max(worst, drift)
+            assert drift < 1.0,                 f"{p.name}: decode moved {drift:.2f}mm with the envelope"
+        finally:
+            p.env_lo, p.env_hi = lo0, hi0
+            for v in p.vertices:
+                if v["T"] == "FIX":
+                    v["bin"] = old_bins[id(v)]
+    # the disc must come from the fastener alone: scramble every non-FIX vertex
+    # and it has to be unchanged
+    for p in parts[:3]:
+        before = fastener_disc(p, rng=np.random.default_rng(0))[0]
+        saved = [(v, v["bin"]) for v in p.vertices if v["T"] != "FIX"]
+        for v, _ in saved:
+            v["bin"] = tuple(int(b) ^ 0x2AAA for b in v["bin"])
+        try:
+            after = fastener_disc(p, rng=np.random.default_rng(0))[0]
+            assert np.allclose(before, after),                 f"{p.name}: the anchor disc depends on the part, not the fastener"
+        finally:
+            for v, b in saved:
+                v["bin"] = b
+    print(f"no-envelope-leak ok ({min(len(parts), 6)} parts, "
+          f"worst decode drift {worst:.3f}mm = re-quantisation noise); "
+          f"anchor disc independent of part geometry")
+
+
 def stage_smoke(args, out: pathlib.Path) -> None:
     train_parts, _ = build_splits(args)
     parts = train_parts[:24]
+    check_no_envelope_leak(parts)
     md = pathlib.Path(args.dataset) / "parts"
     ds = MeshDataset(parts, md, args.points, True)
     loader = DataLoader(ds, batch_size=4, shuffle=True, drop_last=True)
@@ -426,8 +642,14 @@ def main() -> None:
     ap.add_argument("--rel-attn", type=int, default=1)
     ap.add_argument("--anchor", type=int, default=1)
     ap.add_argument("--cfg-drop", type=float, default=0.1)
-    ap.add_argument("--cfg-scale", type=float, default=1.5)
+    # swept at epoch 65: wire 14.3 / 13.2 / 12.2 / 13.8 / 15.0mm at scale
+    # 1.0 / 1.5 / 2.0 / 3.0 / 4.0, and span ratio 0.92 -> 1.06 across it.
+    # Without guidance the model hedges toward the mean and the part comes
+    # out too small, which is exactly where the outline metric was losing.
+    ap.add_argument("--cfg-scale", type=float, default=2.0)
     ap.add_argument("--val-every", type=int, default=5)
+    ap.add_argument("--sample-every", type=int, default=20)
+    ap.add_argument("--probe-parts", type=int, default=6)
     ap.add_argument("--eval-parts", type=int, default=40)
     ap.add_argument("--max-hours", type=float, default=0.55)
     ap.add_argument("--resume", action="store_true")

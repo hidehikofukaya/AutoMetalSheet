@@ -54,7 +54,11 @@ def boundary_score(xyz: np.ndarray, normal: np.ndarray, k: int = 13) -> np.ndarr
 
 
 def extract(xyz: np.ndarray, normal: np.ndarray, k: int = 13,
-            crease_deg: float = 25.0, gap_deg: float = 100.0) -> dict:
+            crease_deg: float = 20.0, gap_deg: float = 140.0) -> dict:
+    # Swept on GT clouds at N=256 with 3mm noise: cover+spurious is flat across
+    # the whole grid (8.79-9.31mm), so the thresholds are not where the error
+    # lives -- but 140 deg puts the boundary fraction at a believable 27% of
+    # points instead of 55%, which a rim of a surface sample cannot be.
     """Returns index arrays for the two feature classes."""
     n = normal / np.maximum(np.linalg.norm(normal, axis=1, keepdims=True), 1e-12)
     cs = crease_score(xyz, n, k)
