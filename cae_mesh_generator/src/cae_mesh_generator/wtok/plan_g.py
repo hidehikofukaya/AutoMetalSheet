@@ -167,28 +167,71 @@ class Block(nn.Module):
         nn.init.zeros_(self.film.weight)
         nn.init.zeros_(self.film.bias)
 
-    def forward(self, x, c):
+    def forward(self, x, c, bias=None):
         s1, b1, s2, b2 = self.film(c)[:, None].chunk(4, dim=-1)
         h = self.n1(x) * (1 + s1) + b1
-        x = x + self.attn(h, h, h, need_weights=False)[0]
+        x = x + self.attn(h, h, h, attn_mask=bias, need_weights=False)[0]
         h = self.n2(x) * (1 + s2) + b2
         return x + self.ff(h)
 
 
+class RelBias(nn.Module):
+    """Per-head attention bias from the pairwise distance between vertex slots.
+
+    The image-domain lever: a convolution shares weights across positions, so one
+    picture teaches a motif everywhere. Absolute coordinate embeddings share
+    nothing, which is why 'which vertex connects to which' had to be memorised
+    per location. Making attention a function of the relative geometry restores
+    that sharing -- and connect-the-dots is exactly a relative-geometry problem.
+    """
+
+    def __init__(self, heads: int, n_rbf: int = 16):
+        super().__init__()
+        self.register_buffer("centers", torch.linspace(0.0, 1.5, n_rbf))
+        self.width = 1.5 / n_rbf
+        self.proj = nn.Linear(n_rbf, heads)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, xyz: torch.Tensor) -> torch.Tensor:
+        d = torch.cdist(xyz, xyz)                              # (B,K_V,K_V)
+        rbf = torch.exp(-((d[..., None] - self.centers) / self.width) ** 2)
+        return self.proj(rbf).permute(0, 3, 1, 2)              # (B,H,K_V,K_V)
+
+
 class SlotNet(nn.Module):
-    """Shared trunk for both stages: [cond | K_V vertex slots | K_E edge slots].
+    """Shared trunk for every stage: [cond | K_V vertex slots | K_E edge slots].
 
     Slots carry no positional encoding, so the network is permutation
     equivariant within each block; an edge names its vertices by adding that
     vertex's own embedding (pointer semantics at the input side) and predicts
     references by dot product against vertex states (pointer at the output).
+
+    Modes:
+      topo / geo      : the original two-stage split (kept so the Kaggle
+                        checkpoints still load).
+      points / edges  : the reordered split. `points` places the vertices
+                        (existence + coordinates) from the condition alone;
+                        `edges` then wires them up *while seeing where they are*.
+                        The first run's topology stage was geometry-blind, which
+                        is why a third of its references were invalid.
     """
 
     def __init__(self, dim=256, layers=8, heads=8, coarse_in: bool = True,
-                 geo: bool = False):
+                 geo: bool = False, mode: str | None = None,
+                 rel_attn: bool = False):
         super().__init__()
+        mode = mode or ("geo" if geo else "topo")
+        self.mode, self.heads = mode, heads
+        self.pred_vtype = mode in ("topo", "points")
+        self.pred_edges = mode in ("topo", "edges")
+        self.pred_xyz = mode in ("geo", "points")
+        self.xyz_in = mode in ("geo", "points", "edges")
+        geo = self.pred_xyz                       # head layout follows this
         self.dim, self.coarse_in, self.geo = dim, coarse_in, geo
+        self.rel = RelBias(heads) if rel_attn else None
         self.cond_proj = nn.Linear(8, dim)
+        self.null_cond = nn.Parameter(torch.zeros(COND_ROWS, dim))
         self.seg = nn.Parameter(torch.zeros(3, dim))
         self.vt_emb = nn.Embedding(len(VT) + 1, dim)          # +MASK
         self.et_emb = nn.Embedding(len(ET) + 1, dim)
@@ -201,17 +244,19 @@ class SlotNet(nn.Module):
         self.t_mlp = nn.Sequential(nn.Linear(dim, dim), nn.SiLU(), nn.Linear(dim, dim))
         self.blocks = nn.ModuleList(Block(dim, heads) for _ in range(layers))
         self.norm = nn.LayerNorm(dim)
-        if geo:
+        if self.xyz_in:
             self.xt_proj = nn.Linear(3, dim)
+        if self.pred_xyz:
             self.vel_head = nn.Linear(dim, 3)
             nn.init.zeros_(self.vel_head.weight)
             nn.init.zeros_(self.vel_head.bias)
-        else:
+        if self.pred_vtype:
             self.vt_head = nn.Linear(dim, len(VT))
-            self.et_head = nn.Linear(dim, len(ET))
-            self.cls_head = nn.Linear(dim, len(CLS))
             self.coarse_head = nn.ModuleList(
                 nn.Linear(dim, N_COARSE) for _ in range(3))
+        if self.pred_edges:
+            self.et_head = nn.Linear(dim, len(ET))
+            self.cls_head = nn.Linear(dim, len(CLS))
             self.q_proj = nn.ModuleList(nn.Linear(dim, dim) for _ in range(3))
             self.k_proj = nn.Linear(dim, dim)
             self.none_key = nn.Parameter(torch.randn(dim) * 0.02)
@@ -236,25 +281,50 @@ class SlotNet(nn.Module):
             e = e + self.ref_proj[k](gathered)
         return v, e
 
-    def forward(self, s: dict, t: torch.Tensor, xt: torch.Tensor | None = None):
-        cond = self.cond_proj(s["cond"]) + self.seg[0]
+    def rel_mask(self, xt, B, S, device, dtype):
+        """Distance bias over the vertex block, zero elsewhere, as the float
+        attn_mask nn.MultiheadAttention takes (B*heads, S, S)."""
+        if self.rel is None or xt is None:
+            return None
+        m = torch.zeros(B, self.heads, S, S, device=device, dtype=dtype)
+        lo = COND_ROWS
+        m[:, :, lo:lo + K_V, lo:lo + K_V] = self.rel(xt).to(dtype)
+        return m.reshape(B * self.heads, S, S)
+
+    def forward(self, s: dict, t: torch.Tensor, xt: torch.Tensor | None = None,
+                drop: torch.Tensor | None = None):
+        cond = self.cond_proj(s["cond"])
+        if drop is not None:                     # classifier-free guidance
+            cond = torch.where(drop[:, None, None], self.null_cond, cond)
+        cond = cond + self.seg[0]
         v, e = self.embed(s, xt)
-        x = torch.cat([cond, v, e], dim=1)
+        # the points stage has nothing to say about edges: drop that block and
+        # its 44% of the sequence rather than feed it MASK for compute's sake
+        x = torch.cat([cond, v], dim=1) if self.mode == "points" \
+            else torch.cat([cond, v, e], dim=1)
         c = self.t_mlp(timestep_embedding(t, self.dim)) + cond.mean(1)
+        bias = self.rel_mask(xt, x.shape[0], x.shape[1], x.device, x.dtype)
         for blk in self.blocks:
-            x = blk(x, c)
+            x = blk(x, c, bias)
         x = self.norm(x)
         hv = x[:, COND_ROWS: COND_ROWS + K_V]
-        he = x[:, COND_ROWS + K_V:]
-        if self.geo:
+        he = x[:, COND_ROWS + K_V:] if self.mode != "points" else None
+        if self.mode == "geo":
             return self.vel_head(hv)
-        keys = torch.cat([self.k_proj(hv),
-                          self.none_key.expand(hv.shape[0], 1, self.dim)], dim=1)
-        refs = [torch.einsum("bed,bvd->bev", self.q_proj[k](he), keys)
-                / (self.dim ** 0.5) for k in range(3)]
-        return {"vtype": self.vt_head(hv), "etype": self.et_head(he),
-                "ecls": self.cls_head(he),
-                "coarse": [h(hv) for h in self.coarse_head], "refs": refs}
+        out = {}
+        if self.pred_xyz:
+            out["vel"] = self.vel_head(hv)
+        if self.pred_vtype:
+            out["vtype"] = self.vt_head(hv)
+            out["coarse"] = [h(hv) for h in self.coarse_head]
+        if self.pred_edges:
+            keys = torch.cat([self.k_proj(hv),
+                              self.none_key.expand(hv.shape[0], 1, self.dim)], dim=1)
+            out["refs"] = [torch.einsum("bed,bvd->bev", self.q_proj[k](he), keys)
+                           / (self.dim ** 0.5) for k in range(3)]
+            out["etype"] = self.et_head(he)
+            out["ecls"] = self.cls_head(he)
+        return out
 
 
 # ---------------------------------------------------------------- discrete FM
@@ -434,6 +504,206 @@ def sample_geo(model: SlotNet, skel: dict, anchors: dict | None, steps: int = 24
     return x
 
 
+# ------------------------------------------- points / edges (reordered split)
+
+def dummy_edges(B: int, dev) -> dict:
+    return {"etype": torch.full((B, K_E), MASK_ET, dtype=torch.long, device=dev),
+            "ecls": torch.full((B, K_E), MASK_CLS, dtype=torch.long, device=dev),
+            "erefs": torch.full((B, K_E, 3), MASK_REF, dtype=torch.long, device=dev)}
+
+
+def anchor_mask(batch: dict) -> torch.Tensor:
+    idx = torch.arange(K_V, device=batch["vtype"].device)[None]
+    return idx < batch["n_fix"][:, None]
+
+
+def cfg_drop(B: int, p: float, dev, training: bool):
+    if p <= 0 or not training:
+        return None
+    return torch.rand(B, device=dev) < p
+
+
+def points_loss(model: SlotNet, batch: dict, anchor: bool, p_drop: float = 0.0):
+    """Place the vertices: existence as masked discrete FM, coordinates as
+    continuous FM, both from the condition alone."""
+    dev = batch["vtype"].device
+    B = batch["vtype"].shape[0]
+    t = torch.rand(B, device=dev)
+    keep = anchor_mask(batch) if anchor else torch.zeros_like(batch["vtype"], dtype=torch.bool)
+
+    m = (torch.rand(batch["vtype"].shape, device=dev) >= t[:, None]) & ~keep
+    s = {"cond": batch["cond"],
+         "vtype": torch.where(m, torch.full_like(batch["vtype"], MASK_VT),
+                              batch["vtype"]),
+         "vcoarse": torch.zeros_like(batch["vcoarse"]), **dummy_edges(B, dev)}
+
+    x1 = batch["vabs"] * 2.0 - 1.0
+    x0 = torch.randn_like(x1)
+    xt = (1 - t[:, None, None]) * x0 + t[:, None, None] * x1
+    live = batch["vtype"] != VT_ID["PAD"]
+    if anchor:
+        xt = torch.where(keep[..., None], x1, xt)
+        live = live & ~keep
+
+    out = model(s, t, xt, cfg_drop(B, p_drop, dev, model.training))
+    loss = masked_ce(out["vtype"], batch["vtype"], m)
+    vel = ((out["vel"] - (x1 - x0)) ** 2).mean(-1)
+    return loss + (vel * live).sum() / live.sum().clamp(min=1)
+
+
+def edges_loss(model: SlotNet, batch: dict, p_drop: float = 0.0):
+    """Wire up a KNOWN point set: the stage that was geometry-blind before."""
+    dev = batch["vtype"].device
+    B = batch["vtype"].shape[0]
+    t = torch.rand(B, device=dev)
+    s = {"cond": batch["cond"], "vtype": batch["vtype"],
+         "vcoarse": torch.zeros_like(batch["vcoarse"])}
+    masks = {}
+    for key in ("etype", "ecls", "erefs"):
+        x = batch[key]
+        m = torch.rand(x.shape, device=dev) >= t.view(B, *([1] * (x.dim() - 1)))
+        s[key] = torch.where(m, torch.full_like(x, MASK_OF[key]), x)
+        masks[key] = m
+    xt = batch["vabs"] * 2.0 - 1.0                       # clean coordinates
+    out = model(s, t, xt, cfg_drop(B, p_drop, dev, model.training))
+    loss = (masked_ce(out["etype"], batch["etype"], masks["etype"])
+            + masked_ce(out["ecls"], batch["ecls"], masks["ecls"]))
+    for k in range(3):
+        loss = loss + masked_ce(out["refs"][k], batch["erefs"][..., k],
+                                masks["erefs"][..., k]) / 3.0
+    return loss
+
+
+def guided(model, s, t, xt, scale: float):
+    """One forward, or two extrapolated when guidance is on."""
+    if scale <= 1.0:
+        return model(s, t, xt)
+    B = t.shape[0]
+    dev = t.device
+    keep = torch.zeros(B, dtype=torch.bool, device=dev)
+    cond = model(s, t, xt, keep)
+    null = model(s, t, xt, ~keep)
+    out = {}
+    for k, v in cond.items():
+        if isinstance(v, list):
+            out[k] = [n + scale * (c - n) for c, n in zip(v, null[k])]
+        else:
+            out[k] = null[k] + scale * (v - null[k])
+    return out
+
+
+def draw_from(logits, gen, temp=1.0):
+    p = F.softmax(logits / temp, dim=-1)
+    return torch.multinomial(p.reshape(-1, p.shape[-1]), 1,
+                             generator=gen).reshape(p.shape[:-1])
+
+
+@torch.no_grad()
+def sample_points(model, cond, anchors, steps=24, gen=None, scale=1.0):
+    dev = cond.device
+    B = cond.shape[0]
+    s = {"cond": cond,
+         "vtype": torch.full((B, K_V), MASK_VT, dtype=torch.long, device=dev),
+         "vcoarse": torch.zeros((B, K_V, 3), dtype=torch.long, device=dev),
+         **dummy_edges(B, dev)}
+    x = torch.randn((B, K_V, 3), device=dev, generator=gen)
+    if anchors is not None:
+        s["vtype"][:, : anchors["n"]] = VT_ID["FIX"]
+        x[:, : anchors["n"]] = anchors["x1"]
+    dt = 1.0 / steps
+    for k in range(steps):
+        t = k * dt
+        rate = dt / max(1.0 - t, 1e-6)
+        tt = torch.full((B,), t, device=dev)
+        out = guided(model, s, tt, x, scale)
+        um = (s["vtype"] == MASK_VT) & (
+            torch.rand(s["vtype"].shape, device=dev, generator=gen) < rate)
+        s["vtype"] = torch.where(um, draw_from(out["vtype"], gen), s["vtype"])
+        x = x + out["vel"] * dt
+        if anchors is not None:
+            x[:, : anchors["n"]] = anchors["x1"]
+    tt = torch.ones(B, device=dev)
+    out = guided(model, s, tt, x, scale)
+    s["vtype"] = torch.where(s["vtype"] == MASK_VT, out["vtype"].argmax(-1),
+                             s["vtype"])
+    if anchors is not None:
+        s["vtype"][:, : anchors["n"]] = VT_ID["FIX"]
+    return s, x
+
+
+def force_anchor_incidence(s: dict, logits: list, n_fix: int) -> dict:
+    """R1, corrected. Freezing an anchor pins where the vertex IS; it does not
+    make any edge USE it, and an unreferenced vertex never appears in the
+    realized curve -- measured 0/2 anchors referenced in the first run. So for
+    any anchor no surviving edge points at, re-point the single (edge, slot) the
+    model itself scored highest. A grammar constraint, not a shape rule.
+
+    Candidates are restricted to edges that will survive decode: re-pointing an
+    edge whose other references are dead just moves the anchor onto an edge that
+    is about to be dropped.
+    """
+    if n_fix <= 0:
+        return s
+    B = s["etype"].shape[0]
+    dead = s["vtype"] == VT_ID["PAD"]                        # (B, K_V)
+    for bi in range(B):
+        arity = [ARITY.get(ET[int(v)], 0) for v in s["etype"][bi]]
+        alive = []
+        for ei, ar in enumerate(arity):
+            if ar == 0:
+                continue
+            refs = s["erefs"][bi, ei, :ar].tolist()
+            if all(r < K_V and not bool(dead[bi, r]) for r in refs):
+                alive.append(ei)
+        if not alive:
+            continue
+        claimed: set = set()
+        for a in range(n_fix):
+            if any(a in s["erefs"][bi, ei, :arity[ei]].tolist() for ei in alive):
+                continue
+            best = None
+            for ei in alive:
+                for j in range(arity[ei]):
+                    if (ei, j) in claimed:      # never overwrite another anchor
+                        continue
+                    v = float(logits[j][bi, ei, a])
+                    if best is None or v > best[0]:
+                        best = (v, ei, j)
+            if best is not None:
+                s["erefs"][bi, best[1], best[2]] = a
+                claimed.add((best[1], best[2]))
+    return s
+
+
+@torch.no_grad()
+def sample_edges(model, points, xyz, steps=24, gen=None, scale=1.0, n_fix=0):
+    dev = xyz.device
+    B = xyz.shape[0]
+    s = {"cond": points["cond"], "vtype": points["vtype"],
+         "vcoarse": points["vcoarse"], **dummy_edges(B, dev)}
+    dead = s["vtype"] == VT_ID["PAD"]
+    dt = 1.0 / steps
+    for k in range(steps + 1):
+        t = min(k * dt, 1.0)
+        rate = dt / max(1.0 - t, 1e-6) if k < steps else 1.0
+        tt = torch.full((B,), t, device=dev)
+        out = guided(model, s, tt, xyz, scale)
+        for key in ("etype", "ecls"):
+            r = torch.rand(s[key].shape, device=dev, generator=gen) < rate
+            pick = (draw_from(out[key], gen) if k < steps
+                    else out[key].argmax(-1))
+            s[key] = torch.where((s[key] == MASK_OF[key]) & r, pick, s[key])
+        for j in range(3):
+            lg = out["refs"][j].clone()
+            lg[:, :, :K_V] = lg[:, :, :K_V].masked_fill(
+                dead[:, None, :], torch.finfo(lg.dtype).min)
+            r = torch.rand(s["erefs"][..., j].shape, device=dev, generator=gen) < rate
+            pick = draw_from(lg, gen) if k < steps else lg.argmax(-1)
+            s["erefs"][..., j] = torch.where(
+                (s["erefs"][..., j] == MASK_REF) & r, pick, s["erefs"][..., j])
+    return force_anchor_incidence(s, out["refs"], n_fix)
+
+
 # ---------------------------------------------------------------- decode
 
 def decode(skel: dict, xs: torch.Tensor, part, coarse_in: bool, b: int = 0) -> dict:
@@ -477,6 +747,59 @@ def decode(skel: dict, xs: torch.Tensor, part, coarse_in: bool, b: int = 0) -> d
     Q = realized_q(part, vertices, edges)
     Q["_dropped"] = dropped
     return Q
+
+
+def relax_q(Q: dict, part, mu: float = 1e3, lam: float = 1e-3) -> dict:
+    """Elastic relaxation: keep the generated edge vectors while pulling the FIX
+    vertices onto their true positions, and let connectivity carry that pull
+    through the wire. Linear least squares, so it is differentiable and can move
+    into training later. Measured post-hoc: FIX error 6.11mm -> 0.00mm."""
+    V = Q["vertices"]
+    if not V or not Q["edges"]:
+        return Q
+    lo = np.asarray(Q["env_lo"], dtype=np.float64)
+    span = np.maximum(np.asarray(Q["env_hi"], dtype=np.float64) - lo, 1e-9)
+    x0 = np.stack([lo + (np.asarray(v["bin"], np.float64) + 0.5) / N_BINS * span
+                   for v in V])
+    gtq = realized_q(part, part.vertices, part.edges)
+    from .codec import bin_center
+    targets = [bin_center(gtq, v) for v in part.vertices if v["T"] == "FIX"]
+    anchors = [i for i, v in enumerate(V) if v["T"] == "FIX"][: len(targets)]
+
+    A, b = [], []
+    for e in Q["edges"]:
+        refs = e["refs"][: ARITY[e["tau"]]]
+        for i, j in zip(refs[:-1], refs[1:]):
+            row = np.zeros(len(V)); row[i], row[j] = 1.0, -1.0
+            A.append(row); b.append(x0[i] - x0[j])
+    for k, i in enumerate(anchors):
+        row = np.zeros(len(V)); row[i] = np.sqrt(mu)
+        A.append(row); b.append(np.sqrt(mu) * targets[k])
+    for i in range(len(V)):
+        row = np.zeros(len(V)); row[i] = np.sqrt(lam)
+        A.append(row); b.append(np.sqrt(lam) * x0[i])
+
+    x = np.linalg.lstsq(np.stack(A), np.stack(b), rcond=None)[0]
+    out = [{"T": v["T"], "nf": v["nf"],
+            "bin": tuple(int(t) for t in
+                         np.clip((p - lo) / span * N_BINS, 0, N_BINS - 1))}
+           for v, p in zip(V, x)]
+    return dict(Q, vertices=out)
+
+
+@torch.no_grad()
+def generate_pe(points_net, edges_net, part, device, anchor: bool, steps: int,
+                seed: int = 0, scale: float = 1.0, do_relax: bool = True) -> dict:
+    """points -> edges -> decode -> elastic relaxation."""
+    gen = torch.Generator(device=device).manual_seed(seed)
+    item = build_item(part, part.vertices, np.random.default_rng(0), shuffle=False)
+    cond = item["cond"][None].to(device)
+    anc = anchors_of(part, device, False) if anchor else None
+    pts, xyz = sample_points(points_net, cond, anc, steps, gen, scale)
+    skel = sample_edges(edges_net, pts, xyz, steps, gen, scale,
+                        n_fix=anc["n"] if anc else 0)
+    Q = decode(skel, xyz, part, False)
+    return relax_q(Q, part) if do_relax else Q
 
 
 def anchors_of(part, device, coarse_in: bool) -> dict:
@@ -530,34 +853,61 @@ def to_device(b: dict, dev: str) -> dict:
     return {k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in b.items()}
 
 
-def make_net(args, geo: bool) -> SlotNet:
+def make_net(args, geo: bool = False, mode: str | None = None) -> SlotNet:
     return SlotNet(args.dim, args.layers, args.heads,
-                   coarse_in=(args.arm == "gagf"), geo=geo)
+                   coarse_in=(args.arm == "gagf"), geo=geo, mode=mode,
+                   rel_attn=(mode == "edges" and getattr(args, "rel_attn", 1)))
 
 
-def run_stage(args, out: pathlib.Path, geo: bool) -> None:
+def stage_loss_fn(mode: str, args):
+    anchor = args.arm != "bcore"
+    p = getattr(args, "cfg_drop", 0.0)
+    return {
+        "topo": lambda m, b: topo_loss(m, b, anchor),
+        "geo": lambda m, b: geo_loss(m, b, anchor),
+        "points": lambda m, b: points_loss(m, b, anchor, p),
+        "edges": lambda m, b: edges_loss(m, b, p),
+    }[mode]
+
+
+def run_stage(args, out: pathlib.Path, mode: str) -> None:
     train_parts, val_parts = build_splits(args)
-    name = "geo" if geo else "topo"
+    name = mode
+    geo = mode == "geo"
     print(f"[{name}] arm={args.arm} parts: train {len(train_parts)} val {len(val_parts)}")
     tl = DataLoader(SlotDataset(train_parts, augment=True), batch_size=args.batch_size,
                     shuffle=True, drop_last=True)
     vl = DataLoader(SlotDataset(val_parts, augment=False, base_seed=555),
                     batch_size=args.batch_size)
-    model = make_net(args, geo).to(args.device)
-    anchor = args.arm == "gagf"
-    loss_fn = geo_loss if geo else topo_loss
+    model = make_net(args, geo, mode).to(args.device)
+    loss_fn = stage_loss_fn(mode, args)
     print(f"[{name}] params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M",
           flush=True)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs, args.lr * 0.05)
     history, best, t_start = [], float("inf"), time.time()
     hist_path = out / f"{name}_history.json"
-    for epoch in range(1, args.epochs + 1):
+    start = 1
+    ck_path = out / f"{name}_last.pt"
+    if args.resume and ck_path.exists():
+        # local training runs in short slices, so resume is the normal path
+        ck = torch.load(ck_path, map_location=args.device, weights_only=False)
+        model.load_state_dict(ck["model"])
+        if "opt" in ck:
+            opt.load_state_dict(ck["opt"])
+        start = ck["epoch"] + 1
+        if hist_path.exists():
+            history = [r for r in json.loads(hist_path.read_text()) if r["epoch"] < start]
+            best = min((r["val"] for r in history if "val" in r), default=float("inf"))
+        for _ in range(start - 1):
+            sched.step()
+        print(f"[{name}] resumed at epoch {start} (best val {best:.4f})", flush=True)
+    for epoch in range(start, args.epochs + 1):
         tl.dataset.set_epoch(epoch)
         model.train()
         t0, tot, n = time.time(), 0.0, 0
         for b in tl:
-            loss = loss_fn(model, to_device(b, args.device), anchor)
+            loss = loss_fn(model, to_device(b, args.device))
             opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -570,10 +920,11 @@ def run_stage(args, out: pathlib.Path, geo: bool) -> None:
         if epoch % args.val_every == 0 or epoch == args.epochs:
             model.eval()
             with torch.no_grad():
-                vs = [float(loss_fn(model, to_device(b, args.device), anchor))
+                vs = [float(loss_fn(model, to_device(b, args.device)))
                       for b in vl]
             row["val"] = float(np.mean(vs))
-            ck = {"model": model.state_dict(), "args": vars(args), "epoch": epoch}
+            ck = {"model": model.state_dict(), "opt": opt.state_dict(),
+                  "args": vars(args), "epoch": epoch}
             if row["val"] < best:
                 best = row["val"]
                 safe_save(ck, out / f"{name}_best.pt")
@@ -593,25 +944,32 @@ def run_stage(args, out: pathlib.Path, geo: bool) -> None:
 def stage_eval(args, out: pathlib.Path) -> None:
     from .evaluate_curve2 import class_points, one_way
     _, val_parts = build_splits(args)
+    modes = ("points", "edges") if (out / "points_best.pt").exists() else ("topo", "geo")
     nets = {}
-    for geo in (False, True):
-        name = "geo" if geo else "topo"
-        ck = torch.load(out / f"{name}_best.pt", map_location=args.device,
+    for mode in modes:
+        ck = torch.load(out / f"{mode}_best.pt", map_location=args.device,
                         weights_only=False)
         a = argparse.Namespace(**ck["args"])
-        net = make_net(a, geo).to(args.device)
+        net = make_net(a, mode == "geo", mode).to(args.device)
         net.load_state_dict(ck["model"])
         net.eval()
-        nets[name] = net
+        nets[mode] = net
         args.arm = a.arm            # the checkpoints decide the arm, not the flag
-    anchor = args.arm == "gagf"
+    anchor = args.arm != "bcore"
+    new_pipeline = modes[0] == "points"
+    print(f"[eval] pipeline={'points/edges' if new_pipeline else 'topo/geo'} "
+          f"arm={args.arm} guidance={args.cfg_scale} relax={not args.no_relax}")
     rows = []
     for p in val_parts[: args.eval_parts]:
         gt = realize_points(realized_q(p, p.vertices, p.edges))
         cands = []
         for s in range(args.best_of):
-            Q = generate(nets["topo"], nets["geo"], p, args.device, anchor,
-                         args.steps, seed=1000 * s + 7)
+            Q = (generate_pe(nets["points"], nets["edges"], p, args.device,
+                             anchor, args.steps, seed=1000 * s + 7,
+                             scale=args.cfg_scale, do_relax=not args.no_relax)
+                 if new_pipeline else
+                 generate(nets["topo"], nets["geo"], p, args.device, anchor,
+                          args.steps, seed=1000 * s + 7))
             gen = realize_points(Q)
             cd = chamfer_mm(gen[::3], gt[::3]) if len(gen) else float("nan")
             cands.append((cd, Q, gen))
@@ -652,70 +1010,72 @@ def stage_eval(args, out: pathlib.Path) -> None:
 
 
 def stage_smoke(args, out: pathlib.Path) -> None:
-    """Self-check: the slot representation must be lossless, both nets must run,
-    both losses must fall, and generation must decode."""
+    """Self-check: the slot representation must be lossless, every stage must
+    run and learn, generation must decode, and the elastic relaxation must put
+    the wire exactly on the fastening points."""
     parts = load_curve_parts(pathlib.Path(args.dataset))[:24]
-    for arm in ("bcore", "gagf"):
+
+    def signature(vertices, edges):
+        vs = sorted((v["T"], tuple(v["bin"])) for v in vertices)
+        es = sorted((e["tau"], e["cls"],
+                     tuple(tuple(vertices[r]["bin"]) for r in e["refs"]))
+                    for e in edges)
+        return vs, es
+
+    for arm in ("bcore", "agf2"):
         a = argparse.Namespace(**{**vars(args), "arm": arm})
         coarse = arm == "gagf"
-        # (a) representation roundtrip. Slot order is randomized, so compare
-        # order-independent signatures (bins, not indices) like codec.roundtrip_ok.
-        def signature(vertices, edges):
-            vs = sorted((v["T"], tuple(v["bin"])) for v in vertices)
-            es = sorted((e["tau"], e["cls"],
-                         tuple(tuple(vertices[r]["bin"]) for r in e["refs"]))
-                        for e in edges)
-            return vs, es
-
         for p in parts[:8]:
             item = build_item(p, p.vertices, np.random.default_rng(0), shuffle=True)
             skel = {k: v[None] for k, v in item.items() if torch.is_tensor(v)}
             Q = decode(skel, geo_target(skel, coarse), p, coarse)
             assert Q["_dropped"] == 0, f"{p.name}: dropped {Q['_dropped']} edges"
-            assert signature(Q["vertices"], Q["edges"]) == \
-                signature(p.vertices, p.edges), f"{p.name}: roundtrip changed the wire"
+            assert signature(Q["vertices"], Q["edges"]) ==                 signature(p.vertices, p.edges), f"{p.name}: roundtrip changed the wire"
         print(f"[{arm}] roundtrip ok (exact on 8 parts)")
 
-        # (b,c) both stages run and learn
         ds = SlotDataset(parts, augment=True)
         loader = DataLoader(ds, batch_size=4, shuffle=True, drop_last=True)
         nets = {}
-        for geo in (False, True):
-            net = make_net(a, geo).to(args.device)
-            nets["geo" if geo else "topo"] = net
-            fn = geo_loss if geo else topo_loss
+        for mode in ("points", "edges"):
+            net = make_net(a, False, mode).to(args.device)
+            nets[mode] = net
+            fn = stage_loss_fn(mode, a)
             opt = torch.optim.AdamW(net.parameters(), lr=1e-3)
             losses = []
             for epoch in range(8):
                 ds.set_epoch(epoch)
                 for b in loader:
-                    loss = fn(net, to_device(b, args.device), arm == "gagf")
+                    loss = fn(net, to_device(b, args.device))
                     opt.zero_grad()
                     loss.backward()
                     opt.step()
                     losses.append(float(loss))
             head, tail = np.mean(losses[:5]), np.mean(losses[-5:])
-            n_par = sum(p.numel() for p in net.parameters()) / 1e6
-            assert tail < head, f"{arm}/{'geo' if geo else 'topo'} did not learn"
-            print(f"[{arm}] {'geo' if geo else 'topo'}: {n_par:.2f}M params, "
-                  f"loss {head:.3f} -> {tail:.3f}")
+            n_par = sum(q.numel() for q in net.parameters()) / 1e6
+            assert tail < head, f"{arm}/{mode} did not learn"
+            print(f"[{arm}] {mode}: {n_par:.2f}M params, {head:.3f} -> {tail:.3f}")
 
-        # (d) generation decodes
-        Q = generate(nets["topo"], nets["geo"], parts[0], args.device,
-                     anchor=arm == "gagf", steps=6, seed=1)
-        pts = realize_points(Q)
-        print(f"[{arm}] generated V={len(Q['vertices'])} E={len(Q['edges'])} "
-              f"dropped={Q['_dropped']} points={len(pts)} "
-              f"fix_err={fix_error_mm(Q, parts[0]):.2f}mm")
-        if arm == "gagf":
-            assert fix_error_mm(Q, parts[0]) < 1.0, "anchor freezing did not hold"
+        for relax in (False, True):
+            Q = generate_pe(nets["points"], nets["edges"], parts[0], args.device,
+                            anchor=(arm != "bcore"), steps=6, seed=1,
+                            scale=args.cfg_scale, do_relax=relax)
+            err = fix_error_mm(Q, parts[0])
+            fix_idx = {i for i, v in enumerate(Q["vertices"]) if v["T"] == "FIX"}
+            used = {r for e in Q["edges"] for r in e["refs"][: ARITY[e["tau"]]]}
+            inc = len(fix_idx & used)
+            print(f"[{arm}] relax={relax}: V={len(Q['vertices'])} E={len(Q['edges'])} "
+                  f"dropped={Q['_dropped']} anchors_referenced={inc}/{len(fix_idx)} "
+                  f"fix_err={err:.2f}mm")
+            if relax and arm != "bcore" and inc:
+                assert err < 1.0, f"{arm}: relaxation left {err:.2f}mm at the anchors"
     print("smoke ok")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--stage", choices=("topo", "geo", "eval", "smoke"), required=True)
-    ap.add_argument("--arm", choices=("bcore", "gagf"), default="gagf")
+    ap.add_argument("--stage", required=True,
+                    choices=("points", "edges", "topo", "geo", "eval", "smoke"))
+    ap.add_argument("--arm", choices=("bcore", "gagf", "agf2"), default="agf2")
     ap.add_argument("--dataset", required=True)
     ap.add_argument("--val-list", default="")
     ap.add_argument("--output-dir", required=True)
@@ -729,6 +1089,16 @@ def main() -> None:
     ap.add_argument("--val-every", type=int, default=5)
     ap.add_argument("--eval-parts", type=int, default=40)
     ap.add_argument("--best-of", type=int, default=5)
+    ap.add_argument("--resume", action="store_true",
+                    help="continue from <stage>_last.pt (local runs go in slices)")
+    ap.add_argument("--cfg-drop", type=float, default=0.1,
+                    help="condition dropout during training (classifier-free guidance)")
+    ap.add_argument("--cfg-scale", type=float, default=1.5,
+                    help="guidance scale at sampling; 1.0 disables it")
+    ap.add_argument("--rel-attn", type=int, default=1,
+                    help="relative-geometry attention bias in the edges stage")
+    ap.add_argument("--no-relax", action="store_true",
+                    help="skip the elastic relaxation at decode")
     ap.add_argument("--max-hours", type=float, default=8.5)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
@@ -740,7 +1110,7 @@ def main() -> None:
     elif args.stage == "eval":
         stage_eval(args, out)
     else:
-        run_stage(args, out, geo=args.stage == "geo")
+        run_stage(args, out, args.stage)
 
 
 if __name__ == "__main__":

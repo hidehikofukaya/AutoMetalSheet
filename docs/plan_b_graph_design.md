@@ -2,7 +2,7 @@
 
 Date: 2026-08-27
 Author: fable5(ユーザーの graph transformer 適用提案を受けて)
-位置づけ: C(純AR、収束済み52.2mm)・AB(計画+AR、評価中)に続く第3路線。
+位置づけ: C(純AR、収束済み単発67.9mm)・AB(計画+AR、単発86.5mm)に続く第3路線。
 一筆書きを完全に廃止する唯一の案。
 
 ## 1. 中核の主張
@@ -72,7 +72,8 @@ wireflow で実装済みの Sinkhorn/OT 資産を流用可)。
 
 - decode: 端点溶接 → Q 形式 → realize_points → **evaluate_curve2 と同一の
   Chamfer・誤差3分解・レンダリング**(arch 追加のみ)
-- 対戦相手: C=52.2mm(収束値)、AB=本日中に判明
+- 対戦相手: C=単発67.9 / oracle47.4mm、AB=単発86.5mm
+  (旧記載52.2mmはbest-of-2オラクル値。frontier_gaps_and_reform.md 4.1a参照)
 - 本案固有のチェック: 溶接後のぶら下がり端点率(接続がどれだけ自然に閉じるか —
   ルールでなく観測指標として)
 
