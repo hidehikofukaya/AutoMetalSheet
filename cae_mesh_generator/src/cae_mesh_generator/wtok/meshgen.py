@@ -41,7 +41,22 @@ from .plan_g import COND_ROWS, Block, RelBias, timestep_embedding
 from .train_ar import chamfer_mm
 from .train_curve import realized_q
 
-CH = 6                       # xyz + normal
+CH = 8      # xyz, normal, then two learned fields
+FIELD_CAP = 0.5    # frame units; distances past this carry no useful signal
+
+# Channels 6 and 7 hold the distance from the point to the outline and to the
+# nearest bend line. Regressing a field instead of labelling points is EC-Net's
+# trick and generating it jointly with the geometry is SeaLion's; together they
+# fix three measured failures.
+#   - the curves are measure-zero in the surface, so a uniform sample lands on
+#     each one about once. A field is defined at every point.
+#   - the geometric rim test is density-dependent and gets WORSE with more
+#     points: on PERFECT clouds its false-rim rate went 5.7% at 256 points to
+#     22.8% at 4096, and recall fell 73% -> 25%.
+#   - the trim is a design decision, not a geometric feature. A bend turns the
+#     normal; a cut just stops the sheet, with no curvature to find. No detector
+#     can recover it, so the model has to say where it is -- and it knows,
+#     because it drew the sheet.
 
 
 # ---------------------------------------------------------------- data
@@ -184,6 +199,26 @@ def fastener_disc(part, per_fix: int = ANCHOR_PER_FIX, r: float = ANCHOR_R,
     return np.concatenate(pts), np.concatenate(nrm)
 
 
+def gt_fields(part, npz) -> np.ndarray:
+    """(N,2): mm distance from each surface sample to the outline and to the
+    nearest bend line. These are the supervision for channels 6 and 7."""
+    from scipy.spatial import cKDTree
+
+    from .codec import realize_edge
+    lo = np.asarray(npz["env_lo"], dtype=np.float64)
+    span = np.maximum(np.asarray(npz["env_hi"], dtype=np.float64) - lo, 1e-9)
+    xyz = npz["xyz"].astype(np.float64) * span + lo
+    q = realized_q(part, part.vertices, part.edges)
+    out = np.full((len(xyz), 2), 1e6, dtype=np.float64)
+    for col, cls in enumerate(("outer_boundary", "bend_line")):
+        polys = [poly for poly in
+                 (realize_edge(q, e) for e in part.edges if e.get("cls") == cls)
+                 if poly is not None and len(poly) >= 2]
+        if polys:
+            out[:, col] = cKDTree(np.concatenate(polys)).query(xyz)[0]
+    return out.astype(np.float32)
+
+
 class MeshDataset(Dataset):
     def __init__(self, parts, mesh_dir: pathlib.Path, n_pts: int,
                  augment: bool, base_seed: int = 0,
@@ -207,18 +242,19 @@ class MeshDataset(Dataset):
     def __len__(self) -> int:
         return len(self.parts)
 
-    def load(self, name):
-        if name not in self.cache:
-            d = np.load(self.dir / f"{name}.npz")
-            self.cache[name] = (d["xyz"].astype(np.float32),
-                                d["normal"].astype(np.float32))
-        return self.cache[name]
+    def load(self, part):
+        if part.name not in self.cache:
+            d = np.load(self.dir / f"{part.name}.npz")
+            self.cache[part.name] = (d["xyz"].astype(np.float32),
+                                     d["normal"].astype(np.float32),
+                                     gt_fields(part, d))
+        return self.cache[part.name]
 
     def __getitem__(self, i: int) -> dict:
         p = self.parts[i]
         rng = np.random.default_rng(
             stable_seed(self.base_seed + 999983 * self.epoch, p.name))
-        xyz_n, nrm = self.load(p.name)
+        xyz_n, nrm, fields = self.load(p)
         lo = np.asarray(p.env_lo, dtype=np.float64)
         span = np.maximum(np.asarray(p.env_hi, dtype=np.float64) - lo, 1e-9)
         xyz_mm = xyz_n.astype(np.float64) * span + lo      # envelope: storage only
@@ -240,7 +276,7 @@ class MeshDataset(Dataset):
                 keep_idx = np.flatnonzero(far > ANCHOR_R / frame[2])
                 self.outside[p.name] = keep_idx
             if len(keep_idx) > self.n_pts:
-                xyz, nrm = xyz[keep_idx], nrm[keep_idx]
+                xyz, nrm, fields = xyz[keep_idx], nrm[keep_idx], fields[keep_idx]
         if self.augment and rng.random() < 0.5:
             # the frame fixes e1 and e2, so only the e3 component is free to
             # mirror -- flipping the others would just redefine the frame
@@ -255,10 +291,14 @@ class MeshDataset(Dataset):
             cond[:COND_ROWS - 1, 5] *= -1.0
         n_fix = min(len(fix), self.n_pts)
         take = rng.choice(len(xyz), self.n_pts - n_fix, replace=False)
+        fld = np.clip(fields / frame[2], 0.0, FIELD_CAP)      # frame units
+        anc_fld = np.clip(fields[cKD(xyz, fix[:n_fix])] / frame[2],
+                          0.0, FIELD_CAP)     # anchors sit on the sheet too
         # anchors occupy the first slots; every other slot is a random surface
         # sample, so slot order carries no information the model could lean on
         pts = np.concatenate([fix[:n_fix], xyz[take]])
         nn_ = np.concatenate([fixn[:n_fix], nrm[take]])
+        fl = np.concatenate([anc_fld, fld[take]])
         # Masked training: pin a random extra set of surface points as "known"
         # and let the model infer the rest. Pinning is already how anchors work,
         # so a constraint point and a fastening point are the same mechanism --
@@ -269,10 +309,10 @@ class MeshDataset(Dataset):
             sel = n_fix + rng.permutation(free)[:k]
             order = np.concatenate([np.arange(n_fix), sel,
                                     np.setdiff1d(np.arange(n_fix, self.n_pts), sel)])
-            pts, nn_ = pts[order], nn_[order]
+            pts, nn_, fl = pts[order], nn_[order], fl[order]
             n_fix += k
         return {"x": torch.from_numpy(
-                    np.concatenate([pts, nn_], axis=1).astype(np.float32)),
+                    np.concatenate([pts, nn_, fl], axis=1).astype(np.float32)),
                 "cond": torch.from_numpy(cond),
                 "n_fix": n_fix}
 
@@ -327,7 +367,8 @@ def anchor_keep(n_fix: torch.Tensor, N: int) -> torch.Tensor:
     return torch.arange(N, device=n_fix.device)[None] < n_fix[:, None]
 
 
-def flow_loss(model, batch, anchor: bool, p_drop: float, w_normal: float = 0.2):
+def flow_loss(model, batch, anchor: bool, p_drop: float, w_normal: float = 0.2,
+              w_field: float = 0.5):
     x1 = batch["x"]          # already in the fastener frame: coords ~ +-0.85
     x0 = torch.randn_like(x1)
     B, N, _ = x1.shape
@@ -335,17 +376,23 @@ def flow_loss(model, batch, anchor: bool, p_drop: float, w_normal: float = 0.2):
     xt = (1 - t[:, None, None]) * x0 + t[:, None, None] * x1
     keep = anchor_keep(batch["n_fix"], N)
     if anchor:
-        xt = torch.where(keep[..., None], x1, xt)   # the disc fixes both
+        # the disc fixes position and normal; the FIELDS are not known at
+        # inference (that is the whole point), so they stay generated
+        pinned = torch.where(keep[..., None], x1, xt)
+        xt = torch.cat([pinned[..., :6], xt[..., 6:]], dim=-1)
     drop = (torch.rand(B, device=x1.device) < p_drop) if (p_drop > 0 and model.training) else None
     v = model(xt, t, batch["cond"], drop)
     target = x1 - x0
     err = (v - target) ** 2
     w = torch.cat([torch.ones(3, device=x1.device),
-                   torch.full((3,), w_normal, device=x1.device)])
+                   torch.full((3,), w_normal, device=x1.device),
+                   torch.full((CH - 6,), w_field, device=x1.device)])
     err = (err * w).mean(-1)
     if anchor:
-        err = err * (~keep)
-        return err.sum() / (~keep).sum().clamp(min=1)
+        geo = ((v[..., :6] - target[..., :6]) ** 2 * w[:6]).mean(-1)
+        fld = ((v[..., 6:] - target[..., 6:]) ** 2 * w[6:]).mean(-1)
+        live = (~keep).float()
+        return ((geo * live).sum() / live.sum().clamp(min=1)) + fld.mean()
     return err.mean()
 
 
@@ -356,7 +403,7 @@ def sample(model, cond, fix_xyz, steps=48, gen=None, scale=1.0, n_pts=256):
     x = torch.randn(B, n_pts, CH, device=dev, generator=gen)
     n_fix = fix_xyz.shape[1] if fix_xyz is not None else 0
     if n_fix:
-        x[:, :n_fix] = fix_xyz            # position and normal are both implied
+        x[:, :n_fix, :6] = fix_xyz        # position and normal; fields are free
     dt = 1.0 / steps
     for k in range(steps):
         t = torch.full((B,), k * dt, device=dev)
@@ -368,17 +415,22 @@ def sample(model, cond, fix_xyz, steps=48, gen=None, scale=1.0, n_pts=256):
             v = model(x, t, cond)
         x = x + v * dt
         if n_fix:
-            x[:, :n_fix] = fix_xyz
+            x[:, :n_fix, :6] = fix_xyz
     return x
 
 
 def to_world(x, part):
-    """model output (fastener frame) -> (points mm, unit normals). The envelope
-    is never consulted: the frame comes from the fastening points alone."""
+    """model output (fastener frame) -> (points mm, unit normals, fields mm).
+    The envelope is never consulted: the frame comes from the fastening points
+    alone."""
+    frame = fastener_frame(part)
     xyz = x[..., :3].cpu().numpy().astype(np.float64)
-    nrm = x[..., 3:].cpu().numpy().astype(np.float64)
+    nrm = x[..., 3:6].cpu().numpy().astype(np.float64)
     nrm = nrm / np.maximum(np.linalg.norm(nrm, axis=-1, keepdims=True), 1e-9)
-    return from_frame(xyz, nrm, fastener_frame(part))
+    world, normal = from_frame(xyz, nrm, frame)
+    fields = np.clip(x[..., 6:].cpu().numpy().astype(np.float64),
+                     0.0, FIELD_CAP) * frame[2]
+    return world, normal, fields
 
 
 # ---------------------------------------------------------------- stages
@@ -401,9 +453,11 @@ def stage_train(args, out: pathlib.Path) -> None:
     print(f"parts: train {len(train_parts)} val {len(val_parts)}  N={args.points}")
     md = pathlib.Path(args.dataset) / "parts"
     tl = DataLoader(MeshDataset(train_parts, md, args.points, True,
+                                anchor_per_fix=args.anchor_per_fix,
                                 mask_rate=args.mask_rate),
                     batch_size=args.batch_size, shuffle=True, drop_last=True)
-    vl = DataLoader(MeshDataset(val_parts, md, args.points, False, 555),
+    vl = DataLoader(MeshDataset(val_parts, md, args.points, False, 555,
+                                anchor_per_fix=args.anchor_per_fix),
                     batch_size=args.batch_size)
     model = PointFlow(args.dim, args.layers, args.heads, bool(args.rel_attn)).to(args.device)
     print(f"params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M", flush=True)
@@ -469,7 +523,8 @@ def stage_train(args, out: pathlib.Path) -> None:
             # through epoch 60
             row["surf_mm"] = float(np.median([
                 chamfer_mm(generate(model, p, args.device, args.steps, 7,
-                                    args.cfg_scale, args.points, args.anchor)[0],
+                                    args.cfg_scale, args.points, args.anchor,
+                                    per_fix=args.anchor_per_fix)[0],
                            probe_gt[p.name])
                 for p in val_parts[: args.probe_parts]]))
         msg = f"epoch {epoch}: loss {row['train']:.5f} ({row['seconds']}s)"
@@ -501,7 +556,7 @@ def generate(model, part, device, steps, seed, scale, n_pts, anchor=True,
         rows.append(np.concatenate([f, fn], axis=1))
     if known is not None and len(known):
         # any point the caller already knows, in mm with its normal
-        kf, kn = to_frame(known[:, :3], known[:, 3:], fastener_frame(part))
+        kf, kn = to_frame(known[:, :3], known[:, 3:6], fastener_frame(part))
         rows.append(np.concatenate([kf, kn], axis=1))
     if rows:
         fx = torch.from_numpy(np.concatenate(rows).astype(np.float32))[None].to(device)
@@ -526,10 +581,20 @@ def stage_eval(args, out: pathlib.Path) -> None:
         gt_wire = realize_points(realized_q(p, p.vertices, p.edges))
         fix_mm = [bin_center(realized_q(p, p.vertices, p.edges), v)
                   for v in p.vertices if v["T"] == "FIX"]
-        xyz, nrm = generate(model, p, args.device, args.steps, 7, args.cfg_scale,
-                            a.points, args.anchor)
-        f = extract(xyz, nrm)
-        bp, cp = xyz[f["boundary"]], xyz[f["crease"]]
+        xyz, nrm, fld = generate(model, p, args.device, args.steps, 7,
+                                 args.cfg_scale, a.points, args.anchor,
+                                 per_fix=getattr(a, "anchor_per_fix", ANCHOR_PER_FIX))
+        if args.recon:
+            # rebuild the sheet, then read the rim and the bends off it. Labelling
+            # the points directly cannot work: the curves are measure-zero in the
+            # surface, so a uniform sample lands on each one about once.
+            from .surface import extract_features
+            # the generated fields say where the curves are; geometry only
+            # provides the surface they live on
+            bp, cp, _ = extract_features(xyz, nrm, fld)
+        else:
+            f = extract(xyz, nrm)
+            bp, cp = xyz[f["boundary"]], xyz[f["crease"]]
         wire = np.concatenate([x for x in (bp, cp) if len(x)]) \
             if len(bp) or len(cp) else np.zeros((0, 3))
         row = {"part": p.name,
@@ -629,7 +694,8 @@ def stage_smoke(args, out: pathlib.Path) -> None:
     parts = train_parts[:24]
     check_no_envelope_leak(parts)
     md = pathlib.Path(args.dataset) / "parts"
-    ds = MeshDataset(parts, md, args.points, True)
+    ds = MeshDataset(parts, md, args.points, True,
+                     anchor_per_fix=args.anchor_per_fix)
     loader = DataLoader(ds, batch_size=4, shuffle=True, drop_last=True)
     model = PointFlow(args.dim, args.layers, args.heads, bool(args.rel_attn)).to(args.device)
     print(f"params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
@@ -648,7 +714,8 @@ def stage_smoke(args, out: pathlib.Path) -> None:
     print(f"loss {head:.4f} -> {tail:.4f}")
 
     # masked training must actually vary how much is pinned
-    ds_m = MeshDataset(parts, md, args.points, True, mask_rate=1.0)
+    ds_m = MeshDataset(parts, md, args.points, True,
+                       anchor_per_fix=args.anchor_per_fix, mask_rate=1.0)
     counts = set()
     for e in range(6):
         ds_m.set_epoch(e)
@@ -663,15 +730,17 @@ def stage_smoke(args, out: pathlib.Path) -> None:
     surf = d["xyz"] * span + d["env_lo"]
     pick = surf[[7, 900, 3000]]
     known = np.concatenate([pick, d["normal"][[7, 900, 3000]]], axis=1)
-    kx, _ = generate(model, p, args.device, 8, 1, args.cfg_scale, args.points,
-                     args.anchor, known=known)
+    kx, _, _ = generate(model, p, args.device, 8, 1, args.cfg_scale, args.points,
+                        args.anchor, per_fix=args.anchor_per_fix, known=known)
     err = float(max(np.min(np.linalg.norm(kx - q, axis=1)) for q in pick))
     print(f"caller constraint points honoured to {err:.4f}mm")
     assert err < 1e-2, f"known points were not pinned ({err:.3f}mm)"
 
-    xyz, nrm = generate(model, p, args.device, 8, 1, args.cfg_scale, args.points,
-                        args.anchor)
+    xyz, nrm, fld = generate(model, p, args.device, 8, 1, args.cfg_scale,
+                             args.points, args.anchor,
+                             per_fix=args.anchor_per_fix)
     f = extract(xyz, nrm)
+    assert fld.shape[1] == CH - 6, "fields missing from the generator output"
     fixq = [bin_center(realized_q(p, p.vertices, p.edges), v)
             for v in p.vertices if v["T"] == "FIX"]
     err = float(np.mean([np.min(np.linalg.norm(xyz - q, axis=1)) for q in fixq]))
@@ -699,6 +768,9 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=48)
     ap.add_argument("--rel-attn", type=int, default=1)
     ap.add_argument("--anchor", type=int, default=1)
+    # 1 = pin just the fastening points. The 8-per-fastener disc converged
+    # faster early but ended 0.76mm worse over 40 parts, so 1 is the default.
+    ap.add_argument("--anchor-per-fix", type=int, default=1)
     ap.add_argument("--mask-rate", type=float, default=0.5,
                     help="fraction of training items that also pin a random set "
                          "of known surface points (masked / inpainting training)")
@@ -712,6 +784,9 @@ def main() -> None:
     ap.add_argument("--sample-every", type=int, default=20)
     ap.add_argument("--probe-parts", type=int, default=6)
     ap.add_argument("--eval-parts", type=int, default=40)
+    ap.add_argument("--recon", type=int, default=1,
+                    help="rebuild the sheet before reading off the curves; "
+                         "0 labels the raw points instead")
     ap.add_argument("--max-hours", type=float, default=0.55)
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
