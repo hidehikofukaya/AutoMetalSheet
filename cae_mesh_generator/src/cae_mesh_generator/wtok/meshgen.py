@@ -219,12 +219,36 @@ def gt_fields(part, npz) -> np.ndarray:
     return out.astype(np.float32)
 
 
+def fps_order(xyz: np.ndarray, k: int) -> np.ndarray:
+    """Farthest-point order: the first m entries are a good even cover for any
+    m <= k, so one pass serves every point count.
+
+    Evenly spread points are markedly easier to read curves off. Measured with
+    the ridge model on GT clouds:
+        256 random 3.03/3.72mm   256 even 2.22/3.36mm
+        512 random 1.48/1.90mm   512 even 1.27/1.47mm
+    and the target itself becomes deterministic -- a random subset differs every
+    epoch, which is noise the model cannot fit and should not have to.
+    """
+    k = min(k, len(xyz))
+    order = np.empty(k, dtype=np.int64)
+    order[0] = 0
+    dist = np.linalg.norm(xyz - xyz[0], axis=1)
+    for i in range(1, k):
+        j = int(dist.argmax())
+        order[i] = j
+        np.minimum(dist, np.linalg.norm(xyz - xyz[j], axis=1), out=dist)
+    return order
+
+
 class MeshDataset(Dataset):
     def __init__(self, parts, mesh_dir: pathlib.Path, n_pts: int,
                  augment: bool, base_seed: int = 0,
                  anchor_per_fix: int = ANCHOR_PER_FIX,
-                 mask_rate: float = 0.0, mask_max: float = 0.5):
+                 mask_rate: float = 0.0, mask_max: float = 0.5,
+                 even: bool = True):
         self.anchor_per_fix = anchor_per_fix
+        self.even = even
         self.mask_rate = mask_rate
         self.mask_max = mask_max
         self.parts = parts
@@ -245,16 +269,18 @@ class MeshDataset(Dataset):
     def load(self, part):
         if part.name not in self.cache:
             d = np.load(self.dir / f"{part.name}.npz")
-            self.cache[part.name] = (d["xyz"].astype(np.float32),
-                                     d["normal"].astype(np.float32),
-                                     gt_fields(part, d))
+            xyz = d["xyz"].astype(np.float32)
+            order = (fps_order(xyz, min(len(xyz), 4 * self.n_pts))
+                     if self.even else None)
+            self.cache[part.name] = (xyz, d["normal"].astype(np.float32),
+                                     gt_fields(part, d), order)
         return self.cache[part.name]
 
     def __getitem__(self, i: int) -> dict:
         p = self.parts[i]
         rng = np.random.default_rng(
             stable_seed(self.base_seed + 999983 * self.epoch, p.name))
-        xyz_n, nrm, fields = self.load(p)
+        xyz_n, nrm, fields, order = self.load(p)
         lo = np.asarray(p.env_lo, dtype=np.float64)
         span = np.maximum(np.asarray(p.env_hi, dtype=np.float64) - lo, 1e-9)
         xyz_mm = xyz_n.astype(np.float64) * span + lo      # envelope: storage only
@@ -277,6 +303,11 @@ class MeshDataset(Dataset):
                 self.outside[p.name] = keep_idx
             if len(keep_idx) > self.n_pts:
                 xyz, nrm, fields = xyz[keep_idx], nrm[keep_idx], fields[keep_idx]
+                if order is not None:
+                    pos = -np.ones(len(xyz_n), dtype=np.int64)
+                    pos[keep_idx] = np.arange(len(keep_idx))
+                    order = pos[order]
+                    order = order[order >= 0]
         if self.augment and rng.random() < 0.5:
             # the frame fixes e1 and e2, so only the e3 component is free to
             # mirror -- flipping the others would just redefine the frame
@@ -290,7 +321,9 @@ class MeshDataset(Dataset):
             cond[:COND_ROWS - 1, 2] *= -1.0
             cond[:COND_ROWS - 1, 5] *= -1.0
         n_fix = min(len(fix), self.n_pts)
-        take = rng.choice(len(xyz), self.n_pts - n_fix, replace=False)
+        n_free = self.n_pts - n_fix
+        take = (order[:n_free] if order is not None and len(order) >= n_free
+                else rng.choice(len(xyz), n_free, replace=False))
         fld = np.clip(fields / frame[2], 0.0, FIELD_CAP)      # frame units
         anc_fld = np.clip(fields[cKD(xyz, fix[:n_fix])] / frame[2],
                           0.0, FIELD_CAP)     # anchors sit on the sheet too
@@ -329,17 +362,18 @@ def cKD(xyz, q):
 class PointFlow(nn.Module):
     """v(x_t, t | condition) over a permutation-equivariant set of points."""
 
-    def __init__(self, dim=256, layers=8, heads=8, rel_attn=True):
+    def __init__(self, dim=256, layers=8, heads=8, rel_attn=True, ch: int = CH):
         super().__init__()
-        self.dim, self.heads = dim, heads
-        self.inp = nn.Linear(CH, dim)
+        # ch is stored so pre-field checkpoints (6 channels) still load
+        self.dim, self.heads, self.ch = dim, heads, ch
+        self.inp = nn.Linear(ch, dim)
         self.cond_proj = nn.Linear(8, dim)
         self.null_cond = nn.Parameter(torch.zeros(COND_ROWS, dim))
         self.seg = nn.Parameter(torch.zeros(2, dim))
         self.t_mlp = nn.Sequential(nn.Linear(dim, dim), nn.SiLU(), nn.Linear(dim, dim))
         self.blocks = nn.ModuleList(Block(dim, heads) for _ in range(layers))
         self.norm = nn.LayerNorm(dim)
-        self.head = nn.Linear(dim, CH)
+        self.head = nn.Linear(dim, ch)
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
         self.rel = RelBias(heads) if rel_attn else None
@@ -400,7 +434,7 @@ def flow_loss(model, batch, anchor: bool, p_drop: float, w_normal: float = 0.2,
 def sample(model, cond, fix_xyz, steps=48, gen=None, scale=1.0, n_pts=256):
     dev = cond.device
     B = cond.shape[0]
-    x = torch.randn(B, n_pts, CH, device=dev, generator=gen)
+    x = torch.randn(B, n_pts, model.ch, device=dev, generator=gen)
     n_fix = fix_xyz.shape[1] if fix_xyz is not None else 0
     if n_fix:
         x[:, :n_fix, :6] = fix_xyz        # position and normal; fields are free
@@ -428,12 +462,25 @@ def to_world(x, part):
     nrm = x[..., 3:6].cpu().numpy().astype(np.float64)
     nrm = nrm / np.maximum(np.linalg.norm(nrm, axis=-1, keepdims=True), 1e-9)
     world, normal = from_frame(xyz, nrm, frame)
+    if x.shape[-1] <= 6:                     # a pre-field model
+        return world, normal, None
     fields = np.clip(x[..., 6:].cpu().numpy().astype(np.float64),
                      0.0, FIELD_CAP) * frame[2]
     return world, normal, fields
 
 
 # ---------------------------------------------------------------- stages
+
+def load_model(path, device):
+    """Rebuild a PointFlow from a checkpoint, whatever channel count it used."""
+    ck = torch.load(path, map_location=device, weights_only=False)
+    a = argparse.Namespace(**ck["args"])
+    ch = ck["model"]["inp.weight"].shape[1]
+    model = PointFlow(a.dim, a.layers, a.heads, bool(a.rel_attn), ch=ch).to(device)
+    model.load_state_dict(ck["model"])
+    model.eval()
+    return model, a, ck["epoch"], ch
+
 
 def build_splits(args):
     parts = load_curve_parts(pathlib.Path(args.wtok))
@@ -454,10 +501,11 @@ def stage_train(args, out: pathlib.Path) -> None:
     md = pathlib.Path(args.dataset) / "parts"
     tl = DataLoader(MeshDataset(train_parts, md, args.points, True,
                                 anchor_per_fix=args.anchor_per_fix,
-                                mask_rate=args.mask_rate),
+                                mask_rate=args.mask_rate, even=bool(args.even)),
                     batch_size=args.batch_size, shuffle=True, drop_last=True)
     vl = DataLoader(MeshDataset(val_parts, md, args.points, False, 555,
-                                anchor_per_fix=args.anchor_per_fix),
+                                anchor_per_fix=args.anchor_per_fix,
+                                even=bool(args.even)),
                     batch_size=args.batch_size)
     model = PointFlow(args.dim, args.layers, args.heads, bool(args.rel_attn)).to(args.device)
     print(f"params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M", flush=True)
@@ -567,11 +615,7 @@ def generate(model, part, device, steps, seed, scale, n_pts, anchor=True,
 def stage_eval(args, out: pathlib.Path) -> None:
     from .evaluate_curve2 import class_points, one_way
     _, val_parts = build_splits(args)
-    ck = torch.load(out / "best.pt", map_location=args.device, weights_only=False)
-    a = argparse.Namespace(**ck["args"])
-    model = PointFlow(a.dim, a.layers, a.heads, bool(a.rel_attn)).to(args.device)
-    model.load_state_dict(ck["model"])
-    model.eval()
+    model, a, _, _ = load_model(out / "best.pt", args.device)
     md = pathlib.Path(args.dataset) / "parts"
     rows = []
     for p in val_parts[: args.eval_parts]:
@@ -784,6 +828,9 @@ def main() -> None:
     ap.add_argument("--sample-every", type=int, default=20)
     ap.add_argument("--probe-parts", type=int, default=6)
     ap.add_argument("--eval-parts", type=int, default=40)
+    ap.add_argument("--even", type=int, default=1,
+                    help="draw the target points by farthest-point order "
+                         "instead of at random")
     ap.add_argument("--recon", type=int, default=1,
                     help="rebuild the sheet before reading off the curves; "
                          "0 labels the raw points instead")
