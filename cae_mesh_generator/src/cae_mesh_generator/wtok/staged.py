@@ -28,7 +28,7 @@ from scipy.spatial import cKDTree
 from torch.utils.data import Dataset
 
 from .constants import stable_seed
-from .frame import BEND_SLOTS, EDGE_SLOTS, FRAME_CH
+from .frame import BEND_SLOTS, EDGE_SLOTS, FRAME_CH, MULTI_CH
 from .meshgen import (CH as MESH_CH, FIELD_CAP, fastener_frame, fastener_disc,
                       fix_points_mm, fps_order, frame_cond_rows, to_frame)
 from .ridge import curve_points
@@ -42,11 +42,12 @@ STAGES = ("outline", "bend", "surface")
 # "bend_pc" is an ALTERNATIVE to "bend", not a fourth stage: the same class of
 # points with the 32x20 slot scaffolding taken away. It sits between the two in
 # the series wherever "bend" would.
-STAGE_ORDER = {"outline": 0, "outline_frame": 0,
+STAGE_ORDER = {"outline": 0, "outline_frame": 0, "outline_multi": 0,
                "bend": 1, "bend_pc": 1, "bend_frame": 1, "surface": 2}
 # how many channels each stage's target carries. Only the parametric frame
 # differs: it adds the arc bulge and the arc flag to the usual 7.
-STAGE_CH = {"outline_frame": FRAME_CH, "bend_frame": FRAME_CH}
+STAGE_CH = {"outline_frame": FRAME_CH, "bend_frame": FRAME_CH,
+            "outline_multi": MULTI_CH}
 GUARD_PER_FIX = 8
 CH = 7          # xyz 3, tangent-or-normal 3, off-the-part flag 1
 
@@ -179,6 +180,9 @@ def stage_target(part, mesh_dir, stage: str, n_pts: int, rng):
     if stage == "outline_frame":
         from .frame import frame_target
         return frame_target(part, frame)
+    if stage == "outline_multi":
+        from .frame import multi_frame_target
+        return multi_frame_target(part, frame)
     if stage == "bend_frame":
         from .frame import bend_frame_target
         return bend_frame_target(part, frame)
@@ -271,6 +275,7 @@ class StageDataset(Dataset):
         self.stage = stage
         self.n_pts = n_pts or {"outline": N_OUTLINE,
                                "outline_frame": EDGE_SLOTS,
+                               "outline_multi": EDGE_SLOTS,
                                "bend_frame": BEND_SLOTS,
                                "bend": BEND_STRANDS * BEND_PER_STRAND,
                                "bend_pc": N_BEND,
@@ -298,6 +303,15 @@ class StageDataset(Dataset):
         self.cache: dict = {}
         self.self_bank: dict = {}       # stage name -> {part: (n, CH)}
 
+    def ctx_len(self):
+        """Rows of context this run always emits, whatever is withheld."""
+        n = 0
+        if self.stage == "bend_frame":
+            n += EDGE_SLOTS
+        if self.cloud_bank:
+            n += 256
+        return max(n, 1)
+
     def set_epoch(self, e):
         self.epoch = int(e)
 
@@ -321,7 +335,7 @@ class StageDataset(Dataset):
             x[:, -1] = 1.0                             # every slot unused
         x = x.copy()
 
-        if self.stage in ("outline_frame", "bend_frame"):
+        if self.stage in ("outline_frame", "outline_multi", "bend_frame"):
             # No outlier injection: an edge is not a point that can be nudged
             # off the surface, and the unused-slot flag already carries the
             # only "this is not part of the shape" the frame has.
@@ -358,9 +372,20 @@ class StageDataset(Dataset):
                     add[:, :6] = c
                     ctx = add if n_ctx == 0 else np.concatenate([ctx, add])
                     n_ctx = len(ctx)
+            # One fixed context length per run, or the batch will not stack.
+            # Withholding the cloud must not change the SHAPE, only the content:
+            # the rows become a single point repeated, whose neighbourhood
+            # features are constant, which is what "no information" should look
+            # like to the encoder.
+            want = self.ctx_len()
+            if len(ctx) < want:
+                ctx = np.concatenate([ctx, ctx[np.arange(want - len(ctx)) % len(ctx)]])
+            elif len(ctx) > want:
+                ctx = ctx[:want]
             return {
-                "x": torch.from_numpy(x.astype(np.float32)),
-                "ctx": torch.from_numpy(ctx),
+                "x": torch.from_numpy(np.ascontiguousarray(ctx if False else
+                                                           x.astype(np.float32))),
+                "ctx": torch.from_numpy(np.ascontiguousarray(ctx)),
                 "n_ctx": n_ctx,
                 "cond": torch.from_numpy(frame_cond_rows(p)),
                 "fix": torch.from_numpy(
@@ -636,9 +661,10 @@ def flow_loss(model, batch, p_drop: float = 0.0, n_pin: int = 0):
         # position 1.0, direction 0.2, flag 0.5. The parametric frame reads the
         # same way: corner 1.0, bulge 0.2, then the arc and unused flags 0.5 --
         # the bulge is a small offset and would otherwise be drowned out.
+        base = [1., 1., 1., .2, .2, .2, .5, .5, .2, .2, .2, .5]
         W_CH = (torch.tensor([1., 1., 1., .2, .2, .2, .5], device=x1.device)
                 if x1.shape[-1] == CH else
-                torch.tensor([1., 1., 1., .2, .2, .2, .5, .5, .2, .2, .2],
+                torch.tensor(base + [.5] * max(0, x1.shape[-1] - len(base)),
                              device=x1.device)[:x1.shape[-1]])
     x0 = torch.randn_like(x1)
     t = torch.rand(B, device=x1.device)
@@ -719,6 +745,16 @@ def probe(model, ds, device, n_parts=12, steps=24, scale=2.0):
             cvs.append(mm * float(cKDTree(np.concatenate(b)).query(
                 np.concatenate(a))[0].mean()) if a and b else 99.0)
             continue
+        if ds.stage == "outline_multi":
+            from .frame import realize_multi
+            g = x.cpu().numpy().astype(np.float64)
+            w = it["x"].numpy().astype(np.float64)
+            a, b = realize_multi(g), realize_multi(w)
+            ends.append(abs(len(a) - len(b)) / max(len(b), 1))
+            mm = fastener_frame(ds.parts[i])[2]
+            cvs.append(mm * float(cKDTree(np.concatenate(b)).query(
+                np.concatenate(a))[0].mean()) if a and b else 99.0)
+            continue
         if ds.stage == "outline_frame":
             # A frame cannot be ragged or open -- it is a closed chain of edges
             # by construction. What can go wrong is using the wrong NUMBER of
@@ -774,13 +810,14 @@ def train(args):
     print(f"stage {args.stage}: train {len(train_parts)} val {len(val_parts)}",
           flush=True)
 
-    cross = args.stage not in ("outline", "outline_frame") or bool(args.cloud_bank)
+    cross = (args.stage not in ("outline", "outline_frame", "outline_multi")
+             or bool(args.cloud_bank))
     if args.cloud_drop and not args.cloud_bank:
         raise SystemExit("--cloud-drop needs --cloud-bank")
     # bend_frame slots are separate folds with no order between them, only the
     # canonical longest-first ranking, so no positional encoding applies.
     ordered = {"outline": "loop", "outline_frame": "loop",
-               "bend": "strand"}.get(args.stage, "")
+               "outline_multi": "loop", "bend": "strand"}.get(args.stage, "")
     # bend_pc is deliberately unordered: with no slot structure there is nothing
     # for a positional encoding to encode.
     ds = StageDataset(train_parts, md, args.stage, base_seed=7,

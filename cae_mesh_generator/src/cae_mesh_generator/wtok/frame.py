@@ -555,3 +555,314 @@ def bend_demo():
     print(f"rebuild error: median {np.median(err):.3f}mm  max {max(err):.3f}mm")
     assert max(nf) <= BEND_SLOTS and np.median(err) < 1.5
     print("ok")
+
+
+# ------------------------------------------------- multi-loop generalisation
+
+MULTI_CH = 12           # frame channels + one loop-end flag
+LOOP_END = 11           # channel: this slot is the LAST edge of its loop
+
+
+def boundary_loops(part):
+    """Every boundary loop of the part, outer first, each walked into order.
+
+    The single-ring representation cannot express a part with a hole: the ring
+    IS the loop, and two loops have no single traversal. Measured on the current
+    2300 parts every boundary is one loop, so nothing here changes their
+    encoding -- this is the shape the data will take once the extraction emits
+    inner boundaries, and it degrades exactly to the old behaviour until then.
+
+    Reads an explicit `loop` field when the extraction provides one, and falls
+    back to walking the adjacency when it does not.
+    """
+    from .codec import bin_center, realize_edge
+    from .staged import _edge_ends
+    from .train_curve import realized_q
+
+    q = realized_q(part, part.vertices, part.edges)
+    groups = {}
+    for e in part.edges:
+        cls = e.get("cls")
+        if cls not in ("outer_boundary", "inner_boundary"):
+            continue
+        ends = _edge_ends(e)
+        if ends is None:
+            continue
+        key = e.get("loop", 0 if cls == "outer_boundary" else 1)
+        mid = bin_center(q, q["vertices"][e["refs"][1]]) if e["tau"] == "ARC" else None
+        groups.setdefault(key, []).append((ends, mid, e["tau"] == "ARC", cls))
+    if not groups:
+        return []
+
+    out = []
+    for key in sorted(groups):
+        adj, pos = {}, {}
+        for ends, mid, is_arc, cls in groups[key]:
+            adj.setdefault(ends[0], []).append((ends[1], mid, is_arc))
+            adj.setdefault(ends[1], []).append((ends[0], mid, is_arc))
+        for k in adj:
+            pos[k] = bin_center(q, q["vertices"][k])
+        seen = set()
+        for start in sorted(adj):
+            if start in seen:
+                continue
+            cur, prev, chain = start, None, []
+            for _ in range(len(adj) + 1):
+                seen.add(cur)
+                nxt = [(v, m, a) for v, m, a in adj[cur] if v != prev]
+                if not nxt:
+                    break
+                v, m, a = nxt[0]
+                chain.append((pos[cur], m, a))
+                prev, cur = cur, v
+                if cur == start:
+                    break
+            if len(chain) >= 3 and cur == start:
+                out.append((chain, groups[key][0][3]))
+    # outer boundary first, then holes largest to smallest -- a canonical order,
+    # so slot 0 means the same thing on every part
+    def size(c):
+        p = np.stack([x[0] for x in c[0]])
+        return float(np.linalg.norm(p.max(0) - p.min(0)))
+    outer = [c for c in out if c[1] == "outer_boundary"]
+    inner = sorted([c for c in out if c[1] != "outer_boundary"], key=size, reverse=True)
+    if not outer and out:                       # no class says outer: take the biggest
+        out.sort(key=size, reverse=True)
+        return out
+    return outer + inner
+
+
+def multi_frame_target(part, frame, slots: int = EDGE_SLOTS):
+    """(slots, MULTI_CH). Loops laid end to end, each closed by its own flag.
+
+    Slot i still joins corner i to corner i+1, EXCEPT where `LOOP_END` is set:
+    there the edge closes back to that loop's first corner. Closure therefore
+    stays structural for every loop, not just for one, which is the property the
+    ordered ring was adopted for in the first place.
+    """
+    from .meshgen import to_frame
+
+    L = boundary_loops(part)
+    if not L:
+        return None
+    x = np.zeros((slots, MULTI_CH))
+    x[:, 7] = 1.0                                    # unused until filled
+    at = 0
+    for chain, _cls in L:
+        n = len(chain)
+        if at + n > slots:
+            break
+        corners = np.stack([c for c, _, _ in chain])
+        is_arc = np.array([a for _, _, a in chain], float)
+        mids = np.stack([m if m is not None else c for c, m, a in chain])
+        p, _ = to_frame(corners, np.zeros_like(corners), frame)
+        mid, _ = to_frame(mids, np.zeros_like(mids), frame)
+        p, mid, is_arc = _canonicalise(p, mid, is_arc)
+        chord = 0.5 * (p + np.roll(p, -1, 0))
+        x[at:at + n, 0:3] = p
+        x[at:at + n, 3:6] = (mid - chord) * is_arc[:, None]
+        x[at:at + n, 6] = is_arc
+        x[at:at + n, 7] = 0.0
+        x[at:at + n, 8:11] = edge_normals(p)
+        x[at + n - 1, LOOP_END] = 1.0                # close this loop here
+        at += n
+    return x if at else None
+
+
+def realize_multi(x, per_edge: int = 24, arc_thresh: float = 0.5):
+    """Multi-loop slots back to a list of closed polylines, one per loop."""
+    live = np.flatnonzero(x[:, 7] < 0.5)
+    if len(live) < 3:
+        return []
+    out, start = [], 0
+    for i in range(len(live)):
+        if x[live[i], LOOP_END] > 0.5 or i == len(live) - 1:
+            idx = live[start:i + 1]
+            if len(idx) >= 3:
+                sub = np.zeros((len(idx), FRAME_CH))
+                sub[:, :FRAME_CH] = x[idx, :FRAME_CH]
+                out.append(realize_frame(sub, per_edge, arc_thresh))
+            start = i + 1
+    return [o for o in out if len(o)]
+
+
+def multi_demo():
+    """Two loops must come back as two closed loops, and one as one."""
+    import pathlib
+
+    from scipy.spatial import cKDTree
+
+    from .dataset_curve import load_curve_parts
+    from .meshgen import fastener_frame
+    from .validity import outline_closed
+
+    R = pathlib.Path(__file__).resolve().parents[4]
+    parts = load_curve_parts(R / "runs" / "wtok_synth")[:40]
+    nl, err = [], []
+    for p in parts:
+        fr = fastener_frame(p)
+        x = multi_frame_target(p, fr)
+        y = frame_target(p, fr)
+        if x is None or y is None:
+            continue
+        loops = realize_multi(x)
+        nl.append(len(loops))
+        # with one loop it must agree with the single-ring encoding exactly
+        if len(loops) == 1:
+            err.append(fr[2] * float(cKDTree(realize_frame(y)).query(loops[0])[0].mean()))
+    print(f"{len(nl)} parts, loops per part {sorted(set(nl))}")
+    print(f"single-loop parts agree with the ring encoding to "
+          f"{np.median(err):.4f}mm")
+    assert np.median(err) < 0.05, np.median(err)
+
+    # synthetic two-loop part: a square with a square hole
+    x = np.zeros((EDGE_SLOTS, MULTI_CH)); x[:, 7] = 1.0
+    x[:4, 0:3] = [[0,0,0],[40,0,0],[40,40,0],[0,40,0]]
+    x[4:8, 0:3] = [[15,15,0],[25,15,0],[25,25,0],[15,25,0]]
+    x[:8, 7] = 0.0
+    x[3, LOOP_END] = 1.0; x[7, LOOP_END] = 1.0
+    loops = realize_multi(x)
+    ends = [outline_closed(o)[0] for o in loops]
+    print(f"square with a square hole -> {len(loops)} loops, "
+          f"endpoint fractions {[round(e,3) for e in ends]}")
+    assert len(loops) == 2 and max(ends) < 0.05
+    print("ok")
+
+
+BEND_CLASSES = ("bend_line", "bead", "inflection", "corner_relief")
+
+
+def bend_features(part, min_mm: float = 10.0):
+    """Every bend-like feature, as (polyline, class, closed).
+
+    `bend_line` still goes through the pair merge that turns two tangent lines
+    into one fold. The other classes do not exist in the data yet -- the
+    extraction emits only outer_boundary and bend_line, and 7.8% of the surface
+    is curved more than 15mm from anything it marks. They are read here so that
+    the day they appear nothing has to change, and until then this returns
+    exactly what fold_lines returns.
+
+    `closed` matters because a bead is a ring, not a segment: the one-slot-per
+    -segment encoding cannot express it, and a chain closed by LOOP_END can.
+    """
+    from .codec import realize_edge
+    from .train_curve import realized_q
+
+    out = [(f, "bend_line", False) for f in fold_lines(part, min_mm)]
+    q = realized_q(part, part.vertices, part.edges)
+    for cls in BEND_CLASSES[1:]:
+        segs = []
+        for e in part.edges:
+            if e.get("cls") != cls:
+                continue
+            poly = realize_edge(q, e)
+            if poly is not None and len(poly) >= 2:
+                segs.append(np.asarray(poly, float))
+        for s in segs:
+            closed = bool(np.linalg.norm(s[0] - s[-1]) < 1e-6) or cls == "bead"
+            out.append((s, cls, closed))
+    return out
+
+
+def bend_multi_target(part, frame, slots: int = BEND_SLOTS,
+                      n_cls: int = len(BEND_CLASSES)):
+    """(slots, BEND_MULTI_CH): folds, beads and the rest in one tensor.
+
+        [0:3] endpoint 1   [3:6] endpoint 2   [6] is_arc   [7] unused
+        [8:11] bulge       [11] loop_end      [12:12+n_cls] class one-hot
+
+    A straight or arc fold is one slot. A bead is a chain of slots whose last
+    one sets loop_end, exactly the mechanism the multi-loop outline uses -- so a
+    closed bend feature is closed by construction, the same way a hole is.
+
+    On today's data this fills only the bend_line channel and sets no loop_end,
+    so it encodes the same thing bend_frame_target does.
+    """
+    from .meshgen import to_frame
+
+    F = bend_features(part)
+    if not F:
+        return None
+    ch = 12 + n_cls
+    x = np.zeros((slots, ch))
+    x[:, 7] = 1.0
+    at = 0
+    for poly, cls, closed in F:
+        if at >= slots:
+            break
+        pts, _ = to_frame(poly, np.zeros_like(poly), frame)
+        ci = BEND_CLASSES.index(cls) if cls in BEND_CLASSES else 0
+        if not closed:
+            a, b, mid = pts[0], pts[-1], _halfway(pts)
+            chord = 0.5 * (a + b)
+            span = max(float(np.linalg.norm(b - a)), 1e-9)
+            x[at, 0:3], x[at, 3:6] = a, b
+            x[at, 6] = 1.0 if float(np.linalg.norm(mid - chord)) / span > 0.02 else 0.0
+            x[at, 7] = 0.0
+            x[at, 8:11] = (mid - chord) * x[at, 6]
+            x[at, 12 + ci] = 1.0
+            at += 1
+            continue
+        # closed: lay the ring down as a chain of straight slots and close it
+        k = min(8, slots - at)
+        if k < 3:
+            break
+        r = _densify(np.concatenate([pts, pts[:1]]), k + 1)[:k]
+        for j in range(k):
+            x[at + j, 0:3] = r[j]
+            x[at + j, 3:6] = r[(j + 1) % k]
+            x[at + j, 7] = 0.0
+            x[at + j, 12 + ci] = 1.0
+        x[at + k - 1, LOOP_END] = 1.0
+        at += k
+    return x if at else None
+
+
+def bend_multi_demo():
+    """Degrades to the current encoding today, and holds a bead when given one."""
+    import pathlib
+
+    from scipy.spatial import cKDTree
+
+    from .dataset_curve import load_curve_parts
+    from .meshgen import fastener_frame
+
+    R = pathlib.Path(__file__).resolve().parents[4]
+    parts = load_curve_parts(R / "runs" / "wtok_synth")[:40]
+    err, cls_seen = [], set()
+    for p in parts:
+        fr = fastener_frame(p)
+        a = bend_multi_target(p, fr)
+        b = bend_frame_target(p, fr)
+        if a is None or b is None:
+            continue
+        for i in np.flatnonzero(a[:, 7] < 0.5):
+            cls_seen.add(BEND_CLASSES[int(np.argmax(a[i, 12:]))])
+        A = realize_bend(a[:, :FRAME_CH])
+        B = realize_bend(b)
+        if A and B:
+            err.append(fr[2] * float(cKDTree(np.concatenate(B)).query(
+                np.concatenate(A))[0].mean()))
+    print(f"{len(err)} parts, classes present today: {sorted(cls_seen)}")
+    print(f"agrees with bend_frame_target to {np.median(err):.4f}mm")
+    assert np.median(err) < 0.01 and cls_seen == {"bend_line"}
+
+    # a synthetic bead: a closed ring must come back closed
+    from types import SimpleNamespace
+    t = np.linspace(0, 2 * np.pi, 24, endpoint=False)
+    ring = np.stack([np.cos(t) * 12, np.sin(t) * 12, np.zeros_like(t)], 1)
+    x = np.zeros((BEND_SLOTS, 12 + len(BEND_CLASSES)))
+    x[:, 7] = 1.0
+    k = 8
+    r = _densify(np.concatenate([ring, ring[:1]]), k + 1)[:k]
+    for j in range(k):
+        x[j, 0:3], x[j, 3:6] = r[j], r[(j + 1) % k]
+        x[j, 7] = 0.0
+        x[j, 12 + BEND_CLASSES.index("bead")] = 1.0
+    x[k - 1, LOOP_END] = 1.0
+    seg = realize_bend(x[:, :FRAME_CH])
+    ends = np.concatenate([[s[0], s[-1]] for s in seg])
+    gap = float(np.linalg.norm(x[k - 1, 3:6] - x[0, 0:3]))
+    print(f"bead: {len(seg)} slots, chain closes to {gap:.6f}")
+    assert len(seg) == k and gap < 1e-9
+    print("ok")
