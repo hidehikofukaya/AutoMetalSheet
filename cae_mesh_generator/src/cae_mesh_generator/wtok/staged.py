@@ -38,6 +38,10 @@ N_BEND = 300
 N_SURFACE = 600
 
 STAGES = ("outline", "bend", "surface")
+# "bend_pc" is an ALTERNATIVE to "bend", not a fourth stage: the same class of
+# points with the 32x20 slot scaffolding taken away. It sits between the two in
+# the series wherever "bend" would.
+STAGE_ORDER = {"outline": 0, "bend": 1, "bend_pc": 1, "surface": 2}
 GUARD_PER_FIX = 8
 CH = 7          # xyz 3, tangent-or-normal 3, off-the-part flag 1
 
@@ -180,15 +184,29 @@ def stage_target(part, mesh_dir, stage: str, n_pts: int, rng):
             pts = smooth_curve(pts)
             dirs = tangents(pts)
         else:
-            strands, used = bend_strands(part)
+            # no slot cap for the cloud: the 32-slot ceiling exists to keep the
+            # tensor a fixed shape, and a cloud has no slots to run out of.
+            # 13.4% of parts carry more than 32 strands (max measured 40).
+            strands, used = bend_strands(
+                part, n_strand=256 if stage == "bend_pc" else BEND_STRANDS)
             if strands is None:
                 return None
-            d = np.zeros_like(strands)
-            for i in range(len(strands)):
-                d[i] = tangents(strands[i]) if used[i] else 0.0
-            p_, v_ = to_frame(strands.reshape(-1, 3), d.reshape(-1, 3), frame)
-            flag = np.repeat(~used, strands.shape[1]).astype(float)[:, None]
-            return np.concatenate([p_, v_, flag], axis=1)
+            if stage == "bend_pc":
+                # Plain point cloud: pour every live strand into one bag and
+                # sample it. No slot means anything, so nothing caps how many
+                # bend lines a part may have and nothing has to be flagged
+                # unused -- a part with few folds simply gets its points spread
+                # over fewer lines.
+                segs = [strands[i] for i in range(len(strands)) if used[i]]
+                pts = np.concatenate(segs)
+                dirs = np.concatenate([tangents(s) for s in segs])
+            else:
+                d = np.zeros_like(strands)
+                for i in range(len(strands)):
+                    d[i] = tangents(strands[i]) if used[i] else 0.0
+                p_, v_ = to_frame(strands.reshape(-1, 3), d.reshape(-1, 3), frame)
+                flag = np.repeat(~used, strands.shape[1]).astype(float)[:, None]
+                return np.concatenate([p_, v_, flag], axis=1)
     if stage == "outline":
         # keep the traversal order: evenly along the loop, so slot i and slot
         # i+1 are neighbours on the curve. Farthest-point order would scramble
@@ -241,6 +259,7 @@ class StageDataset(Dataset):
         self.stage = stage
         self.n_pts = n_pts or {"outline": N_OUTLINE,
                                "bend": BEND_STRANDS * BEND_PER_STRAND,
+                               "bend_pc": N_BEND,
                                "surface": N_SURFACE}[stage]
         self.augment, self.base_seed, self.epoch = augment, base_seed, 0
         self.n_context = n_context
@@ -308,7 +327,7 @@ class StageDataset(Dataset):
         a cubic explains 98% of the difference - and applying it to the target
         puts both on the same part.
         """
-        earlier = STAGES[: STAGES.index(self.stage)]
+        earlier = STAGES[: STAGE_ORDER[self.stage]]
         if not earlier:
             return np.zeros((1, CH)), 0, None
         rows, warp = [], None
@@ -600,7 +619,9 @@ def probe(model, ds, device, n_parts=12, steps=24, scale=2.0):
         ctx = it["ctx"][None].to(device) if model.cross else None
         x = sample(model, cond, fix, ctx, ds.n_pts, steps, scale)[0]
         p = x[:, :3].cpu().numpy().astype(np.float64)
-        if ds.stage == "outline":
+        if ds.stage in ("outline", "bend_pc"):
+            # for a plain cloud "ends" is the fragment measure, not closure:
+            # a bend line is open, so what it reports is how ragged the cloud is
             ends.append(outline_closed(p)[0])
             d = cKDTree(p).query(p, k=2)[0][:, 1]
         else:
@@ -639,6 +660,8 @@ def train(args):
 
     cross = args.stage != "outline"
     ordered = {"outline": "loop", "bend": "strand"}.get(args.stage, "")
+    # bend_pc is deliberately unordered: with no slot structure there is nothing
+    # for a positional encoding to encode.
     ds = StageDataset(train_parts, md, args.stage, base_seed=7,
                       outlier_rate=args.outlier_rate)
     vs = StageDataset(val_parts, md, args.stage, base_seed=555)
@@ -703,7 +726,7 @@ def train(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--stage", choices=STAGES, required=True)
+    ap.add_argument("--stage", choices=list(STAGE_ORDER), required=True)
     ap.add_argument("--dataset", required=True)
     ap.add_argument("--wtok", required=True)
     ap.add_argument("--val-list", required=True)
