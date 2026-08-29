@@ -28,6 +28,7 @@ from scipy.spatial import cKDTree
 from torch.utils.data import Dataset
 
 from .constants import stable_seed
+from .frame import EDGE_SLOTS, FRAME_CH
 from .meshgen import (CH as MESH_CH, FIELD_CAP, fastener_frame, fastener_disc,
                       fix_points_mm, fps_order, frame_cond_rows, to_frame)
 from .ridge import curve_points
@@ -41,7 +42,11 @@ STAGES = ("outline", "bend", "surface")
 # "bend_pc" is an ALTERNATIVE to "bend", not a fourth stage: the same class of
 # points with the 32x20 slot scaffolding taken away. It sits between the two in
 # the series wherever "bend" would.
-STAGE_ORDER = {"outline": 0, "bend": 1, "bend_pc": 1, "surface": 2}
+STAGE_ORDER = {"outline": 0, "outline_frame": 0,
+               "bend": 1, "bend_pc": 1, "surface": 2}
+# how many channels each stage's target carries. Only the parametric frame
+# differs: it adds the arc bulge and the arc flag to the usual 7.
+STAGE_CH = {"outline_frame": 8}
 GUARD_PER_FIX = 8
 CH = 7          # xyz 3, tangent-or-normal 3, off-the-part flag 1
 
@@ -171,6 +176,9 @@ def stage_target(part, mesh_dir, stage: str, n_pts: int, rng):
     Returns (n_pts, CH) or None when the part has no curve of that class.
     """
     frame = fastener_frame(part)
+    if stage == "outline_frame":
+        from .frame import frame_target
+        return frame_target(part, frame)
     if stage == "surface":
         d = np.load(pathlib.Path(mesh_dir) / f"{part.name}.npz")
         span = np.maximum(d["env_hi"] - d["env_lo"], 1e-9)
@@ -258,6 +266,7 @@ class StageDataset(Dataset):
         self.dir = pathlib.Path(mesh_dir)
         self.stage = stage
         self.n_pts = n_pts or {"outline": N_OUTLINE,
+                               "outline_frame": EDGE_SLOTS,
                                "bend": BEND_STRANDS * BEND_PER_STRAND,
                                "bend_pc": N_BEND,
                                "surface": N_SURFACE}[stage]
@@ -283,11 +292,27 @@ class StageDataset(Dataset):
         p = self.parts[i]
         rng = np.random.default_rng(
             stable_seed(self.base_seed + 999983 * self.epoch, p.name))
+        ch = STAGE_CH.get(self.stage, CH)
         x = self._target(p, self.stage, self.n_pts, rng)
         if x is None:                                  # no curve of this class
-            x = np.zeros((self.n_pts, CH))
-            x[:, 6] = 1.0                              # all flagged off-part
+            x = np.zeros((self.n_pts, ch))
+            x[:, -1] = 1.0                             # every slot unused
         x = x.copy()
+
+        if self.stage == "outline_frame":
+            # No outlier injection: an edge is not a point that can be nudged
+            # off the surface, and the unused-slot flag already carries the
+            # only "this is not part of the shape" the frame has.
+            fx, fn = fastener_disc(p, GUARD_PER_FIX, rng=rng)
+            f, fd = to_frame(fx, fn, fastener_frame(p))
+            return {
+                "x": torch.from_numpy(x.astype(np.float32)),
+                "ctx": torch.zeros(1, ch),
+                "n_ctx": 0,
+                "cond": torch.from_numpy(frame_cond_rows(p)),
+                "fix": torch.from_numpy(
+                    np.concatenate([f, fd], 1).astype(np.float32)),
+            }
 
         if self.outlier_rate > 0 and rng.random() < self.outlier_rate:
             k = max(1, int(0.10 * len(x)))
@@ -457,11 +482,13 @@ class StageFlow(nn.Module):
     boundary is known, and they do have something to attend to.
     """
 
-    def __init__(self, dim=256, layers=8, heads=8, cross=True, ordered=""):
+    def __init__(self, dim=256, layers=8, heads=8, cross=True, ordered="",
+                 ch=CH):
         super().__init__()
         self.cross = cross
         self.ordered = ordered or ""
-        self.inp = nn.Linear(CH, dim)
+        self.ch = ch
+        self.inp = nn.Linear(ch, dim)
         self.cond = nn.Linear(8, dim)
         self.fixp = nn.Linear(6, dim)
         self.enc = ContextEncoder(dim) if cross else None
@@ -469,7 +496,7 @@ class StageFlow(nn.Module):
                                    nn.Linear(dim, dim))
         self.blocks = nn.ModuleList(Block(dim, heads) for _ in range(layers))
         self.norm = nn.LayerNorm(dim)
-        self.head = nn.Linear(dim, CH)
+        self.head = nn.Linear(dim, ch)
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
         self.dim = dim
@@ -549,8 +576,13 @@ def flow_loss(model, batch, p_drop: float = 0.0, n_pin: int = 0):
     global W_CH
     x1 = batch["x"]
     B, N, _ = x1.shape
-    if W_CH is None or W_CH.device != x1.device:
-        W_CH = torch.tensor([1., 1., 1., .2, .2, .2, .5], device=x1.device)
+    if W_CH is None or W_CH.device != x1.device or W_CH.numel() != x1.shape[-1]:
+        # position 1.0, direction 0.2, flag 0.5. The parametric frame reads the
+        # same way: corner 1.0, bulge 0.2, then the arc and unused flags 0.5 --
+        # the bulge is a small offset and would otherwise be drowned out.
+        W_CH = (torch.tensor([1., 1., 1., .2, .2, .2, .5], device=x1.device)
+                if x1.shape[-1] == CH else
+                torch.tensor([1., 1., 1., .2, .2, .2, .5, .5], device=x1.device))
     x0 = torch.randn_like(x1)
     t = torch.rand(B, device=x1.device)
     xt = (1 - t[:, None, None]) * x0 + t[:, None, None] * x1
@@ -568,7 +600,7 @@ def flow_loss(model, batch, p_drop: float = 0.0, n_pin: int = 0):
 def sample(model, cond, fix, ctx, n_pts, steps=24, scale=2.0, gen=None,
            pin=None):
     B = cond.shape[0]
-    x = torch.randn(B, n_pts, CH, device=cond.device, generator=gen)
+    x = torch.randn(B, n_pts, model.ch, device=cond.device, generator=gen)
     if pin is not None:
         x[:, :pin.shape[1]] = pin
     dt = 1.0 / steps
@@ -619,6 +651,22 @@ def probe(model, ds, device, n_parts=12, steps=24, scale=2.0):
         ctx = it["ctx"][None].to(device) if model.cross else None
         x = sample(model, cond, fix, ctx, ds.n_pts, steps, scale)[0]
         p = x[:, :3].cpu().numpy().astype(np.float64)
+        if ds.stage == "outline_frame":
+            # A frame cannot be ragged or open -- it is a closed chain of edges
+            # by construction. What can go wrong is using the wrong NUMBER of
+            # edges, and putting them in the wrong place. Both are reported in
+            # units that mean something: a slot-count error rate, and the mm
+            # offset between the realised outline and the true one.
+            from .frame import realize_frame
+            g = x.cpu().numpy().astype(np.float64)
+            w = it["x"].numpy().astype(np.float64)
+            ends.append(abs(int((g[:, 7] < .5).sum()) - int((w[:, 7] < .5).sum()))
+                        / max(int((w[:, 7] < .5).sum()), 1))
+            a, b = realize_frame(g), realize_frame(w)
+            mm = fastener_frame(ds.parts[i])[2]
+            cvs.append(mm * float(cKDTree(b).query(a)[0].mean())
+                       if len(a) and len(b) else 99.0)
+            continue
         if ds.stage in ("outline", "bend_pc"):
             # for a plain cloud "ends" is the fragment measure, not closure:
             # a bend line is open, so what it reports is how ragged the cloud is
@@ -658,15 +706,17 @@ def train(args):
     print(f"stage {args.stage}: train {len(train_parts)} val {len(val_parts)}",
           flush=True)
 
-    cross = args.stage != "outline"
-    ordered = {"outline": "loop", "bend": "strand"}.get(args.stage, "")
+    cross = args.stage not in ("outline", "outline_frame")
+    ordered = {"outline": "loop", "outline_frame": "loop",
+               "bend": "strand"}.get(args.stage, "")
     # bend_pc is deliberately unordered: with no slot structure there is nothing
     # for a positional encoding to encode.
     ds = StageDataset(train_parts, md, args.stage, base_seed=7,
                       outlier_rate=args.outlier_rate)
     vs = StageDataset(val_parts, md, args.stage, base_seed=555)
     dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
-    model = StageFlow(args.dim, args.layers, args.heads, cross, ordered).to(args.device)
+    model = StageFlow(args.dim, args.layers, args.heads, cross, ordered,
+                      ch=STAGE_CH.get(args.stage, CH)).to(args.device)
     print(f"params: {sum(q.numel() for q in model.parameters())/1e6:.2f}M",
           flush=True)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
@@ -726,7 +776,7 @@ def train(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--stage", choices=list(STAGE_ORDER), required=True)
+    ap.add_argument("--stage", choices=sorted(STAGE_ORDER), required=True)
     ap.add_argument("--dataset", required=True)
     ap.add_argument("--wtok", required=True)
     ap.add_argument("--val-list", required=True)
