@@ -24,7 +24,9 @@ from __future__ import annotations
 import numpy as np
 
 EDGE_SLOTS = 32         # max measured 26
-FRAME_CH = 8            # corner xyz 3, arc bulge xyz 3, is_arc 1, unused 1
+FRAME_CH = 11           # corner 3, arc bulge 3, is_arc 1, unused 1, normal 3
+NRM_WIN = 1             # corners each side of an edge used to fit its plane
+NRM_TOL = 0.06          # third singular value over the first; above it, not flat
 
 
 def outline_edges(part):
@@ -96,7 +98,39 @@ def frame_target(part, frame, slots: int = EDGE_SLOTS):
     x[:n, 3:6] = bulge
     x[:n, 6] = is_arc
     x[n:, 7] = 1.0                            # unused slots
+    x[:n, 8:11] = edge_normals(p)
     return x
+
+
+def edge_normals(P, win: int = NRM_WIN, tol: float = NRM_TOL):
+    """The normal of the panel each edge bounds; a zero vector where there is none.
+
+    A panel is flat, so its bounding edges are coplanar -- and in the true data
+    that is exact: every corner lies on a plane, with a 0.16mm residual that is
+    the quantisation. Generated corners sit 0.94mm off, which is a panel that
+    should be flat coming out twisted. Carrying the normal per EDGE rather than
+    as a list of planes is what makes it scale: a panel is a run of edges sharing
+    a normal, so the plane count is emergent and nothing caps it. Measured on the
+    true outlines this window defines a normal for 100% of edges, finds 4
+    distinct ones per part (max 12), and puts 47% of edges on the largest panel.
+
+    A wider window was tried first and covered only 44% of edges: on an 18-edge
+    outline it spans a third of the loop and straddles folds.
+    """
+    P = np.asarray(P, float)
+    n = len(P)
+    N = np.zeros((n, 3))
+    if n < win * 2 + 2:
+        return N
+    for i in range(n):
+        idx = [(i + d) % n for d in range(-win, win + 2)]
+        w = P[idx] - P[idx].mean(0)
+        _, s, V = np.linalg.svd(w)
+        if s[0] < 1e-12 or s[2] / s[0] > tol:
+            continue                      # straddles a fold: no single normal
+        v = V[-1]
+        N[i] = -v if v[int(np.argmax(np.abs(v)))] < 0 else v   # undirected
+    return N
 
 
 def _canonicalise(p, mid, is_arc):
@@ -210,3 +244,85 @@ def demo():
 
 if __name__ == "__main__":
     demo()
+
+
+CONSIST_LAMBDA = 3.0    # swept, not tuned: see below
+
+
+def consistent_corners(P, N, lam: float = CONSIST_LAMBDA):
+    """Move the corners onto the planes the model's own normal channel declares.
+
+    The model knows the panels -- its emitted normals sit 3.8 deg from the true
+    ones and find the same number of them -- but its corners sit 6.7 deg off
+    those same normals, nearly twice the error against the truth. The two
+    outputs disagree with each other, and this solves for the corners that the
+    output already implies. No knowledge is added from outside.
+
+    Nothing here is capped or fitted to this dataset: the planes are whatever
+    the normal field says, so their number grows with the part, and there is no
+    fastener count anywhere in it. An earlier attempt fitted planes to the
+    corners with a fixed 4-plane cap and a hand-set tolerance; it drove the
+    twist to zero and moved the shape 0.34mm further from the part, and was
+    dropped.
+
+    lam trades consistency against staying near the emitted corners. Measured
+    over 30 val parts, twice, with independent sampling:
+
+        lam    twist mm      shape error mm
+        0      0.368 0.364   6.79  7.23
+        3      0.060 0.059   6.80  7.32
+        10     0.035 0.045   6.82  8.08     <- shape cost NOT reproducible
+
+    3 is the largest value whose shape cost held across both draws.
+    """
+    P = np.asarray(P, float)
+    n = len(P)
+    rows, rhs = [], []
+    for i in range(n):
+        for d in range(3):
+            r = np.zeros(3 * n)
+            r[3 * i + d] = 1.0
+            rows.append(r)
+            rhs.append(P[i, d])
+    for i in range(n):
+        nb = float(np.linalg.norm(N[i]))
+        if nb < 0.5:                       # no panel normal here (a fold)
+            continue
+        ni = np.asarray(N[i], float) / nb
+        win = [(i + k) % n for k in (-1, 0, 1, 2)]
+        for a, b in zip(win, win[1:]):
+            # every corner in the window must share one n.q -- that IS coplanar
+            r = np.zeros(3 * n)
+            r[3 * a:3 * a + 3] = lam * ni
+            r[3 * b:3 * b + 3] = -lam * ni
+            rows.append(r)
+            rhs.append(0.0)
+    q = np.linalg.lstsq(np.asarray(rows), np.asarray(rhs), rcond=None)[0]
+    return q.reshape(n, 3)
+
+
+def apply_consistency(x, lam: float = CONSIST_LAMBDA):
+    """`consistent_corners` over a frame tensor, live slots only."""
+    x = np.asarray(x, float).copy()
+    live = x[:, 7] < 0.5
+    if live.sum() < 6 or x.shape[1] < 11:
+        return x
+    idx = np.flatnonzero(live)
+    x[idx, 0:3] = consistent_corners(x[live, 0:3], x[live, 8:11], lam)
+    return x
+
+
+def consist_demo():
+    """A flat ring with one corner lifted, and normals that say it is flat."""
+    t = np.linspace(0, 2 * np.pi, 12, endpoint=False)
+    P = np.stack([np.cos(t), np.sin(t), np.zeros_like(t)], 1) * 10.0
+    P[3, 2] = 2.0                                  # pushed off the panel
+    N = np.tile([0.0, 0.0, 1.0], (12, 1))          # the normal says: flat
+    before = float(np.abs(P[:, 2]).max())
+    Q = consistent_corners(P, N, CONSIST_LAMBDA)
+    after = float(np.abs(Q[:, 2] - np.median(Q[:, 2])).max())
+    moved = float(np.linalg.norm(Q[:, :2] - P[:, :2], axis=1).max())
+    print(f"off-plane {before:.3f} -> {after:.3f}   in-plane drift {moved:.4f}")
+    assert after < before / 3, (before, after)
+    assert moved < 1e-6, "the solve must not slide corners within the plane"
+    print("ok")

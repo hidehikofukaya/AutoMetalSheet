@@ -46,7 +46,7 @@ STAGE_ORDER = {"outline": 0, "outline_frame": 0,
                "bend": 1, "bend_pc": 1, "surface": 2}
 # how many channels each stage's target carries. Only the parametric frame
 # differs: it adds the arc bulge and the arc flag to the usual 7.
-STAGE_CH = {"outline_frame": 8}
+STAGE_CH = {"outline_frame": FRAME_CH}
 GUARD_PER_FIX = 8
 CH = 7          # xyz 3, tangent-or-normal 3, off-the-part flag 1
 
@@ -582,7 +582,8 @@ def flow_loss(model, batch, p_drop: float = 0.0, n_pin: int = 0):
         # the bulge is a small offset and would otherwise be drowned out.
         W_CH = (torch.tensor([1., 1., 1., .2, .2, .2, .5], device=x1.device)
                 if x1.shape[-1] == CH else
-                torch.tensor([1., 1., 1., .2, .2, .2, .5, .5], device=x1.device))
+                torch.tensor([1., 1., 1., .2, .2, .2, .5, .5, .2, .2, .2],
+                             device=x1.device)[:x1.shape[-1]])
     x0 = torch.randn_like(x1)
     t = torch.rand(B, device=x1.device)
     xt = (1 - t[:, None, None]) * x0 + t[:, None, None] * x1
