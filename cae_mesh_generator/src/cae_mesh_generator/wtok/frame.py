@@ -246,7 +246,7 @@ if __name__ == "__main__":
     demo()
 
 
-CONSIST_LAMBDA = 3.0    # swept, not tuned: see below
+CONSIST_LAMBDA = 2.0    # swept, not tuned: see below
 
 
 def consistent_corners(P, N, lam: float = CONSIST_LAMBDA):
@@ -265,15 +265,20 @@ def consistent_corners(P, N, lam: float = CONSIST_LAMBDA):
     twist to zero and moved the shape 0.34mm further from the part, and was
     dropped.
 
-    lam trades consistency against staying near the emitted corners. Measured
-    over 30 val parts, twice, with independent sampling:
+    lam trades consistency against staying near the emitted corners. Median
+    over THREE independent draws x 30 val parts:
 
-        lam    twist mm      shape error mm
-        0      0.368 0.364   6.79  7.23
-        3      0.060 0.059   6.80  7.32
-        10     0.035 0.045   6.82  8.08     <- shape cost NOT reproducible
+        lam    twist mm    shape error mm
+        0        0.367         7.31
+        1        0.103         7.30
+        2        0.067         7.22     <- best shape of any setting
+        3        0.051         7.54
+        5        0.041         7.45
 
-    3 is the largest value whose shape cost held across both draws.
+    2 gives the largest twist reduction whose shape cost is zero or better. An
+    earlier two-draw sweep picked 3, and 10 looked free in one draw and cost
+    0.85mm in the other -- the shape numbers carry roughly +-0.2mm of sampling
+    noise, so anything chosen on a single draw is not chosen.
     """
     P = np.asarray(P, float)
     n = len(P)
