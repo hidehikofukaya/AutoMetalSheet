@@ -28,7 +28,7 @@ from scipy.spatial import cKDTree
 from torch.utils.data import Dataset
 
 from .constants import stable_seed
-from .frame import EDGE_SLOTS, FRAME_CH
+from .frame import BEND_SLOTS, EDGE_SLOTS, FRAME_CH
 from .meshgen import (CH as MESH_CH, FIELD_CAP, fastener_frame, fastener_disc,
                       fix_points_mm, fps_order, frame_cond_rows, to_frame)
 from .ridge import curve_points
@@ -43,10 +43,10 @@ STAGES = ("outline", "bend", "surface")
 # points with the 32x20 slot scaffolding taken away. It sits between the two in
 # the series wherever "bend" would.
 STAGE_ORDER = {"outline": 0, "outline_frame": 0,
-               "bend": 1, "bend_pc": 1, "surface": 2}
+               "bend": 1, "bend_pc": 1, "bend_frame": 1, "surface": 2}
 # how many channels each stage's target carries. Only the parametric frame
 # differs: it adds the arc bulge and the arc flag to the usual 7.
-STAGE_CH = {"outline_frame": FRAME_CH}
+STAGE_CH = {"outline_frame": FRAME_CH, "bend_frame": FRAME_CH}
 GUARD_PER_FIX = 8
 CH = 7          # xyz 3, tangent-or-normal 3, off-the-part flag 1
 
@@ -179,6 +179,9 @@ def stage_target(part, mesh_dir, stage: str, n_pts: int, rng):
     if stage == "outline_frame":
         from .frame import frame_target
         return frame_target(part, frame)
+    if stage == "bend_frame":
+        from .frame import bend_frame_target
+        return bend_frame_target(part, frame)
     if stage == "surface":
         d = np.load(pathlib.Path(mesh_dir) / f"{part.name}.npz")
         span = np.maximum(d["env_hi"] - d["env_lo"], 1e-9)
@@ -261,16 +264,35 @@ class StageDataset(Dataset):
 
     def __init__(self, parts, mesh_dir, stage: str, n_pts: int = 0,
                  augment: bool = False, base_seed: int = 0,
-                 n_context: int = 300, outlier_rate: float = 0.0):
+                 n_context: int = 300, outlier_rate: float = 0.0,
+                 cloud_bank=None):
         self.parts = [p for p in parts]
         self.dir = pathlib.Path(mesh_dir)
         self.stage = stage
         self.n_pts = n_pts or {"outline": N_OUTLINE,
                                "outline_frame": EDGE_SLOTS,
+                               "bend_frame": BEND_SLOTS,
                                "bend": BEND_STRANDS * BEND_PER_STRAND,
                                "bend_pc": N_BEND,
                                "surface": N_SURFACE}[stage]
         self.augment, self.base_seed, self.epoch = augment, base_seed, 0
+        # A fixed draw from the bulk generator, precomputed once. Not the true
+        # cloud and not regenerated per epoch: the outline model has to learn to
+        # read the cloud it will actually be handed at inference, and training
+        # it on a perfect one teaches it to trust something it will never see.
+        # Several banks, each a DIFFERENT draw from the bulk generator, picked
+        # per epoch. One fixed cloud taught the model to follow that cloud's own
+        # 5.62mm error: every draw inherited the same bias, so taking the middle
+        # of nine could not average it away (medoid 5.47 -> 7.57mm). A cloud that
+        # changes is evidence; a cloud that never changes is a second target.
+        self.cloud_bank = []
+        if cloud_bank:
+            for c in (cloud_bank if isinstance(cloud_bank, (list, tuple))
+                      else str(cloud_bank).split(",")):
+                c = pathlib.Path(str(c).strip())
+                if c.is_dir():
+                    self.cloud_bank.append(c)
+        self.cloud_drop = 0.0
         self.n_context = n_context
         self.outlier_rate = outlier_rate
         self.cache: dict = {}
@@ -299,16 +321,47 @@ class StageDataset(Dataset):
             x[:, -1] = 1.0                             # every slot unused
         x = x.copy()
 
-        if self.stage == "outline_frame":
+        if self.stage in ("outline_frame", "bend_frame"):
             # No outlier injection: an edge is not a point that can be nudged
             # off the surface, and the unused-slot flag already carries the
             # only "this is not part of the shape" the frame has.
             fx, fn = fastener_disc(p, GUARD_PER_FIX, rng=rng)
             f, fd = to_frame(fx, fn, fastener_frame(p))
+            ctx, n_ctx = np.zeros((1, ch), np.float32), 0
+            if self.stage == "bend_frame":
+                # the OUTLINE frame is what stage 2 reads. Its slots are edges,
+                # not points, and the context encoder wants xyz + a direction,
+                # so each edge is handed over as its corner and its chord.
+                o = self._target(p, "outline_frame", EDGE_SLOTS, rng)
+                if o is not None:
+                    live = o[:, 7] < 0.5
+                    ctx = np.zeros((int(live.sum()), ch), np.float32)
+                    ctx[:, :3] = o[live, 0:3]
+                    d = np.roll(o[live, 0:3], -1, 0) - o[live, 0:3]
+                    ctx[:, 3:6] = d / np.maximum(
+                        np.linalg.norm(d, axis=1, keepdims=True), 1e-9)
+                    ctx[:, 6:] = o[live, 6:][:, :ch - 6]
+                    n_ctx = len(ctx)
+                    # pad to a fixed length so the batch stacks. Repeats rather
+                    # than zeros: a zero row is a point at the origin, and the
+                    # context encoder builds neighbourhoods by distance, so a
+                    # pile of them at one spot would invent structure there.
+                    if n_ctx < EDGE_SLOTS:
+                        ctx = np.concatenate(
+                            [ctx, ctx[np.arange(EDGE_SLOTS - n_ctx) % n_ctx]])
+            if self.cloud_bank and rng.random() >= self.cloud_drop:
+                bk = self.cloud_bank[rng.integers(len(self.cloud_bank))]
+                cf = bk / f"{p.name}.npy"
+                if cf.exists():
+                    c = np.load(cf)                      # (N, 6) xyz + normal
+                    add = np.zeros((len(c), ch), np.float32)
+                    add[:, :6] = c
+                    ctx = add if n_ctx == 0 else np.concatenate([ctx, add])
+                    n_ctx = len(ctx)
             return {
                 "x": torch.from_numpy(x.astype(np.float32)),
-                "ctx": torch.zeros(1, ch),
-                "n_ctx": 0,
+                "ctx": torch.from_numpy(ctx),
+                "n_ctx": n_ctx,
                 "cond": torch.from_numpy(frame_cond_rows(p)),
                 "fix": torch.from_numpy(
                     np.concatenate([f, fd], 1).astype(np.float32)),
@@ -414,13 +467,16 @@ class ContextEncoder(nn.Module):
     at a different density.
     """
 
-    def __init__(self, dim=192):
+    def __init__(self, dim=192, ctx_ch=CH):
         super().__init__()
         per = dim // len(SCALES)
         self.legs = nn.ModuleList(
             nn.Sequential(nn.Linear(6, per), nn.GELU(), nn.Linear(per, per))
             for _ in SCALES)
-        self.out = nn.Linear(per * len(SCALES) + 7, dim)
+        # the raw context rows are concatenated with the multi-scale features,
+        # so this width follows the context's channel count -- it was hardcoded
+        # to 7 and broke the moment a stage carried more.
+        self.out = nn.Linear(per * len(SCALES) + ctx_ch, dim)
 
     def forward(self, ctx):                       # (B, M, CH)
         p, d = ctx[..., :3], ctx[..., 3:6]
@@ -491,7 +547,7 @@ class StageFlow(nn.Module):
         self.inp = nn.Linear(ch, dim)
         self.cond = nn.Linear(8, dim)
         self.fixp = nn.Linear(6, dim)
-        self.enc = ContextEncoder(dim) if cross else None
+        self.enc = ContextEncoder(dim, ctx_ch=ch) if cross else None
         self.t_mlp = nn.Sequential(nn.Linear(dim, dim), nn.SiLU(),
                                    nn.Linear(dim, dim))
         self.blocks = nn.ModuleList(Block(dim, heads) for _ in range(layers))
@@ -652,6 +708,17 @@ def probe(model, ds, device, n_parts=12, steps=24, scale=2.0):
         ctx = it["ctx"][None].to(device) if model.cross else None
         x = sample(model, cond, fix, ctx, ds.n_pts, steps, scale)[0]
         p = x[:, :3].cpu().numpy().astype(np.float64)
+        if ds.stage == "bend_frame":
+            from .frame import realize_bend
+            g = x.cpu().numpy().astype(np.float64)
+            w = it["x"].numpy().astype(np.float64)
+            nw = max(int((w[:, 7] < .5).sum()), 1)
+            ends.append(abs(int((g[:, 7] < .5).sum()) - nw) / nw)
+            a, b = realize_bend(g), realize_bend(w)
+            mm = fastener_frame(ds.parts[i])[2]
+            cvs.append(mm * float(cKDTree(np.concatenate(b)).query(
+                np.concatenate(a))[0].mean()) if a and b else 99.0)
+            continue
         if ds.stage == "outline_frame":
             # A frame cannot be ragged or open -- it is a closed chain of edges
             # by construction. What can go wrong is using the wrong NUMBER of
@@ -707,14 +774,20 @@ def train(args):
     print(f"stage {args.stage}: train {len(train_parts)} val {len(val_parts)}",
           flush=True)
 
-    cross = args.stage not in ("outline", "outline_frame")
+    cross = args.stage not in ("outline", "outline_frame") or bool(args.cloud_bank)
+    if args.cloud_drop and not args.cloud_bank:
+        raise SystemExit("--cloud-drop needs --cloud-bank")
+    # bend_frame slots are separate folds with no order between them, only the
+    # canonical longest-first ranking, so no positional encoding applies.
     ordered = {"outline": "loop", "outline_frame": "loop",
                "bend": "strand"}.get(args.stage, "")
     # bend_pc is deliberately unordered: with no slot structure there is nothing
     # for a positional encoding to encode.
     ds = StageDataset(train_parts, md, args.stage, base_seed=7,
-                      outlier_rate=args.outlier_rate)
-    vs = StageDataset(val_parts, md, args.stage, base_seed=555)
+                      outlier_rate=args.outlier_rate, cloud_bank=args.cloud_bank)
+    ds.cloud_drop = args.cloud_drop
+    vs = StageDataset(val_parts, md, args.stage, base_seed=555,
+                      cloud_bank=args.cloud_bank)
     dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
     model = StageFlow(args.dim, args.layers, args.heads, cross, ordered,
                       ch=STAGE_CH.get(args.stage, CH)).to(args.device)
@@ -806,6 +879,12 @@ def main():
     ap.add_argument("--probe-every", type=int, default=5)
     ap.add_argument("--probe-parts", type=int, default=12)
     ap.add_argument("--max-hours", type=float, default=3.0)
+    ap.add_argument("--cloud-bank", default="",
+                    help="directory of precomputed bulk-generator clouds to "
+                         "condition on (one <part>.npy of (N,6) per part)")
+    ap.add_argument("--cloud-drop", type=float, default=0.0,
+                    help="probability of withholding the cloud during training, "
+                         "so the model does not learn to depend on it")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     train(ap.parse_args())

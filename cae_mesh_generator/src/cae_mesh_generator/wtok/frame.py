@@ -331,3 +331,227 @@ def consist_demo():
     assert after < before / 3, (before, after)
     assert moved < 1e-6, "the solve must not slide corners within the plane"
     print("ok")
+
+
+MEDOID_K = 9            # draws to choose among; 9 measured, see frame_eval
+
+
+def medoid(frames, per_edge: int = 60):
+    """Pick the draw closest to all the others. Returns (index, frames[index]).
+
+    A CHOICE, not a blend: the winner is one of the generated frames, unchanged,
+    so it keeps every structural guarantee the representation gives -- one closed
+    loop of lines and arcs. Averaging K frames would destroy that, since corner i
+    of one draw is not corner i of another.
+
+    Worth 7.77mm -> 5.47mm on 30 val parts at K=9. The model already draws a
+    4.12mm frame among those 9; it just cannot tell which one, and the middle of
+    its own answers is the best guess available without new information.
+    """
+    from scipy.spatial import cKDTree
+
+    polys = [realize_frame(f, per_edge) for f in frames]
+    keep = [i for i, o in enumerate(polys) if len(o) >= 10]
+    if not keep:
+        return 0, frames[0]
+    D = np.zeros((len(keep), len(keep)))
+    for a, i in enumerate(keep):
+        for b, j in enumerate(keep):
+            if a != b:
+                D[a, b] = float(cKDTree(polys[j]).query(polys[i])[0].mean())
+    w = keep[int(D.sum(1).argmin())]
+    return w, frames[w]
+
+
+# ----------------------------------------------------------- bend wireframe
+
+BEND_SLOTS = 24         # folds per part: median 15, max 22 measured
+BEND_MERGE_DEG = 8.0    # parallel tolerance when pairing a fold's two tangents
+BEND_MERGE_MM = 25.0    # and how far apart the pair may sit
+
+
+def fold_lines(part, min_mm: float = 10.0):
+    """The part's FOLDS, as polylines -- not the raw bend_line edges.
+
+    bend_line marks where a bend's cylinder meets a flat panel, so one fold
+    contributes TWO of them, parallel and about 5.5mm apart. Merging each pair
+    into its centreline is what turns the class into the thing a wireframe
+    actually wants: 24 segments become 15 folds, and the per-part maximum drops
+    from 40 to 22. Segments under 10mm are tessellation slivers -- 61% of them,
+    holding 11.9% of the total length.
+    """
+    from .codec import realize_edge
+    from .train_curve import realized_q
+
+    q = realized_q(part, part.vertices, part.edges)
+    S = []
+    for e in part.edges:
+        if e.get("cls") != "bend_line":
+            continue
+        poly = realize_edge(q, e)
+        if poly is None or len(poly) < 2:
+            continue
+        poly = np.asarray(poly, float)
+        if float(np.linalg.norm(np.diff(poly, axis=0), axis=1).sum()) >= min_mm:
+            S.append(poly)
+    if not S:
+        return []
+    ax = [((s[0] + s[-1]) / 2,
+           (s[-1] - s[0]) / max(np.linalg.norm(s[-1] - s[0]), 1e-9),
+           float(np.linalg.norm(s[-1] - s[0]))) for s in S]
+    taken, out = set(), []
+    for i in range(len(S)):
+        if i in taken:
+            continue
+        best, bj = None, -1
+        for j in range(len(S)):
+            if j == i or j in taken:
+                continue
+            if abs(float(ax[i][1] @ ax[j][1])) <= np.cos(np.radians(BEND_MERGE_DEG)):
+                continue
+            d = float(np.linalg.norm(ax[i][0] - ax[j][0]))
+            lr = min(ax[i][2], ax[j][2]) / max(ax[i][2], ax[j][2])
+            if d < BEND_MERGE_MM and lr > 0.6 and (best is None or d < best):
+                best, bj = d, j
+        taken.add(i)
+        if bj < 0:
+            out.append(S[i])
+            continue
+        taken.add(bj)
+        n = min(len(S[i]), len(S[bj]))
+        a = S[i][np.round(np.linspace(0, len(S[i]) - 1, n)).astype(int)]
+        b = S[bj][np.round(np.linspace(0, len(S[bj]) - 1, n)).astype(int)]
+        if float(np.linalg.norm(a[0] - b[0])) > float(np.linalg.norm(a[0] - b[-1])):
+            b = b[::-1]
+        out.append(0.5 * (a + b))
+    out.sort(key=lambda s: -float(np.linalg.norm(np.diff(s, axis=0), axis=1).sum()))
+    return out[:BEND_SLOTS]
+
+
+def bend_frame_target(part, frame, slots: int = BEND_SLOTS):
+    """(slots, FRAME_CH), the same layout as the outline frame.
+
+        [0:3] first endpoint      [3:6] second endpoint
+        [6]   is_arc              [7]   unused
+        [8:11] bulge -- the mid point measured from the chord midpoint
+
+    Endpoints are FREE, not tied to the outline: measured over 200 parts a fold
+    end sits 11.4mm from the boundary and only 3% of them come within 2mm, so
+    parametrising a fold by two positions along the perimeter -- which would
+    have made a floating wire impossible by construction -- does not fit the
+    data. Whatever holds the wires down has to come from somewhere else.
+
+    Slots are ordered longest-first, which is a canonical order the model can
+    learn ("slots past here are usually unused"), the same role the strand index
+    played in the point-based bend stage.
+    """
+    from .meshgen import to_frame
+
+    F = fold_lines(part)
+    if not F:
+        return None
+    x = np.zeros((slots, FRAME_CH))
+    x[len(F):, 7] = 1.0
+    for i, f in enumerate(F):
+        pts, _ = to_frame(f, np.zeros_like(f), frame)
+        a, b, mid = pts[0], pts[-1], _halfway(pts)
+        chord = 0.5 * (a + b)
+        sag = float(np.linalg.norm(mid - chord))
+        span = max(float(np.linalg.norm(b - a)), 1e-9)
+        x[i, 0:3], x[i, 3:6] = a, b
+        x[i, 6] = 1.0 if sag / span > 0.02 else 0.0     # bowed enough to be an arc
+        x[i, 8:11] = (mid - chord) * x[i, 6]
+    return x
+
+
+def _densify(pts, n):
+    """Resample a polyline to n points, evenly by arc length."""
+    seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    s = np.concatenate([[0.0], np.cumsum(seg)])
+    if s[-1] < 1e-12:
+        return np.repeat(pts[:1], n, axis=0)
+    want = np.linspace(0.0, s[-1], n)
+    return np.stack([np.interp(want, s, pts[:, d]) for d in range(3)], axis=1)
+
+
+def _halfway(pts):
+    """The point half way ALONG the polyline, by arc length.
+
+    Not pts[len(pts)//2]: a LINE edge realises as exactly two points, so the
+    index midpoint is the END point, the sag comes out as half the chord, and
+    every fold gets flagged as an arc bulging by half its own length.
+    """
+    seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    s = np.concatenate([[0.0], np.cumsum(seg)])
+    if s[-1] < 1e-12:
+        return pts[0]
+    return np.array([np.interp(s[-1] / 2, s, pts[:, d]) for d in range(3)])
+
+
+def realize_bend(x, per_edge: int = 40, arc_thresh: float = 0.5):
+    """Bend slots back to a list of polylines, one per live fold."""
+    from .codec import circle_through
+
+    out = []
+    for r in x:
+        if r[7] >= 0.5:
+            continue
+        a, b = r[0:3], r[3:6]
+        if float(np.linalg.norm(b - a)) < 1e-9:
+            continue
+        if r[6] <= arc_thresh:
+            out.append(np.linspace(a, b, per_edge))
+            continue
+        mid = 0.5 * (a + b) + r[8:11]
+        cc = circle_through(a, mid, b)
+        if cc is None:
+            out.append(np.linspace(a, b, per_edge))
+            continue
+        c, n, rad = cc
+        e1 = (a - c) / max(np.linalg.norm(a - c), 1e-12)
+        e2 = np.cross(n, e1)
+        a_m = np.arctan2((mid - c) @ e2, (mid - c) @ e1) % (2 * np.pi)
+        a_e = np.arctan2((b - c) @ e2, (b - c) @ e1) % (2 * np.pi)
+        sweep = a_e if a_m <= a_e else a_e - 2 * np.pi
+        t = np.linspace(0.0, sweep, per_edge)
+        out.append(c + rad * (np.cos(t)[:, None] * e1 + np.sin(t)[:, None] * e2))
+    return out
+
+
+def bend_demo():
+    """Round-trip: the target must rebuild the folds it was made from."""
+    import pathlib
+
+    from scipy.spatial import cKDTree
+
+    from .dataset_curve import load_curve_parts
+    from .meshgen import fastener_frame, to_frame
+
+    R = pathlib.Path(__file__).resolve().parents[4]
+    parts = load_curve_parts(R / "runs" / "wtok_synth")[:40]
+    err, nf, arc = [], [], []
+    for p in parts:
+        fr = fastener_frame(p)
+        x = bend_frame_target(p, fr)
+        F = fold_lines(p)
+        if x is None or not F:
+            continue
+        # Densify the TRUE folds to the same resolution before comparing. A
+        # LINE realises as two points; measuring 40 reconstructed points against
+        # those two charges a quarter of the chord for the densification alone,
+        # which reads as a 12mm error on a fold that is reproduced exactly.
+        ref = np.concatenate([_densify(to_frame(f, np.zeros_like(f), fr)[0], 40)
+                              for f in F])
+        got = realize_bend(x)
+        if not got:
+            continue
+        got = np.concatenate(got)
+        err.append(fr[2] * max(float(cKDTree(got).query(ref)[0].mean()),
+                               float(cKDTree(ref).query(got)[0].mean())))
+        nf.append(int((x[:, 7] < 0.5).sum()))
+        arc.append(float(x[x[:, 7] < 0.5][:, 6].mean()))
+    print(f"{len(err)} parts, folds median {np.median(nf):.0f} max {max(nf)}, "
+          f"arc share {np.mean(arc):.2f}")
+    print(f"rebuild error: median {np.median(err):.3f}mm  max {max(err):.3f}mm")
+    assert max(nf) <= BEND_SLOTS and np.median(err) < 1.5
+    print("ok")
