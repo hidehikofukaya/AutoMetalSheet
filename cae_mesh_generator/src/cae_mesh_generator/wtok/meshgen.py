@@ -250,19 +250,37 @@ ANCHOR_PER_FIX = 8
 
 
 def fastener_disc(part, per_fix: int = ANCHOR_PER_FIX, r: float = ANCHOR_R,
-                  rng=None):
+                  rng=None, use_spec: bool = True):
     """Points the fastener itself determines, SYNTHESISED -- never read from the
     part.
 
-    A bolt needs a flat seat normal to its axis, and the data agrees exactly: over
-    240 fastener sites the real surface within 10mm of a fastening point deviates
-    from the ideal disc by 0.00mm at the 95th percentile, with 0.0 deg of normal
-    tilt. (At 15mm the 95th percentile tilt is already 49 deg, so 10mm is the
-    honest radius.) Feeding these in is the fastening point drawn out, not
-    ground truth: they are generated from the point and its axis alone.
+    A bolt needs a flat seat normal to its axis, and the part is flat there
+    exactly. Measured over 400 fastener sites:
+
+        radius used                          tilt p95   off-plane p95
+        fixed 10mm                             0.0 deg        0.002mm
+        the part's own min_bearing_radius      0.0 deg        0.002mm
+        1.2x that radius                      25.2 deg        0.541mm
+
+    So the flat region ends AT the required bearing radius and not before. The
+    fixed 10mm was chosen without knowing each part's requirement, and it is
+    smaller than the requirement on 100% of parts (median 17.9mm, min 12.5) --
+    a third of the available flat area by area.
+
+    `min_bearing_radius_mm` is a design input, not part geometry, so using it
+    keeps the disc synthetic: it is still the fastener drawn out, from the point,
+    its axis, and the seat the bolt requires.
     """
     rng = rng or np.random.default_rng(0)
     P, A = fix_points_mm(part)
+    if use_spec:
+        from .sidecar import SPEC_KEYS, SPEC_SCALE, load_spec
+        sp = load_spec(part)
+        if sp is not None:
+            i = SPEC_KEYS.index("min_bearing_radius_mm")
+            rb = float(sp[i] / SPEC_SCALE[i])
+            if rb > 0:
+                r = rb
     pts, nrm = [], []
     for c, ax in zip(P, A):
         e1 = np.array([1.0, 0.0, 0.0])
