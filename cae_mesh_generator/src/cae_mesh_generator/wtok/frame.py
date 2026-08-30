@@ -24,8 +24,7 @@ from __future__ import annotations
 import numpy as np
 
 EDGE_SLOTS = 32         # max measured 26
-FRAME_CH = 9            # corner 3, sagitta 1, is_arc 1, unused 1, normal 3
-SAG, ARC_F, UNUSED_F = 3, 4, 5      # channel indices after the corner
+FRAME_CH = 11           # corner 3, arc bulge 3, is_arc 1, unused 1, normal 3
 NRM_WIN = 1             # corners each side of an edge used to fit its plane
 NRM_TOL = 0.06          # third singular value over the first; above it, not flat
 
@@ -92,16 +91,14 @@ def frame_target(part, frame, slots: int = EDGE_SLOTS):
 
     chord = 0.5 * (p + np.roll(p, -1, 0))     # edge i runs corner i -> i+1
     bulge = (mid - chord) * is_arc[:, None]
-    out = loop_outward(p)
-    sag = np.einsum("ij,ij->i", bulge, out)   # signed, along the outward normal
 
     x = np.zeros((slots, FRAME_CH))
     n = len(p)
     x[:n, 0:3] = p
-    x[:n, SAG] = sag
-    x[:n, ARC_F] = is_arc
-    x[n:, UNUSED_F] = 1.0                     # unused slots
-    x[:n, 6:9] = edge_normals(p)
+    x[:n, 3:6] = bulge
+    x[:n, 6] = is_arc
+    x[n:, 7] = 1.0                            # unused slots
+    x[:n, 8:11] = edge_normals(p)
     return x
 
 
@@ -134,36 +131,6 @@ def edge_normals(P, win: int = NRM_WIN, tol: float = NRM_TOL):
         v = V[-1]
         N[i] = -v if v[int(np.argmax(np.abs(v)))] < 0 else v   # undirected
     return N
-
-
-def loop_outward(P):
-    """In-plane outward direction for each edge of a closed corner loop.
-
-    An arc on an outline bows across the loop, not out of its plane: measured
-    over 1764 true arcs the bulge's component along the loop normal is 0.337
-    while 83% of it points outward. Carrying only a SIGNED SAGITTA along this
-    direction makes an out-of-plane bulge inexpressible and leaves the model one
-    number instead of a free 3-vector -- of which it got the direction wrong on
-    23% of edges.
-
-    The centre was considered instead. It is the natural CAD parameter but it
-    diverges: a gentle arc has a huge radius, and the measured centre reaches
-    2116mm on a part a tenth that size, while the sagitta stays at 1.1mm median
-    and 22.8mm worst. The centre is recovered from the sagitta by
-    `codec.circle_through`, so nothing is lost downstream.
-    """
-    P = np.asarray(P, float)
-    c = P.mean(0)
-    n = np.linalg.svd(P - c)[2][-1]
-    t = np.roll(P, -1, 0) - P
-    t /= np.maximum(np.linalg.norm(t, axis=1, keepdims=True), 1e-12)
-    o = np.cross(np.tile(n, (len(P), 1)), t)
-    no = np.linalg.norm(o, axis=1, keepdims=True)
-    o = np.divide(o, np.maximum(no, 1e-12))
-    mid = 0.5 * (P + np.roll(P, -1, 0))
-    s = np.sign(np.einsum("ij,ij->i", o, mid - c))
-    s[s == 0] = 1.0
-    return o * s[:, None]
 
 
 def _canonicalise(p, mid, is_arc):
@@ -201,13 +168,13 @@ def realize_frame(x, per_edge: int = 24, arc_thresh: float = 0.5):
     """
     from .codec import circle_through
 
-    live = x[:, UNUSED_F] < 0.5
+    live = x[:, 7] < 0.5
     p = x[live, 0:3]
     if len(p) < 3:
         return np.zeros((0, 3))
-    is_arc = x[live, ARC_F] > arc_thresh
+    bulge, is_arc = x[live, 3:6], x[live, 6] > arc_thresh
     nxt = np.roll(p, -1, 0)
-    mid = 0.5 * (p + nxt) + x[live, SAG][:, None] * loop_outward(p)
+    mid = 0.5 * (p + nxt) + bulge
 
     out = []
     for i in range(len(p)):
@@ -264,7 +231,7 @@ def demo():
         d1 = cKDTree(got).query(ref)[0].mean()
         d2 = cKDTree(ref).query(got)[0].mean()
         err.append(fr[2] * max(d1, d2))       # frame unit -> mm
-        ne.append(int((x[:, UNUSED_F] < 0.5).sum()))
+        ne.append(int((x[:, 7] < 0.5).sum()))
         arc.append(float(x[:len(ne)][:, 6].mean()))
     print(f"{len(err)} parts round-tripped, {dropped} over {EDGE_SLOTS} slots")
     print(f"edges per part: median {np.median(ne):.0f}  max {max(ne)}")
@@ -343,10 +310,10 @@ def apply_consistency(x, lam: float = CONSIST_LAMBDA):
     """`consistent_corners` over a frame tensor, live slots only."""
     x = np.asarray(x, float).copy()
     live = x[:, 7] < 0.5
-    if live.sum() < 6 or x.shape[1] < FRAME_CH:
+    if live.sum() < 6 or x.shape[1] < 11:
         return x
     idx = np.flatnonzero(live)
-    x[idx, 0:3] = consistent_corners(x[live, 0:3], x[live, 6:9], lam)
+    x[idx, 0:3] = consistent_corners(x[live, 0:3], x[live, 8:11], lam)
     return x
 
 
@@ -398,7 +365,6 @@ def medoid(frames, per_edge: int = 60):
 
 # ----------------------------------------------------------- bend wireframe
 
-BEND_CH = 11            # this layout is its own; it does not share the outline's
 BEND_SLOTS = 24         # folds per part: median 15, max 22 measured
 BEND_MERGE_DEG = 8.0    # parallel tolerance when pairing a fold's two tangents
 BEND_MERGE_MM = 25.0    # and how far apart the pair may sit
@@ -462,7 +428,7 @@ def fold_lines(part, min_mm: float = 10.0):
     return out[:BEND_SLOTS]
 
 
-def bend_frame_target(part, frame, slots: int = BEND_SLOTS, ch: int = BEND_CH):
+def bend_frame_target(part, frame, slots: int = BEND_SLOTS):
     """(slots, FRAME_CH), the same layout as the outline frame.
 
         [0:3] first endpoint      [3:6] second endpoint
@@ -484,7 +450,7 @@ def bend_frame_target(part, frame, slots: int = BEND_SLOTS, ch: int = BEND_CH):
     F = fold_lines(part)
     if not F:
         return None
-    x = np.zeros((slots, ch))
+    x = np.zeros((slots, FRAME_CH))
     x[len(F):, 7] = 1.0
     for i, f in enumerate(F):
         pts, _ = to_frame(f, np.zeros_like(f), frame)
@@ -593,8 +559,8 @@ def bend_demo():
 
 # ------------------------------------------------- multi-loop generalisation
 
-MULTI_CH = FRAME_CH + 1     # frame channels + one loop-end flag
-LOOP_END = FRAME_CH         # channel: this slot is the LAST edge of its loop
+MULTI_CH = 12           # frame channels + one loop-end flag
+LOOP_END = 11           # channel: this slot is the LAST edge of its loop
 
 
 def boundary_loops(part):
@@ -680,7 +646,7 @@ def multi_frame_target(part, frame, slots: int = EDGE_SLOTS):
     if not L:
         return None
     x = np.zeros((slots, MULTI_CH))
-    x[:, UNUSED_F] = 1.0                             # unused until filled
+    x[:, 7] = 1.0                                    # unused until filled
     at = 0
     for chain, _cls in L:
         n = len(chain)
@@ -694,11 +660,10 @@ def multi_frame_target(part, frame, slots: int = EDGE_SLOTS):
         p, mid, is_arc = _canonicalise(p, mid, is_arc)
         chord = 0.5 * (p + np.roll(p, -1, 0))
         x[at:at + n, 0:3] = p
-        x[at:at + n, SAG] = np.einsum(
-            "ij,ij->i", (mid - chord) * is_arc[:, None], loop_outward(p))
-        x[at:at + n, ARC_F] = is_arc
-        x[at:at + n, UNUSED_F] = 0.0
-        x[at:at + n, 6:9] = edge_normals(p)
+        x[at:at + n, 3:6] = (mid - chord) * is_arc[:, None]
+        x[at:at + n, 6] = is_arc
+        x[at:at + n, 7] = 0.0
+        x[at:at + n, 8:11] = edge_normals(p)
         x[at + n - 1, LOOP_END] = 1.0                # close this loop here
         at += n
     return x if at else None
@@ -706,7 +671,7 @@ def multi_frame_target(part, frame, slots: int = EDGE_SLOTS):
 
 def realize_multi(x, per_edge: int = 24, arc_thresh: float = 0.5):
     """Multi-loop slots back to a list of closed polylines, one per loop."""
-    live = np.flatnonzero(x[:, UNUSED_F] < 0.5)
+    live = np.flatnonzero(x[:, 7] < 0.5)
     if len(live) < 3:
         return []
     out, start = [], 0
@@ -751,10 +716,10 @@ def multi_demo():
     assert np.median(err) < 0.05, np.median(err)
 
     # synthetic two-loop part: a square with a square hole
-    x = np.zeros((EDGE_SLOTS, MULTI_CH)); x[:, UNUSED_F] = 1.0
+    x = np.zeros((EDGE_SLOTS, MULTI_CH)); x[:, 7] = 1.0
     x[:4, 0:3] = [[0,0,0],[40,0,0],[40,40,0],[0,40,0]]
     x[4:8, 0:3] = [[15,15,0],[25,15,0],[25,25,0],[15,25,0]]
-    x[:8, UNUSED_F] = 0.0
+    x[:8, 7] = 0.0
     x[3, LOOP_END] = 1.0; x[7, LOOP_END] = 1.0
     loops = realize_multi(x)
     ends = [outline_closed(o)[0] for o in loops]

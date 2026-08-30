@@ -365,7 +365,6 @@ class StageDataset(Dataset):
         self.cloud_drop = 0.0
         self.surf_curv = False
         self.use_spec = False
-        self.plane_rows = False
         self.n_context = n_context
         self.outlier_rate = outlier_rate
         self.cache: dict = {}
@@ -413,25 +412,6 @@ class StageDataset(Dataset):
             # only "this is not part of the shape" the frame has.
             fx, fn = fastener_disc(p, GUARD_PER_FIX, rng=rng)
             f, fd = to_frame(fx, fn, fastener_frame(p))
-            if self.plane_rows:
-                # Say the coplanarity rather than leaving it to be inferred: for
-                # each disc point, which fastener it belongs to and its signed
-                # offset along that fastener's axis. The offset is 0 by
-                # construction, so the channel states "this point and its
-                # fastener lie in one plane" -- the seating plane a bolt needs.
-                # Measured, the part really is flat out to the required bearing
-                # radius: tilt 0.0 deg at p95, off-plane 0.002mm.
-                fc, _ = fix_points_mm(p)
-                fcf, _ = to_frame(fc, np.zeros_like(fc), fastener_frame(p))
-                who = np.repeat(np.arange(len(fcf)), GUARD_PER_FIX)[:len(f)]
-                off = np.einsum("ij,ij->i", f - fcf[who], fd)
-                # appended AFTER the normals, or the row becomes
-                # [pos, id, off, normal] and the two extra channels sit where
-                # the normal is read
-                self._plane_extra = np.stack(
-                    [who / max(len(fcf) - 1, 1), off], 1).astype(np.float32)
-            else:
-                self._plane_extra = None
             cond = frame_cond_rows(p)
             if self.use_spec:
                 # The design spec, as one extra condition row. It is the
@@ -512,10 +492,8 @@ class StageDataset(Dataset):
                 "ctx": torch.from_numpy(np.ascontiguousarray(ctx)),
                 "n_ctx": n_ctx,
                 "cond": torch.from_numpy(cond),
-                "fix": torch.from_numpy(np.concatenate(
-                    [f, fd] + ([self._plane_extra]
-                               if self._plane_extra is not None else []),
-                    1).astype(np.float32)),
+                "fix": torch.from_numpy(
+                    np.concatenate([f, fd], 1).astype(np.float32)),
             }
 
         if self.outlier_rate > 0 and rng.random() < self.outlier_rate:
@@ -690,14 +668,14 @@ class StageFlow(nn.Module):
     """
 
     def __init__(self, dim=256, layers=8, heads=8, cross=True, ordered="",
-                 ch=CH, fix_ch=6):
+                 ch=CH):
         super().__init__()
         self.cross = cross
         self.ordered = ordered or ""
         self.ch = ch
         self.inp = nn.Linear(ch, dim)
         self.cond = nn.Linear(8, dim)
-        self.fixp = nn.Linear(fix_ch, dim)
+        self.fixp = nn.Linear(6, dim)
         self.enc = ContextEncoder(dim, ctx_ch=ch) if cross else None
         self.t_mlp = nn.Sequential(nn.Linear(dim, dim), nn.SiLU(),
                                    nn.Linear(dim, dim))
@@ -822,9 +800,7 @@ def flow_loss(model, batch, p_drop: float = 0.0, n_pin: int = 0):
         elif x1.shape[-1] == CH:
             w = [1., 1., 1., .2, .2, .2, .5]
         else:
-            # outline frame: corner 1.0 | sagitta 0.5 | is_arc 0.5 | unused 0.5
-            # | normal 0.2, then any extra channel (loop_end) 0.5
-            base = [1., 1., 1., .5, .5, .5, .2, .2, .2]
+            base = [1., 1., 1., .2, .2, .2, .5, .5, .2, .2, .2, .5]
             w = base + [.5] * max(0, x1.shape[-1] - len(base))
         W_CH = torch.tensor(w[:x1.shape[-1]], device=x1.device)
     x0 = torch.randn_like(x1)
@@ -961,9 +937,8 @@ def probe(model, ds, device, n_parts=12, steps=24, scale=2.0):
             from .frame import realize_frame
             g = x.cpu().numpy().astype(np.float64)
             w = it["x"].numpy().astype(np.float64)
-            from .frame import UNUSED_F
-            nw = max(int((w[:, UNUSED_F] < .5).sum()), 1)
-            ends.append(abs(int((g[:, UNUSED_F] < .5).sum()) - nw) / nw)
+            ends.append(abs(int((g[:, 7] < .5).sum()) - int((w[:, 7] < .5).sum()))
+                        / max(int((w[:, 7] < .5).sum()), 1))
             a, b = realize_frame(g), realize_frame(w)
             mm = fastener_frame(ds.parts[i])[2]
             cvs.append(mm * float(cKDTree(b).query(a)[0].mean())
@@ -1028,17 +1003,14 @@ def train(args):
                       outlier_rate=args.outlier_rate, cloud_bank=args.cloud_bank)
     ds.cloud_drop = args.cloud_drop
     ds.surf_curv = bool(args.surf_curv)
-    ds.use_spec = bool(args.use_spec)
-    ds.plane_rows = bool(args.plane_rows)
+    ds.use_spec = vs_use = bool(args.use_spec)
     vs = StageDataset(val_parts, md, args.stage, base_seed=555,
                       cloud_bank=args.cloud_bank)
     vs.surf_curv = bool(args.surf_curv)
     vs.use_spec = bool(args.use_spec)
-    vs.plane_rows = bool(args.plane_rows)
     dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
     model = StageFlow(args.dim, args.layers, args.heads, cross, ordered,
-                      ch=STAGE_CH.get(args.stage, CH),
-                      fix_ch=8 if args.plane_rows else 6).to(args.device)
+                      ch=STAGE_CH.get(args.stage, CH)).to(args.device)
     print(f"params: {sum(q.numel() for q in model.parameters())/1e6:.2f}M",
           flush=True)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
@@ -1130,10 +1102,6 @@ def main():
     ap.add_argument("--cloud-bank", default="",
                     help="directory of precomputed bulk-generator clouds to "
                          "condition on (one <part>.npy of (N,6) per part)")
-    ap.add_argument("--plane-rows", action="store_true",
-                    help="state the seating-plane relation explicitly: each "
-                         "guard point carries which fastener it belongs to and "
-                         "its offset along that axis (zero by construction)")
     ap.add_argument("--use-spec", action="store_true",
                     help="add the design spec (thickness, half width, bend "
                          "radius, fold slacks) as a condition row")
