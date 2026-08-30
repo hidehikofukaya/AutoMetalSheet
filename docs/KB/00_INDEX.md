@@ -28,6 +28,7 @@ Branch: `feat/softmin-guidance-poc`
 | 12 | [12_conditioning_rule.md](12_conditioning_rule.md) | **導出できる情報は効かない。**4度の失敗と1つの成功 | 条件を足そうとする人。必読 |
 | 13 | [13_mechanics_geometry.md](13_mechanics_geometry.md) | 材料力学×幾何の整理。何を入力に、何を教師信号にできるか | 情報を増やそうとする人 |
 | 14 | [14_delta_tokens.md](14_delta_tokens.md) | 変位トークン。**保留中、次は曲げで試す** | 続きをやる人 |
+| 15 | [15_micro_structure_design.md](15_micro_structure_design.md) | **微細構造の設計。**粗→密サンプリング、学習した局所判定器、関係アテンション | 次に実装する人 |
 
 ---
 

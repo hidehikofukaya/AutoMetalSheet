@@ -624,6 +624,72 @@ class ContextEncoder(nn.Module):
         return self.out(torch.cat(feats + [ctx], -1))
 
 
+class RelAttention(nn.Module):
+    """Self-attention whose bias is learned from the RELATION between two slots.
+
+    Absolute position encoding tells a slot where it sits; it does not tell it
+    what "the previous edge" is, so a relation like "a corner is where my
+    predecessor turns sharply into me" has to be rediscovered at every position.
+    That relation is exactly what the outline stage keeps getting wrong: its
+    is_arc agrees with the truth 64% of the time while a rule using only the
+    turn angle and the neighbouring lengths reaches 79%. The information is in
+    the model's own output and it is not being used.
+
+    Hand-coding the turn angle as a channel was tried and rejected -- it decides
+    for the model which relation matters. Instead every pair of slots is
+    described by quantities that are relations rather than positions, and the
+    bias the attention adds is learned from them:
+
+        cyclic offset      sin/cos of 2*pi*(i-j)/N, so "my neighbour" is one
+                           pattern that holds everywhere on the ring
+        distance           |p_i - p_j|, expanded in radial basis functions
+        direction agreement d_i . d_j, how parallel the two edges run
+        chord alignment    (p_j - p_i) . d_i, whether j lies ahead or behind
+
+    The model chooses what to attend to; none of these is a decision about
+    corners, and nothing here mentions arcs.
+    """
+
+    def __init__(self, dim, heads, n_rbf: int = 16, n_off: int = 4):
+        super().__init__()
+        self.h = heads
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.out = nn.Linear(dim, dim)
+        self.register_buffer("centers", torch.linspace(0.0, 2.0, n_rbf))
+        self.width = 2.0 / n_rbf
+        self.n_off = n_off
+        self.bias = nn.Sequential(
+            nn.Linear(n_rbf + 2 * n_off + 2, 4 * heads), nn.GELU(),
+            nn.Linear(4 * heads, heads))
+        nn.init.zeros_(self.bias[-1].weight)
+        nn.init.zeros_(self.bias[-1].bias)
+
+    def rel(self, pos, dir_):
+        B, N, _ = pos.shape
+        d = torch.cdist(pos, pos)
+        rbf = torch.exp(-((d[..., None] - self.centers) / self.width) ** 2)
+        i = torch.arange(N, device=pos.device)
+        off = (i[:, None] - i[None, :]).float() * (2 * np.pi / N)
+        k = torch.arange(1, self.n_off + 1, device=pos.device).float()
+        cyc = torch.cat([torch.sin(off[..., None] * k),
+                         torch.cos(off[..., None] * k)], -1)
+        cyc = cyc[None].expand(B, -1, -1, -1)
+        agree = torch.einsum("bnd,bmd->bnm", dir_, dir_)[..., None]
+        delta = pos[:, None] - pos[:, :, None]
+        ahead = torch.einsum("bnmd,bnd->bnm", delta, dir_)[..., None]
+        return torch.cat([rbf, cyc, agree, ahead], -1)
+
+    def forward(self, x, pos, dir_):
+        B, N, D = x.shape
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        sh = lambda z: z.view(B, N, self.h, D // self.h).transpose(1, 2)
+        q, k, v = sh(q), sh(k), sh(v)
+        att = q @ k.transpose(-2, -1) / np.sqrt(D // self.h)
+        att = att + self.bias(self.rel(pos, dir_)).permute(0, 3, 1, 2)
+        a = torch.softmax(att, -1) @ v
+        return self.out(a.transpose(1, 2).reshape(B, N, D))
+
+
 class Block(nn.Module):
     """Self-attention over the points being generated, then cross-attention to
     everything known, both gated by the timestep the way AdaLN-Zero does.
@@ -637,11 +703,13 @@ class Block(nn.Module):
     adds the earlier stages' points to what is attended to.
     """
 
-    def __init__(self, dim, heads):
+    def __init__(self, dim, heads, rel=False):
         super().__init__()
         self.n1, self.n2, self.n3 = (nn.LayerNorm(dim, elementwise_affine=False)
                                      for _ in range(3))
-        self.self_at = nn.MultiheadAttention(dim, heads, batch_first=True)
+        self.rel = rel
+        self.self_at = (RelAttention(dim, heads) if rel else
+                        nn.MultiheadAttention(dim, heads, batch_first=True))
         self.cross_at = nn.MultiheadAttention(dim, heads, batch_first=True)
         self.mlp = nn.Sequential(nn.Linear(dim, dim * 4), nn.GELU(),
                                  nn.Linear(dim * 4, dim))
@@ -649,10 +717,13 @@ class Block(nn.Module):
         nn.init.zeros_(self.ada.weight)
         nn.init.zeros_(self.ada.bias)
 
-    def forward(self, h, c, mem):
+    def forward(self, h, c, mem, pos=None, dir_=None):
         g = self.ada(c)[:, None].chunk(6, dim=-1)
         x = self.n1(h) * (1 + g[0])
-        h = h + g[1] * self.self_at(x, x, x, need_weights=False)[0]
+        if self.rel:
+            h = h + g[1] * self.self_at(x, pos, dir_)
+        else:
+            h = h + g[1] * self.self_at(x, x, x, need_weights=False)[0]
         x = self.n2(h) * (1 + g[2])
         h = h + g[3] * self.cross_at(x, mem, mem, need_weights=False)[0]
         return h + g[5] * self.mlp(self.n3(h) * (1 + g[4]))
@@ -668,7 +739,7 @@ class StageFlow(nn.Module):
     """
 
     def __init__(self, dim=256, layers=8, heads=8, cross=True, ordered="",
-                 ch=CH):
+                 ch=CH, rel=False):
         super().__init__()
         self.cross = cross
         self.ordered = ordered or ""
@@ -679,7 +750,8 @@ class StageFlow(nn.Module):
         self.enc = ContextEncoder(dim, ctx_ch=ch) if cross else None
         self.t_mlp = nn.Sequential(nn.Linear(dim, dim), nn.SiLU(),
                                    nn.Linear(dim, dim))
-        self.blocks = nn.ModuleList(Block(dim, heads) for _ in range(layers))
+        self.rel = rel
+        self.blocks = nn.ModuleList(Block(dim, heads, rel) for _ in range(layers))
         self.norm = nn.LayerNorm(dim)
         self.head = nn.Linear(dim, ch)
         nn.init.zeros_(self.head.weight)
@@ -768,8 +840,16 @@ class StageFlow(nn.Module):
             # across every outline the two fastening points allow and returns
             # their average: a band around the right shape rather than a curve.
             mem = torch.where(drop[:, None, None], torch.zeros_like(mem), mem)
+        pos = dir_ = None
+        if self.rel:
+            # the relations are read off the CURRENT state of the slots, which
+            # during generation is the partially denoised frame -- so attention
+            # re-decides what to look at as the shape emerges
+            pos = x[..., 0:3]
+            d = torch.roll(pos, -1, dims=1) - pos
+            dir_ = d / d.norm(dim=-1, keepdim=True).clamp(min=1e-6)
         for b in self.blocks:
-            h = b(h, c, mem)
+            h = b(h, c, mem, pos, dir_)
         return self.head(self.norm(h))
 
 
@@ -1010,7 +1090,8 @@ def train(args):
     vs.use_spec = bool(args.use_spec)
     dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
     model = StageFlow(args.dim, args.layers, args.heads, cross, ordered,
-                      ch=STAGE_CH.get(args.stage, CH)).to(args.device)
+                      ch=STAGE_CH.get(args.stage, CH),
+                      rel=bool(args.rel_attn)).to(args.device)
     print(f"params: {sum(q.numel() for q in model.parameters())/1e6:.2f}M",
           flush=True)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
@@ -1102,6 +1183,11 @@ def main():
     ap.add_argument("--cloud-bank", default="",
                     help="directory of precomputed bulk-generator clouds to "
                          "condition on (one <part>.npy of (N,6) per part)")
+    ap.add_argument("--rel-attn", action="store_true",
+                    help="self-attention biased by learned functions of the "
+                         "RELATION between slots (cyclic offset, distance, "
+                         "direction agreement, chord alignment) instead of a "
+                         "plain dot product over absolute positions")
     ap.add_argument("--use-spec", action="store_true",
                     help="add the design spec (thickness, half width, bend "
                          "radius, fold slacks) as a condition row")
