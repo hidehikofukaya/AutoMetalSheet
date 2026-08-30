@@ -25,7 +25,17 @@ import zipfile
 REPO = pathlib.Path(__file__).resolve().parent.parent
 BUNDLE = REPO / "kaggle_bundle"
 USER = "hidehikofukaya"
-KERNEL = f"{USER}/autometalsheet-v0-1"
+import re
+
+
+def kernel_slug(title: str) -> str:
+    # Kaggle derives the kernel slug from the TITLE, ignoring the id we send:
+    # a push titled "autometalsheet-frame-sweep" landed there, and status/pull
+    # against the hard-coded id returned 404
+    return f"{USER}/{re.sub(r'[^a-z0-9]+', '-', title.lower()).strip('-')}"
+
+
+KERNEL = kernel_slug("AutoMetalSheet_v0.1")
 CODE_DS = f"{USER}/wtok-code"
 DATA_DS = f"{USER}/wtok-synth"
 STAGE = BUNDLE / "_kernel"          # working dir for kernel push
@@ -77,14 +87,16 @@ os.environ["WTOK_EVAL_PARTS"] = "{eval_parts}"
 os.environ["WTOK_MODULE"] = "{module}"
 os.environ["WTOK_BATCH"] = "{batch}"
 os.environ["WTOK_ARMS"] = "{arms}"
+os.environ["WTOK_SWEEP"] = {sweep!r}
 
-hits = glob.glob("/kaggle/input/**/kaggle_run.py", recursive=True)
+LAUNCH = "{launcher}"
+hits = glob.glob("/kaggle/input/**/" + LAUNCH, recursive=True)
 if not hits:
     for p in sorted(glob.glob("/kaggle/input/*")):
         print(p)
         for q in sorted(glob.glob(p + "/*"))[:8]:
             print("   ", q)
-    raise SystemExit("kaggle_run.py not found in the attached datasets")
+    raise SystemExit(LAUNCH + " not found in the attached datasets")
 print("launcher:", hits[0], flush=True)
 subprocess.run([sys.executable, hits[0]], check=True)
 '''
@@ -92,7 +104,8 @@ subprocess.run([sys.executable, hits[0]], check=True)
 
 def push(epochs: int, max_hours: float, resume_from: str, eval_parts: int,
          module: str = "cae_mesh_generator.wtok.curve3", batch: int = 16,
-         arms: str = "bcore,gagf") -> None:
+         arms: str = "bcore,gagf", launcher: str = "kaggle_run.py",
+         sweep: str = "", title: str = "AutoMetalSheet_v0.1") -> None:
     if STAGE.exists():
         shutil.rmtree(STAGE)
     STAGE.mkdir(parents=True)
@@ -105,11 +118,12 @@ def push(epochs: int, max_hours: float, resume_from: str, eval_parts: int,
     (STAGE / "script.py").write_text(
         KERNEL_SCRIPT.format(epochs=epochs, max_hours=max_hours,
                              resume_dir=resume_dir, eval_parts=eval_parts,
-                             module=module, batch=batch, arms=arms),
+                             module=module, batch=batch, arms=arms,
+                             launcher=launcher, sweep=sweep),
         encoding="utf-8")
     meta = {
-        "id": KERNEL,
-        "title": "AutoMetalSheet_v0.1",
+        "id": kernel_slug(title),
+        "title": title,
         "code_file": "script.py",
         "language": "python",
         "kernel_type": "script",
@@ -144,10 +158,19 @@ def main() -> None:
     p.add_argument("--module", default="cae_mesh_generator.wtok.curve3")
     p.add_argument("--batch", type=int, default=16)
     p.add_argument("--arms", default="bcore,gagf", help="plan_g arms to run")
-    sub.add_parser("status")
+    p.add_argument("--launcher", default="kaggle_run.py",
+                   help="which launcher in the code dataset to run")
+    p.add_argument("--sweep", default="", help="WTOK_SWEEP json for kaggle_frame")
+    p.add_argument("--title", default="AutoMetalSheet_v0.1")
+    s = sub.add_parser("status")
+    s.add_argument("--title", default="AutoMetalSheet_v0.1")
     q = sub.add_parser("pull")
     q.add_argument("--out", default=str(REPO / "runs" / "kaggle_output"))
+    q.add_argument("--title", default="AutoMetalSheet_v0.1")
     args = ap.parse_args()
+    if hasattr(args, "title"):
+        global KERNEL
+        KERNEL = kernel_slug(args.title)
 
     if args.cmd == "update-code":
         update_dataset(CODE_DS, "wtok_code.zip", "code update")
@@ -155,7 +178,8 @@ def main() -> None:
         update_dataset(DATA_DS, "wtok_synth_data.zip", "data update")
     elif args.cmd == "push":
         push(args.epochs, args.max_hours, args.resume_from, args.eval_parts,
-             args.module, args.batch, args.arms)
+             args.module, args.batch, args.arms,
+             launcher=args.launcher, sweep=args.sweep, title=args.title)
     elif args.cmd == "status":
         run(["kernels", "status", KERNEL], check=False)
     elif args.cmd == "pull":

@@ -49,6 +49,7 @@ CODE_FILES = [
     "wtok/sidecar.py",
     "wtok/bendlines.py",
     "wtok/judge.py",
+    "wtok/rational.py",
     "wtok/tokens.py",
     "wtok/deltatok.py",
     "wtok/feature.py",
