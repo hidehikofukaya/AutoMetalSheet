@@ -30,6 +30,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+from scipy.spatial import cKDTree
 from torch.utils.data import DataLoader, Dataset
 
 from .codec import bin_center, realize_points
@@ -41,7 +42,19 @@ from .plan_g import COND_ROWS, Block, RelBias, timestep_embedding
 from .train_ar import chamfer_mm
 from .train_curve import realized_q
 
-CH = 8      # xyz, normal, then two learned fields
+CH = 9      # xyz, normal, two learned fields, then an off-the-part flag
+# Nothing in the training data is off the part -- every sample sits on the
+# surface -- so the flag has no signal unless we make some. A fraction of the
+# free points are pushed off the sheet and labelled 1; every real sample is 0.
+# The generated cloud measurably overruns the true part (span ratio 1.02-1.05
+# at every guidance scale, so it is not a CFG artifact), and the points it
+# overruns with are exactly the ones the classifier most confidently calls
+# outline: 8.21mm from the truth against a 4.88mm cloud average. The flag is
+# what lets the model disown them instead of being forced to place every point
+# on the sheet.
+OUTLIER_RATE = 0.35     # of items, how often outliers are injected at all
+OUTLIER_FRAC = 0.10     # of the free points in such an item
+OUTLIER_PITCH = (1.0, 4.0)   # displacement, in units of the point spacing
 FIELD_CAP = 0.5    # frame units; distances past this carry no useful signal
 
 # Channels 6 and 7 hold the distance from the point to the outline and to the
@@ -78,34 +91,99 @@ def fix_points_mm(part) -> tuple[np.ndarray, np.ndarray]:
 def fastener_frame(part):
     """Canonical frame from the fastening points ALONE -- no part geometry.
 
-      origin : midpoint of the two fasteners
-      unit   : the distance between them (part diagonal / this distance is
-               1.21-1.69 across the set, so frame coordinates land near +-0.85)
-      e1     : fastener-to-fastener direction
-      e2     : whichever fastener axis is furthest from e1, orthogonalised
-               (measured: at least 17.5 deg for every part, so never degenerate)
+      origin : their centroid
+      unit   : RMS distance from the centroid, scaled so two points reproduce
+               exactly the separation the old two-point frame used
+      axes   : principal directions of the point set, and where the points do
+               not span three dimensions (they never do for two of them) the
+               remaining axes come from the fastener AXES, which are input too
 
-    Replaces the envelope frame, which was the ground-truth bounding box and so
-    handed the model the part's position, orientation and extent.
+    Any number of fasteners from two upward, with no branch on the count: the
+    principal directions of two points are one direction, of three points two,
+    and the fastener axes fill whatever is left. At N=2 this is bit-for-bit the
+    old frame, which the self-check below asserts.
+
+    One point is not supported and cannot be: with a single fastener the part's
+    size is not determined by the input at all, so a normalised frame has no
+    scale to use. That is a property of the task, not of this function.
     """
     P, A = fix_points_mm(part)
     if len(P) < 2:
-        R = np.eye(3)
-        return (P[0] if len(P) else np.zeros(3)), R, 1.0
-    d = float(np.linalg.norm(P[1] - P[0]))
-    e1 = (P[1] - P[0]) / max(d, 1e-12)
-    cos = np.abs(A @ e1)
-    a = A[int(np.argmin(cos))]
-    e2 = a - (a @ e1) * e1
-    n2 = np.linalg.norm(e2)
-    if n2 < 1e-6:                       # never hit on this data; stay defined
-        alt = np.array([1.0, 0.0, 0.0])
-        if abs(alt @ e1) > 0.9:
-            alt = np.array([0.0, 1.0, 0.0])
-        e2 = alt - (alt @ e1) * e1
-        n2 = np.linalg.norm(e2)
-    e2 /= n2
-    return P.mean(0), np.stack([e1, e2, np.cross(e1, e2)]), max(d, 1e-9)
+        return (P[0] if len(P) else np.zeros(3)), np.eye(3), 1.0
+    o = P.mean(0)
+    Q = P - o
+    # unit: RMS spread, times 2 so that two points give their separation
+    d = float(np.sqrt((Q ** 2).sum(1).mean())) * 2.0
+    U, S, Vt = np.linalg.svd(Q, full_matrices=True)
+    axes, rank = [], int((S > 1e-6 * max(S[0], 1e-12)).sum())
+    for i in range(rank):
+        v = Vt[i]
+        # canonical sign: point the axis the way the fastener order runs
+        if float(Q[-1] @ v) < float(Q[0] @ v):
+            v = -v
+        axes.append(v)
+    # fill the remaining axes from the fastener axes, most orthogonal first
+    for _ in range(3 - len(axes)):
+        best, bv = None, None
+        for a in A:
+            r = a - sum(float(a @ e) * e for e in axes)
+            n = float(np.linalg.norm(r))
+            if n > 1e-6 and (best is None or n > best):
+                best, bv = n, r / n
+        if bv is None:                     # degenerate: take any orthogonal axis
+            for alt in (np.array([1.0, 0, 0]), np.array([0, 1.0, 0]),
+                        np.array([0, 0, 1.0])):
+                r = alt - sum(float(alt @ e) * e for e in axes)
+                if np.linalg.norm(r) > 1e-6:
+                    bv = r / np.linalg.norm(r)
+                    break
+        axes.append(bv)
+    e1, e2 = axes[0], axes[1]
+    return o, np.stack([e1, e2, np.cross(e1, e2)]), max(d, 1e-9)
+
+
+def frame_demo():
+    """At two fasteners the general frame must equal the old two-point one."""
+    import pathlib as _pl
+
+    from .dataset_curve import load_curve_parts
+
+    R = _pl.Path(__file__).resolve().parents[4]
+    parts = load_curve_parts(R / "runs" / "wtok_synth")[:40]
+    du, da = [], []
+    for p in parts:
+        P, A = fix_points_mm(p)
+        if len(P) != 2:
+            continue
+        d0 = float(np.linalg.norm(P[1] - P[0]))
+        e1 = (P[1] - P[0]) / d0
+        a = A[int(np.argmin(np.abs(A @ e1)))]
+        e2 = a - (a @ e1) * e1
+        e2 /= np.linalg.norm(e2)
+        o1, R1, u1 = P.mean(0), np.stack([e1, e2, np.cross(e1, e2)]), d0
+        o2, R2, u2 = fastener_frame(p)
+        du.append(abs(u1 - u2))
+        da.append(float(np.abs(R1 - R2).max()) + float(np.abs(o1 - o2).max()))
+    print(f"{len(du)} two-fastener parts")
+    print(f"  unit differs by at most   {max(du):.3e}")
+    print(f"  frame differs by at most  {max(da):.3e}")
+    assert max(du) < 1e-9 and max(da) < 1e-9, "the general frame moved N=2"
+    # and it must stay defined for more fasteners
+    import copy
+    for n in (3, 4, 6):
+        q = copy.deepcopy(parts[0])
+        fx = [v for v in q.vertices if v["T"] == "FIX"]
+        extra = []
+        for i in range(n - len(fx)):
+            v = dict(fx[i % len(fx)])
+            v["bin"] = tuple(int(c * (0.6 + 0.1 * i)) for c in v["bin"])
+            extra.append(v)
+        q.vertices = fx + extra
+        o, Rm, u = fastener_frame(q)
+        det = float(np.linalg.det(Rm))
+        assert abs(det - 1.0) < 1e-6 and u > 1e-6, (n, det, u)
+        print(f"  {n} fasteners: unit {u:8.2f}  det(R) {det:.6f}  ok")
+    print("ok")
 
 
 def to_frame(xyz, normal, frame):
@@ -118,17 +196,22 @@ def from_frame(xyz, normal, frame):
     return (xyz * d) @ R + o, normal @ R
 
 
-def frame_cond_rows(part) -> np.ndarray:
-    """Fastening points only: their position and axis expressed in their own
-    frame, plus log of their separation. No envelope, no part geometry."""
+def frame_cond_rows(part, rows: int = 0) -> np.ndarray:
+    """Fastening points only: position and axis in their own frame, one row each,
+    plus a final row carrying the log of the frame's scale.
+
+    The row count follows the part instead of a constant. COND_ROWS was 4, so a
+    part with four fasteners silently lost one; the model reads these rows with
+    attention, which does not care how many there are.
+    """
     P, A = fix_points_mm(part)
     frame = fastener_frame(part)
     Pf, Af = to_frame(P, A, frame)
-    out = np.zeros((COND_ROWS, 8), dtype=np.float32)
-    for i in range(min(len(Pf), COND_ROWS - 1)):
+    n = max(rows, len(Pf) + 1, COND_ROWS)
+    out = np.zeros((n, 8), dtype=np.float32)
+    for i in range(len(Pf)):
         out[i] = np.concatenate([Pf[i], Af[i], [1.0, 0.0]])
-    out[COND_ROWS - 1] = np.concatenate(
-        [[np.log(frame[2]) / 10.0], np.zeros(6), [1.0]])
+    out[n - 1] = np.concatenate([[np.log(frame[2]) / 10.0], np.zeros(6), [1.0]])
     return out
 
 
@@ -245,9 +328,17 @@ class MeshDataset(Dataset):
     def __init__(self, parts, mesh_dir: pathlib.Path, n_pts: int,
                  augment: bool, base_seed: int = 0,
                  anchor_per_fix: int = ANCHOR_PER_FIX,
+                 outlier_rate: float = 0.0, self_rate: float = 0.0,
                  mask_rate: float = 0.0, mask_max: float = 0.5,
                  even: bool = True):
         self.anchor_per_fix = anchor_per_fix
+        self.outlier_rate = outlier_rate
+        # how often the pinned rows come from the model's own output, and the
+        # bank they come from: {part name -> (N, CH) array in frame units}.
+        # Refreshed every few epochs; generating inside the loop would cost a
+        # full 24-step sample per item.
+        self.self_rate = self_rate
+        self.self_bank: dict = {}
         self.even = even
         self.mask_rate = mask_rate
         self.mask_max = mask_max
@@ -332,22 +423,61 @@ class MeshDataset(Dataset):
         pts = np.concatenate([fix[:n_fix], xyz[take]])
         nn_ = np.concatenate([fixn[:n_fix], nrm[take]])
         fl = np.concatenate([anc_fld, fld[take]])
+        out = np.zeros((len(pts), 1))
+        if self.outlier_rate > 0 and rng.random() < self.outlier_rate:
+            # push points off the part in a random direction. The failure being
+            # taught against is a cloud that overruns its own boundary, so the
+            # displacement is isotropic rather than along the normal only.
+            free = np.arange(n_fix, len(pts))
+            k = max(1, int(len(free) * OUTLIER_FRAC))
+            sel = rng.choice(free, k, replace=False)
+            # NOT np.diff over consecutive rows: farthest-point order puts
+            # consecutive samples as far apart as possible, which measured
+            # 14-19x the real spacing and ~30% of the part, so injected
+            # outliers were flung a whole part-width away and the surface
+            # probe went from 9mm to 39mm.
+            free_pts = pts[n_fix:]
+            pitch = float(np.median(
+                cKDTree(free_pts).query(free_pts, k=2)[0][:, 1])) or 1e-3
+            v = rng.normal(size=(k, 3))
+            v /= np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-12)
+            pts = pts.copy()
+            pts[sel] += v * (pitch * rng.uniform(*OUTLIER_PITCH, size=(k, 1)))
+            out[sel] = 1.0
         # Masked training: pin a random extra set of surface points as "known"
         # and let the model infer the rest. Pinning is already how anchors work,
         # so a constraint point and a fastening point are the same mechanism --
         # this keeps the model usable with any set of known points at inference.
+        n_anchor = n_fix        # rows 0..n_anchor-1 are the fastening discs
         if self.mask_rate > 0 and rng.random() < self.mask_rate:
             free = self.n_pts - n_fix
             k = int(rng.integers(1, max(2, int(free * self.mask_max))))
             sel = n_fix + rng.permutation(free)[:k]
             order = np.concatenate([np.arange(n_fix), sel,
                                     np.setdiff1d(np.arange(n_fix, self.n_pts), sel)])
-            pts, nn_, fl = pts[order], nn_[order], fl[order]
+            pts, nn_, fl, out = pts[order], nn_[order], fl[order], out[order]
             n_fix += k
+            # Scheduled sampling: sometimes the pinned rows are replaced by the
+            # model's OWN earlier output for this part. Only the CONDITIONING
+            # moves -- the target stays the true cloud, because training on its
+            # own errors is how a model drifts.
+            #
+            # Confirming its own points measured worth nothing (8.51 -> 8.68mm,
+            # against 3.92mm for true points at the same count): the model was
+            # trained to treat a pinned row as exact, so pinning a row that is
+            # 5mm out forces a shape consistent with that error. This is what
+            # teaches it to hold them loosely.
+            bank = self.self_bank.get(p.name)
+            if bank is not None and rng.random() < self.self_rate:
+                q = cKDTree(bank[:, :3]).query(pts[n_anchor:n_fix])[1]
+                pts[n_anchor:n_fix] = bank[q, :3]
+                nn_[n_anchor:n_fix] = bank[q, 3:6]
+                fl[n_anchor:n_fix] = bank[q, 6:6 + fl.shape[1]]
         return {"x": torch.from_numpy(
-                    np.concatenate([pts, nn_, fl], axis=1).astype(np.float32)),
+                    np.concatenate([pts, nn_, fl, out], axis=1).astype(np.float32)),
                 "cond": torch.from_numpy(cond),
-                "n_fix": n_fix}
+                "n_fix": n_fix,
+                "n_anchor": n_anchor}
 
 
 def cKD(xyz, q):
@@ -401,19 +531,90 @@ def anchor_keep(n_fix: torch.Tensor, N: int) -> torch.Tensor:
     return torch.arange(N, device=n_fix.device)[None] < n_fix[:, None]
 
 
+def repulsion(pred_x1, true_x1, live, sigma_pitch: float = 2.0):
+    """Match how evenly the generated points cover the sheet.
+
+    The first version of this punished only pairs closer than the target
+    spacing. It fixed duplicates (2.7% -> 1.9% of points) and left the spread
+    exactly where it was (0.580 -> 0.582): a cloud with a dense patch beside a
+    hole has no pair that is too close, because every point still has a
+    neighbour at a reasonable distance. The wrong quantity was penalised.
+
+    Measured where the unevenness lives, as the spread of the local point count
+    at several radii (generated over true):
+
+        0.5x pitch   duplicates, since fixed
+        1.0x pitch   1.13x
+        2.0x pitch   1.90x   <- here
+        4.0x pitch   1.37x
+        8.0x pitch   1.05x   the global layout is already fine
+
+    So the term acts on the density within a couple of spacings, estimated with
+    a Gaussian kernel because counting points is not differentiable, and matched
+    to the true cloud of the same batch rather than to a constant.
+    """
+    N = pred_x1.shape[1]
+    eye = torch.eye(N, device=pred_x1.device)[None] * 1e9
+    pitch = (torch.cdist(true_x1, true_x1) + eye).min(-1).values.median(-1).values
+    s = (sigma_pitch * pitch).clamp(min=1e-6)[:, None, None]
+
+    def density(x):
+        return torch.exp(-(torch.cdist(x, x) / s) ** 2).sum(-1) - 1.0
+
+    def rel_spread(rho, m):
+        mu = (rho * m).sum(-1) / m.sum(-1).clamp(min=1)
+        var = ((rho - mu[:, None]) ** 2 * m).sum(-1) / m.sum(-1).clamp(min=1)
+        return var.sqrt() / mu.clamp(min=1e-6)
+
+    ones = torch.ones_like(live)
+    return ((rel_spread(density(pred_x1), live)
+             - rel_spread(density(true_x1), ones).detach()) ** 2).mean()
+
+
+def repulsion_demo():
+    """The density term, checked without needing a model or data."""
+    n = 64
+    g = torch.stack(torch.meshgrid(torch.arange(8.), torch.arange(8.),
+                                   indexing="ij"), -1).reshape(-1, 2)
+    even = (torch.cat([g, torch.zeros(n, 1)], 1)[None].repeat(2, 1, 1) * 0.1)
+    live = torch.ones(2, n)
+    clumped = even.clone()
+    a = even[:, 0:1, :]
+    clumped[:, :16] = a + (even[:, :16] - a) * 0.15      # a clump and a hole
+    r_even, r_bad = float(repulsion(even, even, live)),         float(repulsion(clumped, even, live))
+    assert r_even < 1e-6 < r_bad, (r_even, r_bad)
+    x = clumped.clone().requires_grad_(True)
+    repulsion(x, even, live).backward()
+    c = clumped[0, :16].mean(0)
+    dot = float(((-x.grad[0, :16]) * (clumped[0, :16] - c)).sum())
+    assert dot > 0, "descent does not expand the clump"
+    print(f"repulsion ok: even {r_even:.6f}, clumped {r_bad:.6f}, "
+          f"gradient expands the clump (dot {dot:+.5f})")
+
+
 def flow_loss(model, batch, anchor: bool, p_drop: float, w_normal: float = 0.2,
-              w_field: float = 0.5):
+              w_field: float = 0.5, w_repel: float = 0.0):
+    # w_normal is the knob 施策4 turns. Bend lines are read from a change of
+    # orientation across a point, and the generated normals are 16.3 degrees out
+    # -- while this weight is a fifth of the position weight. The quantity the
+    # bend classifier depends on most is the one trained least.
     x1 = batch["x"]          # already in the fastener frame: coords ~ +-0.85
     x0 = torch.randn_like(x1)
     B, N, _ = x1.shape
     t = torch.rand(B, device=x1.device)
     xt = (1 - t[:, None, None]) * x0 + t[:, None, None] * x1
     keep = anchor_keep(batch["n_fix"], N)
+    # A fastening disc pins position and normal only -- whether it sits on an
+    # outline is exactly what we are asking. A point committed by an earlier
+    # round of the loop is different: its class is the reason it was committed,
+    # so its fields are pinned too. Without this the loop can tell the
+    # generator where a point is but not that it is an outline point.
+    n_anc = batch.get("n_anchor")
+    keep_cls = (keep & ~anchor_keep(n_anc, N)) if n_anc is not None         else torch.zeros_like(keep)
     if anchor:
-        # the disc fixes position and normal; the FIELDS are not known at
-        # inference (that is the whole point), so they stay generated
         pinned = torch.where(keep[..., None], x1, xt)
-        xt = torch.cat([pinned[..., :6], xt[..., 6:]], dim=-1)
+        fld = torch.where(keep_cls[..., None], x1[..., 6:], xt[..., 6:])
+        xt = torch.cat([pinned[..., :6], fld], dim=-1)
     drop = (torch.rand(B, device=x1.device) < p_drop) if (p_drop > 0 and model.training) else None
     v = model(xt, t, batch["cond"], drop)
     target = x1 - x0
@@ -424,20 +625,49 @@ def flow_loss(model, batch, anchor: bool, p_drop: float, w_normal: float = 0.2,
     err = (err * w).mean(-1)
     if anchor:
         geo = ((v[..., :6] - target[..., :6]) ** 2 * w[:6]).mean(-1)
-        fld = ((v[..., 6:] - target[..., 6:]) ** 2 * w[6:]).mean(-1)
+        fldl = ((v[..., 6:] - target[..., 6:]) ** 2 * w[6:]).mean(-1)
         live = (~keep).float()
-        return ((geo * live).sum() / live.sum().clamp(min=1)) + fld.mean()
+        live_f = (~keep_cls).float()
+        out = ((geo * live).sum() / live.sum().clamp(min=1)
+               + (fldl * live_f).sum() / live_f.sum().clamp(min=1))
+        if w_repel > 0:
+            # Where the sample would land if the flow were followed from here.
+            #
+            # This term is only defined once the model already puts points
+            # roughly on the sheet. It is a RELATIVE spread -- standard
+            # deviation over mean -- of a Gaussian density whose width is a
+            # couple of point spacings. From a random initialisation the
+            # predicted points scatter past the part itself, every one of them
+            # is isolated at that width, the mean density goes to zero and the
+            # ratio explodes: measured 39.6 against 0.017 for a trained model,
+            # a factor of 2300, and training diverged (1.15 -> 0.72 without the
+            # term, 2.80 -> 3.59 with it). Gating by t does not rescue it, since
+            # early in training every t is in that regime.
+            #
+            # So it is used only when fine-tuning from trained weights, which is
+            # how every generator run here starts. stage_smoke, which trains
+            # from scratch, switches it off.
+            pred = xt[..., :3] + (1 - t[:, None, None]) * v[..., :3]
+            out = out + w_repel * repulsion(pred, x1[..., :3], live)
+        return out
     return err.mean()
 
 
 @torch.no_grad()
-def sample(model, cond, fix_xyz, steps=48, gen=None, scale=1.0, n_pts=256):
+def sample(model, cond, fix_xyz, steps=48, gen=None, scale=1.0, n_pts=256,
+           fix_fld=None):
     dev = cond.device
     B = cond.shape[0]
     x = torch.randn(B, n_pts, model.ch, device=dev, generator=gen)
     n_fix = fix_xyz.shape[1] if fix_xyz is not None else 0
+    def pin(z):
+        z[:, :n_fix, :6] = fix_xyz
+        if fix_fld is not None:            # NaN = class unknown, leave it free
+            z[:, :n_fix, 6:] = torch.where(torch.isnan(fix_fld),
+                                           z[:, :n_fix, 6:], fix_fld)
+        return z
     if n_fix:
-        x[:, :n_fix, :6] = fix_xyz        # position and normal; fields are free
+        x = pin(x)
     dt = 1.0 / steps
     for k in range(steps):
         t = torch.full((B,), k * dt, device=dev)
@@ -449,8 +679,41 @@ def sample(model, cond, fix_xyz, steps=48, gen=None, scale=1.0, n_pts=256):
             v = model(x, t, cond)
         x = x + v * dt
         if n_fix:
-            x[:, :n_fix, :6] = fix_xyz
+            x = pin(x)
     return x
+
+
+@torch.no_grad()
+def refresh_self_bank(model, dataset, parts, device, steps=48, cfg=2.0,
+                      n_pts=512, limit=0, seed=0):
+    """Fill the dataset's bank with the model's own clouds, in frame units.
+
+    Generating inside the training loop would cost a full sample per item, so a
+    bank is built every few epochs and reused. It goes stale as the model
+    improves, which is the point of refreshing rather than doing it once.
+    """
+    was = model.training
+    model.eval()
+    # A rotating window rather than the same head of the list: every entry is
+    # freshly generated, and over len(parts)/limit epochs the whole training set
+    # gets its turn at being self-conditioned. Cleared first so nothing stale
+    # survives.
+    if limit and limit < len(parts):
+        off = (seed * limit) % len(parts)
+        sel = [parts[(off + i) % len(parts)] for i in range(limit)]
+    else:
+        sel = parts
+    dataset.self_bank.clear()
+    for i, p in enumerate(sel):
+        xyz, nrm, fld = generate(model, p, device, steps, seed + i, cfg, n_pts,
+                                 True, per_fix=1)
+        f, n = to_frame(xyz, nrm, fastener_frame(p))
+        fl = fld.copy()
+        fl[:, :2] /= fastener_frame(p)[2]           # fields come back in mm
+        dataset.self_bank[p.name] = np.concatenate(
+            [f, n, fl], axis=1).astype(np.float64)
+    model.train(was)
+    return len(sel)
 
 
 def to_world(x, part):
@@ -464,8 +727,10 @@ def to_world(x, part):
     world, normal = from_frame(xyz, nrm, frame)
     if x.shape[-1] <= 6:                     # a pre-field model
         return world, normal, None
-    fields = np.clip(x[..., 6:].cpu().numpy().astype(np.float64),
-                     0.0, FIELD_CAP) * frame[2]
+    raw = x[..., 6:].cpu().numpy().astype(np.float64)
+    fields = np.concatenate(
+        [np.clip(raw[..., :2], 0.0, FIELD_CAP) * frame[2], raw[..., 2:]],
+        axis=-1)                      # last column stays the raw 0/1 flag
     return world, normal, fields
 
 
@@ -501,6 +766,7 @@ def stage_train(args, out: pathlib.Path) -> None:
     md = pathlib.Path(args.dataset) / "parts"
     tl = DataLoader(MeshDataset(train_parts, md, args.points, True,
                                 anchor_per_fix=args.anchor_per_fix,
+                                outlier_rate=args.outlier_rate,
                                 mask_rate=args.mask_rate, even=bool(args.even)),
                     batch_size=args.batch_size, shuffle=True, drop_last=True)
     vl = DataLoader(MeshDataset(val_parts, md, args.points, False, 555,
@@ -534,11 +800,28 @@ def stage_train(args, out: pathlib.Path) -> None:
         probe_gt[p.name] = d["xyz"] * np.maximum(d["env_hi"] - d["env_lo"], 1e-9)             + d["env_lo"]
     t_start = time.time()
     for epoch in range(start, args.epochs + 1):
+        # started before the bank refresh, which costs a full sample per part
+        # and is the dominant cost when it runs -- timing only the training
+        # portion reported 55s for epochs that actually took 27 minutes
+        t0 = time.time()
         tl.dataset.set_epoch(epoch)
+        if args.self_rate > 0 and epoch >= args.self_warmup:
+            if (epoch - args.self_warmup) % args.self_every == 0:
+                k = refresh_self_bank(model, tl.dataset, train_parts, args.device,
+                                      steps=args.self_steps, n_pts=args.points,
+                                      limit=args.self_bank, seed=epoch)
+                print(f"  self-bank refreshed: {k} parts", flush=True)
+            # ramp in, never to 1.0: the model still has to learn to exploit a
+            # clean pin when it gets one
+            span = max(args.epochs - args.self_warmup, 1)
+            tl.dataset.self_rate = args.self_rate * min(
+                1.0, (epoch - args.self_warmup) / (0.5 * span))
         model.train()
-        t0, tot, n = time.time(), 0.0, 0
+        tot, n = 0.0, 0
         for b in tl:
-            loss = flow_loss(model, to_device(b, args.device), args.anchor, args.cfg_drop)
+            loss = flow_loss(model, to_device(b, args.device), args.anchor,
+                             args.cfg_drop, w_normal=args.w_normal,
+                             w_repel=args.w_repel)
             opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -555,7 +838,9 @@ def stage_train(args, out: pathlib.Path) -> None:
             with torch.no_grad():
                 torch.manual_seed(1234)
                 row["val"] = float(np.mean(
-                    [float(flow_loss(model, to_device(b, args.device), args.anchor, 0.0))
+                    [float(flow_loss(model, to_device(b, args.device), args.anchor,
+                                     0.0, w_normal=args.w_normal,
+                                     w_repel=args.w_repel))
                      for b in vl]))
                 torch.manual_seed(epoch)
             ck = {"model": model.state_dict(), "opt": opt.state_dict(),
@@ -602,13 +887,25 @@ def generate(model, part, device, steps, seed, scale, n_pts, anchor=True,
         dp, dn = fastener_disc(part, per_fix, rng=np.random.default_rng(seed))
         f, fn = to_frame(dp, dn, fastener_frame(part))
         rows.append(np.concatenate([f, fn], axis=1))
+    nf = model.ch - 6                    # this model's field width, not CH
+    flds = [np.full((len(rows[0]), nf), np.nan)] if rows else []
     if known is not None and len(known):
-        # any point the caller already knows, in mm with its normal
-        kf, kn = to_frame(known[:, :3], known[:, 3:6], fastener_frame(part))
+        # any point the caller already knows, in mm with its normal, and -- if
+        # the caller committed it because of what it is -- its class fields
+        frame = fastener_frame(part)
+        kf, kn = to_frame(known[:, :3], known[:, 3:6], frame)
         rows.append(np.concatenate([kf, kn], axis=1))
+        f = np.full((len(known), nf), np.nan)
+        if known.shape[1] >= 6 + nf:
+            f = np.concatenate(
+                [np.clip(known[:, 6:8] / frame[2], 0.0, FIELD_CAP),
+                 known[:, 8:6 + nf]], axis=1)
+        flds.append(f)
+    ff = None
     if rows:
         fx = torch.from_numpy(np.concatenate(rows).astype(np.float32))[None].to(device)
-    x = sample(model, cond, fx, steps, gen, scale, n_pts)
+        ff = torch.from_numpy(np.concatenate(flds).astype(np.float32))[None].to(device)
+    x = sample(model, cond, fx, steps, gen, scale, n_pts, fix_fld=ff)
     return to_world(x[0], part)
 
 
@@ -734,6 +1031,14 @@ def check_no_envelope_leak(parts) -> None:
 
 
 def stage_smoke(args, out: pathlib.Path) -> None:
+    # This stage trains from a random initialisation, which is the one regime
+    # the density term is not defined in (see flow_loss). Everything else is
+    # still exercised; the term has its own check in repulsion_demo().
+    if args.w_repel:
+        print("  note: density term off for the smoke stage (trains from "
+              "scratch; the term needs weights that already place points "
+              "roughly on the sheet)")
+        args.w_repel = 0.0
     train_parts, _ = build_splits(args)
     parts = train_parts[:24]
     check_no_envelope_leak(parts)
@@ -748,7 +1053,9 @@ def stage_smoke(args, out: pathlib.Path) -> None:
     for epoch in range(8):
         ds.set_epoch(epoch)
         for b in loader:
-            loss = flow_loss(model, to_device(b, args.device), args.anchor, args.cfg_drop)
+            loss = flow_loss(model, to_device(b, args.device), args.anchor,
+                             args.cfg_drop, w_normal=args.w_normal,
+                             w_repel=args.w_repel)
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -815,9 +1122,29 @@ def main() -> None:
     # 1 = pin just the fastening points. The 8-per-fastener disc converged
     # faster early but ended 0.76mm worse over 40 parts, so 1 is the default.
     ap.add_argument("--anchor-per-fix", type=int, default=1)
+    ap.add_argument("--outlier-rate", type=float, default=0.0,
+                    help="fraction of items that get off-the-part points "
+                         "injected, so the outlier flag has something to learn")
+    ap.add_argument("--self-rate", type=float, default=0.0,
+                    help="final fraction of masked items whose pinned rows come "
+                         "from the model's own output instead of the truth")
+    ap.add_argument("--self-warmup", type=int, default=10,
+                    help="epoch to start scheduled sampling")
+    ap.add_argument("--self-every", type=int, default=10,
+                    help="epochs between regenerating the bank")
+    ap.add_argument("--self-steps", type=int, default=48,
+                    help="sampling steps for the bank clouds; fewer is cheaper "
+                         "but moves them away from what inference produces")
+    ap.add_argument("--self-bank", type=int, default=600,
+                    help="parts in the bank (0 = all); a sample each is costly")
     ap.add_argument("--mask-rate", type=float, default=0.5,
                     help="fraction of training items that also pin a random set "
                          "of known surface points (masked / inpainting training)")
+    ap.add_argument("--w-normal", type=float, default=0.2,
+                    help="loss weight on the normals (position is 1.0)")
+    ap.add_argument("--w-repel", type=float, default=0.0,
+                    help="weight on the term that keeps generated points from "
+                         "landing on top of each other")
     ap.add_argument("--cfg-drop", type=float, default=0.1)
     # swept at epoch 65: wire 14.3 / 13.2 / 12.2 / 13.8 / 15.0mm at scale
     # 1.0 / 1.5 / 2.0 / 3.0 / 4.0, and span ratio 0.92 -> 1.06 across it.
