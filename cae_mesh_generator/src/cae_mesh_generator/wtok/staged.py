@@ -197,6 +197,9 @@ def curvature_field(P, N, k=14):
     return a.mean(1)
 
 
+CORNER_T = 0.0          # bend_tok: corner tokens at this many thicknesses; 0 = dense
+
+
 def stage_target(part, mesh_dir, stage: str, n_pts: int, rng):
     """The true point set for one stage, in the fastener frame.
 
@@ -225,10 +228,13 @@ def stage_target(part, mesh_dir, stage: str, n_pts: int, rng):
         return curves_to_tokens(cur, frame, n_tok=n_pts)[0]
     if stage == "bend_tok":
         from .bendlines import mesh_bend_lines
+        from .frame import thickness_units
         cur = mesh_bend_lines(part, classes=("bend_line", "crease"))
         if not cur:
             return None
-        return curves_to_tokens(cur, frame, n_tok=n_pts)[0]
+        # corner tokens at a thickness-scaled tolerance (0 = dense tokens)
+        tol = CORNER_T * thickness_units(part, frame) * frame[2]
+        return curves_to_tokens(cur, frame, n_tok=n_pts, corner_mm=tol)[0]
     if stage == "outline_multi":
         from .frame import multi_frame_target
         return multi_frame_target(part, frame)
@@ -1173,8 +1179,9 @@ def train(args):
     # for a positional encoding to encode.
     ds = StageDataset(train_parts, md, args.stage, base_seed=7,
                       outlier_rate=args.outlier_rate, cloud_bank=args.cloud_bank)
-    global W_D1, W_D2
+    global W_D1, W_D2, CORNER_T
     W_D1, W_D2 = float(args.w_d1), float(args.w_d2)
+    CORNER_T = float(getattr(args, "corner_t", 0.0))
     if W_D1 or W_D2:
         print(f"relational loss: D1 {W_D1}  D2 {W_D2}", flush=True)
     ds.cloud_drop = args.cloud_drop
@@ -1298,6 +1305,9 @@ def main():
     ap.add_argument("--cloud-drop", type=float, default=0.0,
                     help="probability of withholding the cloud during training, "
                          "so the model does not learn to depend on it")
+    ap.add_argument("--corner-t", type=float, default=0.0,
+                    help="bend_tok: corner tokens at this many sheet thicknesses "
+                         "of chordal tolerance (0 = dense resampled tokens)")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     train(ap.parse_args())

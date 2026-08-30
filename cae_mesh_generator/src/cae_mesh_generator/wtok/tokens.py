@@ -44,7 +44,31 @@ def _resample(c, n):
     return np.stack([np.interp(w, s, c[:, d]) for d in range(3)], axis=1)
 
 
-def curves_to_tokens(curves, frame=None, n_tok: int = TOK_N, min_pts: int = 3):
+def _simplify(c, tol):
+    """Douglas-Peucker: the fewest vertices that keep the polyline within `tol`."""
+    keep = np.zeros(len(c), bool)
+    keep[[0, -1]] = True
+    stack = [(0, len(c) - 1)]
+    while stack:
+        a, b = stack.pop()
+        if b - a < 2:
+            continue
+        seg = c[b] - c[a]
+        L = np.linalg.norm(seg)
+        w = c[a + 1:b] - c[a]
+        if L < 1e-9:
+            d = np.linalg.norm(w, axis=1)
+        else:
+            d = np.linalg.norm(w - np.outer(w @ seg / L, seg / L), axis=1)
+        i = int(np.argmax(d))
+        if d[i] > tol:
+            keep[a + 1 + i] = True
+            stack += [(a, a + 1 + i), (a + 1 + i, b)]
+    return c[keep]
+
+
+def curves_to_tokens(curves, frame=None, n_tok: int = TOK_N, min_pts: int = 3,
+                     corner_mm: float = 0.0):
     """Lay curves out as tokens, sharing the budget by arc length.
 
     A long curve gets more tokens than a short one because it needs them, not
@@ -52,6 +76,16 @@ def curves_to_tokens(curves, frame=None, n_tok: int = TOK_N, min_pts: int = 3):
     budget can give `min_pts` each, the shortest are dropped and the caller can
     see it in the returned count -- that is a capacity limit, and it is reported
     rather than hidden.
+
+    `corner_mm` > 0 switches to CORNER tokens: each curve is reduced to the
+    fewest vertices that keep it within that tolerance, and the tokens are
+    those vertices. A straight fold is then two tokens and cannot zigzag, the
+    way an outline edge cannot -- the property sits in the representation.
+    Measured on the dense tokens the generator turned 9026deg per part in
+    excess against the teacher's 759deg. How many vertices a curve gets is
+    whatever its shape needs.
+    ponytail: straight segments between corners; add an arc bulge (as the
+    outline frame has) when bead ridges need true arcs for B-rep.
     """
     from .meshgen import to_frame
 
@@ -62,20 +96,25 @@ def curves_to_tokens(curves, frame=None, n_tok: int = TOK_N, min_pts: int = 3):
     order = np.argsort(-L)
     cur = [cur[i] for i in order]
     L = L[order]
-    keep = min(len(cur), n_tok // min_pts)
-    cur, L = cur[:keep], L[:keep]
-
-    share = L / max(L.sum(), 1e-9)
-    n = np.maximum(min_pts, np.floor(share * n_tok).astype(int))
-    while n.sum() > n_tok:                       # trim the longest first
-        n[int(np.argmax(n))] -= 1
+    if corner_mm > 0:
+        cur = [_simplify(c, corner_mm) for c in cur]
+        n = np.array([len(c) for c in cur])
+        while n.sum() > n_tok and len(cur) > 1:  # over capacity: drop the shortest
+            cur, n = cur[:-1], n[:-1]
+    else:
+        keep = min(len(cur), n_tok // min_pts)
+        cur, L = cur[:keep], L[:keep]
+        share = L / max(L.sum(), 1e-9)
+        n = np.maximum(min_pts, np.floor(share * n_tok).astype(int))
+        while n.sum() > n_tok:                   # trim the longest first
+            n[int(np.argmax(n))] -= 1
     x = np.zeros((n_tok, TOK_CH))
     x[:, UNUSED] = 1.0
     at = 0
     for c, k in zip(cur, n):
         closed = bool(np.linalg.norm(c[0] - c[-1]) < 1e-3)
         # canonical traversal: start at the end nearer the frame origin
-        p = _resample(c, int(k))
+        p = c if corner_mm > 0 else _resample(c, int(k))
         if not closed and np.linalg.norm(p[-1]) < np.linalg.norm(p[0]):
             p = p[::-1]
         if frame is not None:

@@ -145,6 +145,61 @@ def seat_project(x, frame, seat_pts, seat_axes, seat_r, margin=1.0):
     return x
 
 
+def bend_score(curves, outline, u, t_mm, attach_t: float = 2.0):
+    """The same question for bend lines: is every feature explainable?
+
+    `curves`: polylines in frame units (what tokens_to_curves returns);
+    `outline`: the outline polyline in the same units.
+
+      excess    turning a curve has beyond the net rotation of its tangent
+                (a straight fold turns 0; a smooth bead ridge turns exactly
+                its end-to-end angle; zigzag turns without going anywhere).
+                Closed curves owe 360. Degrees, summed over the part.
+      dangling  open ends that reach neither the outline nor another curve
+                within `attach_t` thicknesses -- a bend that ends in the
+                middle of a panel has no reason to exist.
+      curves    how many came out. An observation, not a target.
+    """
+    if not curves:
+        return None
+    tol = attach_t * t_mm / u
+    allpts = np.concatenate(curves)
+    excess = 0.0
+    ends_open, ends_dangling = 0, 0
+    for c in curves:
+        d = np.diff(c, axis=0)
+        L = np.linalg.norm(d, axis=1)
+        T = d[L > 1e-9] / L[L > 1e-9, None]
+        if len(T) < 2:
+            continue
+        turn = np.degrees(np.arccos(np.clip(np.einsum("ij,ij->i", T[:-1], T[1:]), -1, 1)))
+        closed = np.linalg.norm(c[0] - c[-1]) < 1e-6
+        if closed:
+            excess += max(turn.sum() - 360.0, 0.0)
+        else:
+            net = np.degrees(np.arccos(np.clip(T[0] @ T[-1], -1, 1)))
+            excess += max(turn.sum() - net, 0.0)
+            for e in (c[0], c[-1]):
+                ends_open += 1
+                near_out = cKDTree(outline).query(e)[0] < tol
+                # another curve: any point closer than tol that is not this curve's
+                others = allpts[np.linalg.norm(allpts - e, axis=1) < tol]
+                near_curve = len(others) > len(c[np.linalg.norm(c - e, axis=1) < tol])
+                if not (near_out or near_curve):
+                    ends_dangling += 1
+    return {"excess": float(excess),
+            "dangling": ends_dangling / ends_open if ends_open else 0.0,
+            "curves": len(curves)}
+
+
+def bend_rank(curve_sets, outline, u, t_mm):
+    """Order draws: fewest dangling ends, then least excess turning."""
+    sc = [bend_score(c, outline, u, t_mm) for c in curve_sets]
+    order = sorted(range(len(sc)), key=lambda i: (
+        (1, 0.0, 0.0) if sc[i] is None else (0, sc[i]["dangling"], sc[i]["excess"])))
+    return order, sc
+
+
 def demo():
     """Teacher must pass tier 1 and sit at the seat; a squeezed copy must not."""
     import pathlib
