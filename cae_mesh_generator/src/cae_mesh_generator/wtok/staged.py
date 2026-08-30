@@ -945,7 +945,12 @@ def flow_loss(model, batch, p_drop: float = 0.0, n_pin: int = 0):
 
 @torch.no_grad()
 def sample(model, cond, fix, ctx, n_pts, steps=24, scale=2.0, gen=None,
-           pin=None):
+           pin=None, constrain=None):
+    """`constrain(x1_hat) -> x1_hat` is applied to the model's own prediction
+    of the endpoint at every step, and the velocity re-aimed at the constrained
+    endpoint. It is for input-derived hard constraints (a fastener seat the
+    outline may not cut), like `pin`: nothing is added to what is learned, and
+    the model keeps adjusting the neighbours of what was moved."""
     B = cond.shape[0]
     x = torch.randn(B, n_pts, model.ch, device=cond.device, generator=gen)
     if pin is not None:
@@ -959,6 +964,10 @@ def sample(model, cond, fix, ctx, n_pts, steps=24, scale=2.0, gen=None,
             v = v + scale * (model(x, t, cond, fix, ctx, keep) - v)
         else:
             v = model(x, t, cond, fix, ctx)
+        if constrain is not None:
+            rem = 1.0 - i * dt
+            x1 = constrain(x + v * rem)
+            v = (x1 - x) / rem
         x = x + v * dt
         if pin is not None:
             x[:, :pin.shape[1]] = pin

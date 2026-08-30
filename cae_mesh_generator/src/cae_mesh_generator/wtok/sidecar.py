@@ -44,7 +44,10 @@ SPEC_KEYS = ("thickness_mm", "half_width_mm", "bend_radius_mm",
 SPEC_SCALE = np.array([2.0, 0.02, 0.05, 0.03, 0.03, 0.03, 0.1])
 
 
-_SPEC_FILE = _ROOT / "runs" / "wtok_synth" / "spec_vectors.json"
+import os
+# Kaggle sets WTOK_SPEC_FILE to the table inside its read-only input dataset
+_SPEC_FILE = pathlib.Path(os.environ.get(
+    "WTOK_SPEC_FILE", _ROOT / "runs" / "wtok_synth" / "spec_vectors.json"))
 _spec_table = None
 
 

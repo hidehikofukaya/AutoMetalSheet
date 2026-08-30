@@ -74,12 +74,88 @@ def outline_edges(part):
     return out
 
 
-def frame_target(part, frame, slots: int = EDGE_SLOTS):
+# Merge tolerance in sheet thicknesses. 1.0t was measured first (30 val parts):
+# edges 18 -> 18, excess turn 191 -> 188deg, slivers 10% -> 0%, but fastener
+# seat ratio 1.009 -> 0.963, because the teacher hugs the seat at exactly its
+# radius and flattening a sub-thickness arc there cuts into it. The teacher's
+# excess turning is real concavity, not tessellation noise, so there is no
+# parsimony to recover at a coarser tolerance -- only slivers to remove.
+CANON_TOL_T = 0.25
+CANON_TURN_DEG = 3.0    # below this a junction is tangent, not a corner
+
+
+def thickness_units(part, frame):
+    """Sheet thickness in frame units; falls back to 1.5mm without a spec."""
+    from .sidecar import SPEC_KEYS, SPEC_SCALE, load_spec
+    sp = load_spec(part)
+    i = SPEC_KEYS.index("thickness_mm")
+    t = float(sp[i] / SPEC_SCALE[i]) if sp is not None else 0.0
+    return (t or 1.5) / frame[2]
+
+
+def _merge_primitives(p, mid, is_arc, tol, turn_deg=CANON_TURN_DEG):
+    """Reduce the extractor's split to the minimal primitive decomposition.
+
+    The extractor breaks the outline where the B-rep breaks its faces, not where
+    the design has a corner: 60% of its "arcs" sit within 0.35mm of their chord
+    and only 15% meet their neighbours tangentially (KB 16.2). Geometry alone
+    decides what to merge, at a tolerance of one sheet thickness -- the mesh
+    cannot see a deviation smaller than the plate:
+
+      * an edge shorter than the tolerance is a sliver: its corner goes
+      * two lines meeting at under `turn_deg` are one line
+      * two arcs on the same circle meeting tangentially are one arc, and the
+        shared corner -- which lies on both -- becomes the new midpoint
+      * an arc whose sagitta is under the tolerance is a line
+
+    A line meeting an arc tangentially is left alone: that is a fillet, and the
+    corner between them is real. Nothing is counted or classified.
+    """
+    from .codec import circle_through
+
+    p, mid, is_arc = p.copy(), mid.copy(), is_arc.copy()
+    chord = 0.5 * (p + np.roll(p, -1, 0))
+    flat = np.linalg.norm(mid - chord, axis=1) < tol
+    is_arc = is_arc * (~flat)
+
+    changed = True
+    while changed and len(p) > 3:
+        changed = False
+        n = len(p)
+        for j in range(n):
+            i = (j - 1) % n
+            a, b, c = p[i], p[j], p[(j + 1) % n]
+            t1, t2 = b - a, c - b
+            L1, L2 = np.linalg.norm(t1), np.linalg.norm(t2)
+            drop = False
+            if L2 < tol:                                  # sliver edge j
+                drop = True
+            elif L1 > 1e-9 and L2 > 1e-9:
+                turn = np.degrees(np.arccos(np.clip(t1 @ t2 / (L1 * L2), -1, 1)))
+                if turn < turn_deg:
+                    if is_arc[i] < 0.5 and is_arc[j] < 0.5:
+                        drop = True
+                    elif is_arc[i] > 0.5 and is_arc[j] > 0.5:
+                        c1 = circle_through(a, mid[i], b)
+                        c2 = circle_through(b, mid[j], c)
+                        if (c1 and c2 and np.linalg.norm(c1[0] - c2[0]) < tol
+                                and abs(c1[2] - c2[2]) < tol):
+                            mid[i] = b
+                            drop = True
+            if drop:
+                p, mid, is_arc = (np.delete(p, j, 0), np.delete(mid, j, 0),
+                                  np.delete(is_arc, j, 0))
+                changed = True
+                break
+    return p, mid, is_arc
+
+
+def frame_target(part, frame, slots: int = EDGE_SLOTS, canonical: bool = True):
     """(slots, FRAME_CH) in the fastener frame, canonicalised, zero-padded."""
     from .meshgen import to_frame
 
     ed = outline_edges(part)
-    if ed is None or len(ed) > slots:
+    if ed is None:
         return None
     corners = np.stack([c for c, _, _ in ed])
     is_arc = np.array([a for _, _, a in ed], float)
@@ -87,6 +163,11 @@ def frame_target(part, frame, slots: int = EDGE_SLOTS):
 
     p, _ = to_frame(corners, np.zeros_like(corners), frame)
     mid, _ = to_frame(mids, np.zeros_like(mids), frame)
+    if canonical:
+        p, mid, is_arc = _merge_primitives(
+            p, mid, is_arc, CANON_TOL_T * thickness_units(part, frame))
+    if len(p) > slots:
+        return None
     p, mid, is_arc = _canonicalise(p, mid, is_arc)
 
     chord = 0.5 * (p + np.roll(p, -1, 0))     # edge i runs corner i -> i+1
