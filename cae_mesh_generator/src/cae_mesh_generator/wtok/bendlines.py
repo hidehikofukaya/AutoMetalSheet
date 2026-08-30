@@ -209,3 +209,126 @@ def demo():
 
 if __name__ == "__main__":
     demo()
+
+
+def face_properties(part, root=None):
+    """Per-face geometry the extractor already records and convert.py throws away.
+
+    Two of these are ground truth for quantities that are mechanically meaningful
+    and not otherwise available:
+
+      face_geo      planar / single_curved / double_curved
+                    Sheet metal is made by isometric bending, and Gauss's
+                    theorema egregium then forces K=0 on the midsurface, so a
+                    face is planar or single_curved. A double_curved face is
+                    where that breaks -- a bead's corner sphere, formed with
+                    stretch. This is the developability label, exactly.
+      face_radius   the bend radius of a curved face. With the thickness it
+                    gives R/t, the one absolute pass condition available in a
+                    task whose distance-to-truth floor is 14.9mm.
+
+    Estimating either from a point cloud does not work: measured over 30 parts,
+    |Gaussian curvature| appears to find bend lines at AUC 0.896, but a
+    developable surface has K=0 everywhere and what the estimator is picking up
+    is fitting residual correlated with the larger principal curvature. The
+    extractor's label is not an estimate.
+    """
+    d = _wireframe(getattr(part, "name", str(part)), root)
+    if d is None:
+        return {}
+    return {
+        "face_geo": d.get("face_geo") or [],
+        "face_types": d.get("face_types") or [],
+        "face_radius_mm": d.get("face_radius_mm") or [],
+        "face_wall": d.get("face_wall") or [],
+        "n_faces": d.get("n_faces", 0),
+        "clusters": d.get("clusters") or [],
+    }
+
+
+def edge_face_context(part, root=None):
+    """Each mesh bend line with the faces it separates and their radii.
+
+    An edge in the extraction records the pair of faces it lies between, so a
+    curve carries the geometry of both sides without any estimation: which of
+    them is planar, and what radius the curved one has.
+    """
+    d = _wireframe(getattr(part, "name", str(part)), root)
+    if d is None:
+        return []
+    out = []
+    for e in d["edges"]:
+        if e.get("type") not in MESH_CLASSES:
+            continue
+        poly = np.asarray(e["polyline"], float)
+        if len(poly) < 2:
+            continue
+        out.append({
+            "polyline": poly,
+            "type": e["type"],
+            "face_types": tuple(e.get("face_types") or ()),
+            "face_wall": tuple(e.get("face_wall") or ()),
+            "length_mm": e.get("length_mm"),
+            "closed": bool(e.get("closed", False)),
+        })
+    return out
+
+
+def developability(part, root=None):
+    """What share of the part is developable, by face count and by type.
+
+    Reported rather than assumed: the textbook statement that sheet metal is
+    developable is an approximation, and the fraction that is not is the size of
+    the error a developable-by-construction representation would make.
+    """
+    fp = face_properties(part, root)
+    geo = fp.get("face_geo") or []
+    if not geo:
+        return {}
+    c = collections.Counter(geo)
+    r = [x for x in (fp.get("face_radius_mm") or []) if x]
+    return {
+        "n_faces": len(geo),
+        "planar": c.get("planar", 0),
+        "single_curved": c.get("single_curved", 0),
+        "double_curved": c.get("double_curved", 0),
+        "developable_frac": (c.get("planar", 0) + c.get("single_curved", 0)) / len(geo),
+        "radius_min_mm": float(min(r)) if r else None,
+        "radius_median_mm": float(np.median(r)) if r else None,
+    }
+
+
+def face_demo():
+    """What the discarded fields actually contain, over many parts."""
+    import pathlib as _pl
+
+    from .dataset_curve import load_curve_parts
+
+    R = _pl.Path(__file__).resolve().parents[4]
+    have = {p.stem for p in (R / "runs" / "mesh_synth" / "parts").glob("*.npz")}
+    parts = [p for p in load_curve_parts(R / "runs" / "wtok_synth")
+             if p.name in have][:200]
+    rows, radii, pairs = [], [], collections.Counter()
+    for p in parts:
+        d = developability(p)
+        if d:
+            rows.append(d)
+            if d["radius_min_mm"]:
+                radii.append(d["radius_min_mm"])
+        for e in edge_face_context(p)[:400]:
+            pairs[e["face_types"]] += 1
+    k = lambda f: np.array([r[f] for r in rows], float)
+    print(f"{len(rows)} parts")
+    print(f"  faces per part          median {np.median(k('n_faces')):5.0f}")
+    print(f"  planar                  median {np.median(k('planar')):5.0f}")
+    print(f"  single_curved           median {np.median(k('single_curved')):5.0f}")
+    print(f"  double_curved           median {np.median(k('double_curved')):5.0f}")
+    print(f"  DEVELOPABLE fraction    median {np.median(k('developable_frac')):5.3f}"
+          f"   min {k('developable_frac').min():.3f}")
+    print(f"  smallest bend radius    median {np.median(radii):5.2f}mm"
+          f"   min {min(radii):.2f}mm")
+    print(f"\n  most common face pairs an edge separates:")
+    for kk, v in pairs.most_common(5):
+        print(f"    {str(kk):<26}{v:>7}")
+    assert np.median(k("developable_frac")) > 0.5
+    print("ok")

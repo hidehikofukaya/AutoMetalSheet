@@ -364,6 +364,7 @@ class StageDataset(Dataset):
                     self.cloud_bank.append(c)
         self.cloud_drop = 0.0
         self.surf_curv = False
+        self.use_spec = False
         self.n_context = n_context
         self.outlier_rate = outlier_rate
         self.cache: dict = {}
@@ -411,6 +412,20 @@ class StageDataset(Dataset):
             # only "this is not part of the shape" the frame has.
             fx, fn = fastener_disc(p, GUARD_PER_FIX, rng=rng)
             f, fd = to_frame(fx, fn, fastener_frame(p))
+            cond = frame_cond_rows(p)
+            if self.use_spec:
+                # The design spec, as one extra condition row. It is the
+                # generator's own input, so it is not derivable from the
+                # fastening points -- the one class of information KB 12 does
+                # not rule out. Measured, it cannot place a part but it does
+                # predict the scalars the fasteners leave open (perimeter R^2
+                # 0.205 -> 0.356, width 0.281 -> 0.419).
+                from .sidecar import load_spec
+                sp = load_spec(p)
+                if sp is not None:
+                    row = np.zeros((1, cond.shape[1]), np.float32)
+                    row[0, :min(len(sp), cond.shape[1])] = sp[:cond.shape[1]]
+                    cond = np.concatenate([cond, row])
             ctx, n_ctx = np.zeros((1, ch), np.float32), 0
             if self.stage in ("bend_frame", "feature", "bend_tok", "bend_delta"):
                 # the OUTLINE frame is what stage 2 reads. Its slots are edges,
@@ -476,7 +491,7 @@ class StageDataset(Dataset):
                                                            x.astype(np.float32))),
                 "ctx": torch.from_numpy(np.ascontiguousarray(ctx)),
                 "n_ctx": n_ctx,
-                "cond": torch.from_numpy(frame_cond_rows(p)),
+                "cond": torch.from_numpy(cond),
                 "fix": torch.from_numpy(
                     np.concatenate([f, fd], 1).astype(np.float32)),
             }
@@ -988,9 +1003,11 @@ def train(args):
                       outlier_rate=args.outlier_rate, cloud_bank=args.cloud_bank)
     ds.cloud_drop = args.cloud_drop
     ds.surf_curv = bool(args.surf_curv)
+    ds.use_spec = vs_use = bool(args.use_spec)
     vs = StageDataset(val_parts, md, args.stage, base_seed=555,
                       cloud_bank=args.cloud_bank)
     vs.surf_curv = bool(args.surf_curv)
+    vs.use_spec = bool(args.use_spec)
     dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
     model = StageFlow(args.dim, args.layers, args.heads, cross, ordered,
                       ch=STAGE_CH.get(args.stage, CH)).to(args.device)
@@ -1085,6 +1102,9 @@ def main():
     ap.add_argument("--cloud-bank", default="",
                     help="directory of precomputed bulk-generator clouds to "
                          "condition on (one <part>.npy of (N,6) per part)")
+    ap.add_argument("--use-spec", action="store_true",
+                    help="add the design spec (thickness, half width, bend "
+                         "radius, fold slacks) as a condition row")
     ap.add_argument("--surf-curv", action="store_true",
                     help="ORACLE: condition on the true surface and its "
                          "curvature field, to bound what one can buy")
