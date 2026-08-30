@@ -856,6 +856,38 @@ class StageFlow(nn.Module):
 W_CH = None      # built lazily: position 1.0, direction 0.2, flag 0.5
 
 
+# How much the loss weighs RELATIONS between slots against the slots themselves.
+# The plain loss is a sum over independent slots and channels, so nothing in it
+# compares slot i with slot i+1: measured over 270 draws, its correlation with
+# the turn-angle error is +0.06 and with is_arc agreement -0.33. Driving it down
+# does not make the structure right because it never looked at the structure.
+#
+# A finite difference along the ring is LINEAR, so applying it to both the
+# prediction and the flow-matching target leaves a valid flow-matching loss --
+# the same argument that let a position-space loss be written for displacement
+# tokens. D1 is the edge vector (how slot i relates to i+1), D2 is the turn
+# (how the edge before relates to the edge after). Nothing here is a designed
+# geometric feature; it is the same error, measured on relations instead of on
+# positions alone.
+W_D1 = 0.0      # set from --w-d1 / --w-d2; default off so nothing changes
+W_D2 = 0.0      # for runs that do not ask for it
+
+
+def _ring_diff(z, live):
+    """First and second differences around the ring, over live slots only.
+
+    Dead slots must not enter: a difference across the boundary between the
+    used and unused part of the tensor is not a relation in the part.
+    """
+    m = live.unsqueeze(-1).float()
+    z = z * m
+    d1 = torch.roll(z, -1, dims=1) - z
+    k1 = m * torch.roll(m, -1, dims=1)
+    d2 = torch.roll(z, -1, dims=1) - 2 * z + torch.roll(z, 1, dims=1)
+    k2 = k1 * torch.roll(m, 1, dims=1)
+    return d1 * k1, d2 * k2, k1, k2
+
+
 def flow_loss(model, batch, p_drop: float = 0.0, n_pin: int = 0):
     global W_CH
     x1 = batch["x"]
@@ -890,10 +922,25 @@ def flow_loss(model, batch, p_drop: float = 0.0, n_pin: int = 0):
         xt = torch.cat([x1[:, :n_pin], xt[:, n_pin:]], dim=1)
     drop = (torch.rand(B, device=x1.device) < p_drop) if p_drop > 0 else None
     v = model(xt, t, batch["cond"], batch["fix"], batch.get("ctx"), drop)
-    err = ((v - (x1 - x0)) ** 2 * W_CH).mean(-1)
+    u = x1 - x0
+    err = ((v - u) ** 2 * W_CH).mean(-1)
     if n_pin:
         err = err[:, n_pin:]
-    return err.mean()
+    loss = err.mean()
+
+    if (W_D1 or W_D2) and x1.shape[-1] >= 8:
+        # a slot is live in the TARGET; the unused channel is the last of the
+        # first eight in every frame layout
+        live = x1[..., 7] < 0.5
+        dv1, dv2, k1, k2 = _ring_diff(v, live)
+        du1, du2, _, _ = _ring_diff(u, live)
+        if W_D1:
+            e = ((dv1 - du1) ** 2 * W_CH).mean(-1)
+            loss = loss + W_D1 * (e.sum() / k1.sum().clamp(min=1.0))
+        if W_D2:
+            e = ((dv2 - du2) ** 2 * W_CH).mean(-1)
+            loss = loss + W_D2 * (e.sum() / k2.sum().clamp(min=1.0))
+    return loss
 
 
 @torch.no_grad()
@@ -1086,7 +1133,13 @@ def train(args):
     md = pathlib.Path(args.dataset) / "parts"
     parts = load_curve_parts(pathlib.Path(args.wtok))
     have = {f.stem for f in md.glob("*.npz")}
-    parts = [p for p in parts if p.name in have]
+    if have:
+        parts = [p for p in parts if p.name in have]
+    else:
+        # only the surface stage reads the mesh npz; the frame and token stages
+        # build their target from the part alone, so a machine without the mesh
+        # dataset (Kaggle) can still train them
+        print(f"no mesh npz under {md} -- using all {len(parts)} parts", flush=True)
     vn = set(json.loads(pathlib.Path(args.val_list).read_text(encoding="utf-8")))
     train_parts = [p for p in parts if p.name not in vn][: args.train_parts]
     val_parts = [p for p in parts if p.name in vn][: args.val_parts]
@@ -1111,6 +1164,10 @@ def train(args):
     # for a positional encoding to encode.
     ds = StageDataset(train_parts, md, args.stage, base_seed=7,
                       outlier_rate=args.outlier_rate, cloud_bank=args.cloud_bank)
+    global W_D1, W_D2
+    W_D1, W_D2 = float(args.w_d1), float(args.w_d2)
+    if W_D1 or W_D2:
+        print(f"relational loss: D1 {W_D1}  D2 {W_D2}", flush=True)
     ds.cloud_drop = args.cloud_drop
     ds.surf_curv = bool(args.surf_curv)
     ds.use_spec = vs_use = bool(args.use_spec)
@@ -1213,6 +1270,11 @@ def main():
     ap.add_argument("--cloud-bank", default="",
                     help="directory of precomputed bulk-generator clouds to "
                          "condition on (one <part>.npy of (N,6) per part)")
+    ap.add_argument("--w-d1", type=float, default=0.0,
+                    help="weight on the first difference around the ring -- "
+                         "how slot i relates to i+1")
+    ap.add_argument("--w-d2", type=float, default=0.0,
+                    help="weight on the second difference -- the turn")
     ap.add_argument("--rel-attn", action="store_true",
                     help="self-attention biased by learned functions of the "
                          "RELATION between slots (cyclic offset, distance, "

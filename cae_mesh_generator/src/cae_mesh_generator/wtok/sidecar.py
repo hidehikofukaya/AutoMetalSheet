@@ -44,6 +44,25 @@ SPEC_KEYS = ("thickness_mm", "half_width_mm", "bend_radius_mm",
 SPEC_SCALE = np.array([2.0, 0.02, 0.05, 0.03, 0.03, 0.03, 0.1])
 
 
+_SPEC_FILE = _ROOT / "runs" / "wtok_synth" / "spec_vectors.json"
+_spec_table = None
+
+
+def _table():
+    """The spec vectors exported to one file, for machines that cannot see the
+    generator's own params directory (Kaggle). Falls back to reading PartMaker
+    directly when the file is absent."""
+    global _spec_table
+    if _spec_table is None:
+        if _SPEC_FILE.exists():
+            d = json.loads(_SPEC_FILE.read_text())
+            _spec_table = {k: np.asarray(v, np.float32)
+                           for k, v in d["spec"].items()}
+        else:
+            _spec_table = {}
+    return _spec_table
+
+
 def load_spec(part):
     """The design spec as a fixed-length vector, or None where there is no file.
 
@@ -65,6 +84,10 @@ def load_spec(part):
     name = getattr(part, "name", str(part))
     key = ("spec", name)
     if key not in _cache:
+        tab = _table()
+        if name in tab:
+            _cache[key] = tab[name]
+            return _cache[key]
         f = spec_path(name)
         s = json.loads(f.read_text(encoding="utf-8")).get("spec") if f else None
         _cache[key] = (np.array([s.get(k, 0.0) for k in SPEC_KEYS], np.float32)

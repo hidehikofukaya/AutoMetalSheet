@@ -40,6 +40,21 @@ CODE_FILES = [
     "wtok/evaluate_curve.py",
     "wtok/evaluate_curve2.py",
     "wtok/kaggle_run.py",
+    "wtok/kaggle_frame.py",
+    # the current line of work: parametric frames, the staged trainer and the
+    # readers they need. meshgen brings the fastener frame and the guard disc.
+    "wtok/frame.py",
+    "wtok/staged.py",
+    "wtok/meshgen.py",
+    "wtok/sidecar.py",
+    "wtok/bendlines.py",
+    "wtok/judge.py",
+    "wtok/tokens.py",
+    "wtok/deltatok.py",
+    "wtok/feature.py",
+    "wtok/kernel.py",
+    "wtok/ridge.py",
+    "wtok/validity.py",
 ]
 
 NOTEBOOK = '''# Kaggle cell -- clear the cell completely (Ctrl+A, Delete) before pasting.
@@ -47,7 +62,8 @@ import glob, os, subprocess, sys
 os.environ["WTOK_EPOCHS"] = "150"
 os.environ["WTOK_MAX_HOURS"] = "8.5"
 os.environ["WTOK_RESUME_DIR"] = ""   # set to a previous Output dataset to continue
-hits = glob.glob("/kaggle/input/**/kaggle_run.py", recursive=True)
+LAUNCH = os.environ.get("WTOK_LAUNCHER", "kaggle_frame.py")
+hits = glob.glob(f"/kaggle/input/**/{LAUNCH}", recursive=True)
 if not hits:
     print("kaggle_run.py NOT FOUND. /kaggle/input currently holds:")
     for p in sorted(glob.glob("/kaggle/input/*")):
@@ -95,6 +111,11 @@ def main() -> None:
     vl = pathlib.Path(args.val_list)
     if vl.exists():
         files.append((vl, "val_names_100.json"))
+    # the design spec lives in the PartMaker tree, which Kaggle cannot see, so
+    # it travels as one exported table (sidecar.load_spec falls back to it)
+    sv = data / "spec_vectors.json"
+    if sv.exists():
+        files.append((sv, "spec_vectors.json"))
     zip_dir(OUT / "wtok_synth_data.zip", files)
     print(f"\nUpload {OUT}:\n"
           f"  wtok_code.zip       -> Kaggle Dataset 'wtok-code'\n"
