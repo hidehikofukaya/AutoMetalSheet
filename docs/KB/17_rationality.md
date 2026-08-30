@@ -150,7 +150,22 @@ E2E(生成外形 → `bendtok1`)、val 30部品:
 考え方)。1部品あたり 512 → 113 トークン、曲線数は40/40で保存。`runs/bendcorner1` で学習中。
 ビードの稜線は折れ線近似(0.25t)— B-rep 用の真円弧は外形と同じ膨らみチャンネルで拡張可能。
 
+### 学習を2倍にしても簡潔性は良くならない(`runs/frame_canon`)
+
+frame_rel と同じ処方(rel + spec)、スライバー除去教師、**600エポック**(frame_rel は300)。
+
+| 選択 | 座面比 | ≥0.95 | 余剰回転 | 近傍誤差 |
+|---|---|---|---|---|
+| frame_rel 中央選択 | 0.763 | 17% | 219° | 3.89mm |
+| frame_canon 中央選択 | 0.787 | 20% | **248°** | **3.39mm** |
+| frame_rel 拘束+ランク | 1.016 | 87% | 224° | 2.91mm |
+| frame_canon 拘束+ランク | 0.982 | 70% | **258°** | **2.66mm** |
+
+損失 0.020 → 0.008、位置は 0.5mm 良くなり、**余剰回転は 30° 悪化**。位置損失を下げるほど
+角の揺れが増える — 「損失は構造を見ていない」の再確認。長く回す・容量を増やすのは
+層2の対策にならない(Kaggle 掃引 v12 も同じ問い。結果は `kaggle_ops.py pull --title autometalsheet-frame-sweep`)。
+
 ### 進行中
-- `runs/frame_canon`: スライバー除去教師 + 関係アテンション + spec、600エポック
-- `runs/bendcorner1`: 角トークン、200エポック → 上の表と同じ評価で比較
-- Kaggle `autometalsheet-frame-sweep` v11: 容量/学習長の掃引(base/wide/deep/long、すべて rel+spec)
+- `runs/bendcorner1`: 角トークン、200エポック → 曲げ線の表と同じ評価で比較
+- Kaggle `autometalsheet-frame-sweep` v12: 容量/学習長の掃引(base/wide/deep/long、すべて rel+spec)。
+  出力の best.pt は `scratchpad/constrain_seat.py <run>` と同じ手順で3層評価にかける

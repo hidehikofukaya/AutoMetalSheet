@@ -163,10 +163,16 @@ def bend_score(curves, outline, u, t_mm, attach_t: float = 2.0):
     if not curves:
         return None
     tol = attach_t * t_mm / u
-    allpts = np.concatenate(curves)
+    # junctions are tested against the curves as LINES, not their vertices:
+    # corner tokens leave a straight fold with two vertices 100mm apart
+    from .tokens import _arc, _resample
+    dense = [_resample(c, max(int(_arc(c)[-1] / (0.5 * tol)) + 2, 2)) for c in curves]
+    owner = np.concatenate([np.full(len(d), i) for i, d in enumerate(dense)])
+    allpts = np.concatenate(dense)
+    tree = cKDTree(allpts)
     excess = 0.0
     ends_open, ends_dangling = 0, 0
-    for c in curves:
+    for ci, c in enumerate(curves):
         d = np.diff(c, axis=0)
         L = np.linalg.norm(d, axis=1)
         T = d[L > 1e-9] / L[L > 1e-9, None]
@@ -182,9 +188,7 @@ def bend_score(curves, outline, u, t_mm, attach_t: float = 2.0):
             for e in (c[0], c[-1]):
                 ends_open += 1
                 near_out = cKDTree(outline).query(e)[0] < tol
-                # another curve: any point closer than tol that is not this curve's
-                others = allpts[np.linalg.norm(allpts - e, axis=1) < tol]
-                near_curve = len(others) > len(c[np.linalg.norm(c - e, axis=1) < tol])
+                near_curve = any(owner[j] != ci for j in tree.query_ball_point(e, tol))
                 if not (near_out or near_curve):
                     ends_dangling += 1
     return {"excess": float(excess),
