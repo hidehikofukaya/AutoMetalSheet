@@ -44,6 +44,11 @@ def quantize_W(W: SparseW) -> dict:
             merged[key] = len(new_vertices)
             nf = None if v["nf"] is None else [round(float(x), 6) for x in v["nf"]]
             new_vertices.append({"T": v["T"], "bin": key[1], "nf": nf})
+        # the junction angle (KB 18) rides on the vertex; duplicates of one
+        # CATIA vertex all carry it, merged bins keep the largest turn
+        if v.get("jt") is not None:
+            nv = new_vertices[merged[key]]
+            nv["jt"] = max(float(v["jt"]), nv.get("jt", -1.0))
         remap[i] = merged[key]
 
     # canonical vertex order: FIX block first, then (T, z, y, x) lexicographic

@@ -109,6 +109,36 @@ def rank(frames, frame, seat_pts, seat_r, t_mm, teacher=None):
     return order, sc
 
 
+def junction_match(x_gen, x_true, tol):
+    """Tier 2 for the G1 channel (KB 18): did the true corners land as corners?
+
+    True corners (G1 flag off) are matched to the generated frame's corners by
+    position, within `tol` frame units. Reported per true junction kind:
+    `g0_missed` -- a real corner that came out tangent or unmatched;
+    `g1_as_g0` -- a tangent junction that grew a corner. Both 0 when right.
+    """
+    from .frame import G1_CH
+
+    def corners(x):
+        live = x[:, 7] < 0.5
+        return x[live, 0:3], x[live, G1_CH] > 0.5
+
+    if x_gen.shape[1] <= 11 or x_true.shape[1] <= 11:
+        return None
+    pg, g1g = corners(x_gen)
+    pt, g1t = corners(x_true)
+    if len(pg) < 3 or len(pt) < 3:
+        return None
+    d, idx = cKDTree(pg).query(pt)
+    hit = d < tol
+    g0_missed = [not hit[i] or g1g[idx[i]] for i in range(len(pt)) if not g1t[i]]
+    g1_as_g0 = [hit[i] and not g1g[idx[i]] for i in range(len(pt)) if g1t[i]]
+    return {"g0_missed": float(np.mean(g0_missed)) if g0_missed else 0.0,
+            "g1_as_g0": float(np.mean(g1_as_g0)) if g1_as_g0 else 0.0,
+            "g1_share_true": float(np.mean(g1t)),
+            "g1_share_gen": float(np.mean(g1g))}
+
+
 def seat_project(x, frame, seat_pts, seat_axes, seat_r, margin=1.0):
     """Push every corner out of any fastener seat it intrudes on.
 

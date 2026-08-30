@@ -51,7 +51,8 @@ class CurvePart:
         self.name = path.stem
         self.env_lo = np.asarray(d["env_lo"])
         self.env_hi = np.asarray(d["env_hi"])
-        self.vertices = [{"T": v["T"], "bin": tuple(v["bin"]), "nf": v.get("nf")}
+        self.vertices = [{"T": v["T"], "bin": tuple(v["bin"]), "nf": v.get("nf"),
+                          "jt": v.get("jt")}
                          for v in d["vertices"]]
         from .codec_curve import traversal_order
         self.edges = traversal_order(

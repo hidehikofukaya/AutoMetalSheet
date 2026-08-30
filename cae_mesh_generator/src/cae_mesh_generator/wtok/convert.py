@@ -105,6 +105,131 @@ def arc_dev(pts, center, normal, radius) -> float:
     return float(np.hypot(rho - radius, axial).max())
 
 
+def fit_edge_primitive(pts: np.ndarray) -> tuple[dict, float]:
+    """One B-rep edge -> ONE primitive, never split (KB 18).
+
+    Measured on 60 parts / 1084 outer edges: every CATIA edge already fits a
+    single LINE or ARC at ~0 residual, so the recursive refit was re-cutting
+    primitives at places CATIA never put a vertex -- 62% of its corners had no
+    CATIA vertex within 1mm, and those invented corners are the outline's
+    corner jitter. Returns (segment, residual_mm); the residual is reported,
+    not gated, so a genuine spline shows up in the stats instead of growing
+    new corners.
+    """
+    dev_line = float(point_segment_dev(pts, pts[0], pts[-1]).max())
+    if len(pts) < 3 or dev_line < FIT_TOL_MM:
+        return {"kind": "LINE", "p0": pts[0], "p1": pts[-1]}, dev_line
+    fc = fit_circle(pts)
+    if fc is not None and fc[2] < 1e5:
+        center, normal, r, _ = fc
+        adev = float(arc_dev(pts, center, normal, r))
+        if adev < dev_line:
+            probe = pts[len(pts) // 2]
+            mid, sweep = arc_from_endpoints(center, normal, r, pts[0], pts[-1], probe)
+            return {"kind": "ARC", "p0": pts[0], "p1": pts[-1], "mid": mid,
+                    "center": center, "normal": normal, "radius": r,
+                    "sagitta": r * (1 - math.cos(sweep / 2))}, adev
+    return {"kind": "LINE", "p0": pts[0], "p1": pts[-1]}, dev_line
+
+
+def _prim_tangent(seg: dict, poly: np.ndarray, at_end: bool) -> np.ndarray:
+    """Unit tangent of the fitted primitive at one endpoint, pointing along
+    the p0 -> p1 travel direction. The primitive fits at ~0 residual, so this
+    IS the raw geometry's tangent -- unlike a chord over a 2mm span, it does
+    not read an arc's own curvature as a corner."""
+    if seg["kind"] == "ARC":
+        pt = seg["p1"] if at_end else seg["p0"]
+        t = np.cross(seg["normal"], pt - seg["center"])
+        n = np.linalg.norm(t)
+        if n > 1e-9:
+            t = t / n
+            # the fitted normal's sign is arbitrary: orient by the polyline
+            ref = (poly[-1] - poly[-2]) if at_end else (poly[1] - poly[0])
+            return t if t @ ref >= 0 else -t
+    d = seg["p1"] - seg["p0"]
+    return d / max(np.linalg.norm(d), 1e-12)
+
+
+def add_outline_primitives(W: SparseW, polys: list[np.ndarray], cls: str,
+                           delta_est: float, stats: dict) -> list[np.ndarray]:
+    """The CATIA decomposition as the teacher: one vertex per CATIA vertex,
+    one primitive per edge, and the junction's tangent angle stored on the
+    shared vertex (`jt`, degrees) so the representation can carry G1/G0.
+
+    Computed BEFORE quantization -- the +-0.3mm bin snap would fold a tangent
+    junction into a false corner (KB 18.4).
+
+    Returns the polylines it could NOT take (closed single-edge loops), for
+    the caller's chain-and-fit fallback.
+    """
+    fitted, leftover = [], []
+    for poly in polys:
+        length = float(np.linalg.norm(np.diff(poly, axis=0), axis=1).sum())
+        if length < WELD_MM:
+            continue                       # extractor junk: a zero-length edge
+        if np.linalg.norm(poly[0] - poly[-1]) < WELD_MM:
+            leftover.append(poly)          # a closed edge has no junctions
+            continue
+        seg, dev = fit_edge_primitive(poly)
+        fitted.append((seg, dev, poly))
+    if not fitted:
+        return leftover
+
+    # weld shared endpoints by CLUSTER, not by grid cell: two copies of one
+    # CATIA vertex can differ by 0.01mm and a rounded grid puts that straddle
+    # in different cells, which broke the loop on the first part tried
+    from scipy.spatial import cKDTree
+    ends = np.concatenate([[s["p0"], s["p1"]] for s, _, _ in fitted])
+    parent = list(range(len(ends)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i, j in cKDTree(ends).query_pairs(WELD_MM):
+        parent[find(i)] = find(j)
+    # cluster id per fitted endpoint: fitted edge k owns rows 2k (p0), 2k+1 (p1)
+    cid = [find(i) for i in range(len(ends))]
+
+    # junction turn angle where exactly two edges meet: the angle between the
+    # tangent arriving and the tangent leaving, 0 = tangent-continuous (G1)
+    at_junction: dict = {}
+    for k, (seg, _, poly) in enumerate(fitted):
+        at_junction.setdefault(cid[2 * k], []).append(
+            _prim_tangent(seg, poly, at_end=False))          # leaving
+        at_junction.setdefault(cid[2 * k + 1], []).append(
+            -_prim_tangent(seg, poly, at_end=True))          # arriving, flipped
+    jt = {}
+    for c, ts in at_junction.items():
+        if len(ts) == 2:
+            jt[c] = math.degrees(math.acos(np.clip(-(ts[0] @ ts[1]), -1.0, 1.0)))
+
+    resid = []
+    for k, (seg, dev, _) in enumerate(fitted):
+        resid.append(dev)
+        if seg["kind"] == "ARC" and seg["sagitta"] < DEGEN_K * delta_est:
+            seg = {"kind": "LINE", "p0": seg["p0"], "p1": seg["p1"]}
+        idx = []
+        for c in (cid[2 * k], cid[2 * k + 1]):
+            i = W.add_vertex(ends[c], "END")     # the cluster root's position
+            if c in jt:
+                W.vertices[i]["jt"] = round(jt[c], 2)
+            idx.append(i)
+        if seg["kind"] == "LINE":
+            W.edges.append({"tau": "LINE", "refs": idx, "cls": cls})
+            stats["n_line"] += 1
+        else:
+            im = W.add_vertex(seg["mid"], "MID")
+            W.edges.append({"tau": "ARC", "refs": [idx[0], im, idx[1]], "cls": cls})
+            stats["n_arc"] += 1
+    stats["n_outline_edges"] = stats.get("n_outline_edges", 0) + len(fitted)
+    stats["outline_resid_max_mm"] = max(stats.get("outline_resid_max_mm", 0.0),
+                                        float(max(resid)))
+    return leftover
+
+
 def segment_polyline(pts: np.ndarray, tol: float, depth: int = 0) -> list[dict]:
     """Recursive LINE/ARC decomposition of an open chain."""
     if len(pts) < 3 or point_segment_dev(pts, pts[0], pts[-1]).max() < tol:
@@ -213,6 +338,12 @@ def convert_part(wf_json: Path, joints: list[dict]) -> tuple[SparseW, dict]:
         [p for ps in by_class.values() for p in ps]).min(0))) / (1 << BITS)
 
     for cls, polys in by_class.items():
+        if cls == "outer_boundary":
+            # KB 18: the CATIA edges ARE the primitives; chain-and-refit only
+            # what this path cannot take (closed single-edge loops)
+            polys = add_outline_primitives(W, polys, cls, delta_est, stats)
+            if not polys:
+                continue
         for pts, closed in build_chains(polys):
             stats["n_chains"] += 1
             if closed and len(pts) >= 8:

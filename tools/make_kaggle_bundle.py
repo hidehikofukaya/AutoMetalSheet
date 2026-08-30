@@ -53,6 +53,7 @@ CODE_FILES = [
     "wtok/bendlines.py",
     "wtok/judge.py",
     "wtok/rational.py",
+    "wtok/rational_eval.py",
     "wtok/tokens.py",
     "wtok/deltatok.py",
     "wtok/feature.py",

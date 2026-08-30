@@ -23,14 +23,20 @@ from __future__ import annotations
 
 import numpy as np
 
-EDGE_SLOTS = 32         # max measured 26
-FRAME_CH = 11           # corner 3, arc bulge 3, is_arc 1, unused 1, normal 3
+EDGE_SLOTS = 32         # max measured 26 (24 with the CATIA decomposition)
+FRAME_CH = 12           # corner 3, arc bulge 3, is_arc 1, unused 1, normal 3, g1 1
+G1_CH = 11              # junction with the PREVIOUS edge is tangent-continuous
+G1_DEG = 3.0            # tangent angle below this is G1, not a corner (KB 18)
 NRM_WIN = 1             # corners each side of an edge used to fit its plane
 NRM_TOL = 0.06          # third singular value over the first; above it, not flat
 
 
 def outline_edges(part):
-    """The outline walked edge by edge: [(corner, bulge, is_arc), ...].
+    """The outline walked edge by edge: [(corner, mid, is_arc, jt), ...].
+
+    `jt` is the junction's tangent angle at the CORNER (degrees, from the raw
+    geometry before quantization; see convert.add_outline_primitives), or None
+    on parts converted before KB 18.
 
     `bulge` is the arc's midpoint measured FROM THE CHORD MIDPOINT, not in
     absolute coordinates. It is then zero for a straight edge and small for a
@@ -65,7 +71,7 @@ def outline_edges(part):
         if not nxt:
             break
         v, m, a = nxt[0]
-        out.append((pos[cur], m, a))
+        out.append((pos[cur], m, a, q["vertices"][cur].get("jt")))
         prev, cur = cur, v
         if cur == start:
             break
@@ -157,18 +163,23 @@ def frame_target(part, frame, slots: int = EDGE_SLOTS, canonical: bool = True):
     ed = outline_edges(part)
     if ed is None:
         return None
-    corners = np.stack([c for c, _, _ in ed])
-    is_arc = np.array([a for _, _, a in ed], float)
-    mids = np.stack([m if m is not None else c for c, m, a in ed])
+    corners = np.stack([c for c, _, _, _ in ed])
+    is_arc = np.array([a for _, _, a, _ in ed], float)
+    mids = np.stack([m if m is not None else c for c, m, a, _ in ed])
+    jt = np.array([np.nan if j is None else j for _, _, _, j in ed], float)
 
     p, _ = to_frame(corners, np.zeros_like(corners), frame)
     mid, _ = to_frame(mids, np.zeros_like(mids), frame)
-    if canonical:
+    if canonical and not np.isfinite(jt).any():
+        # pre-KB-18 teachers only: with the CATIA decomposition the vertices
+        # ARE the canonical ones, and a <3deg turn is a G1 junction to keep,
+        # not a chain artefact to merge away
         p, mid, is_arc = _merge_primitives(
             p, mid, is_arc, CANON_TOL_T * thickness_units(part, frame))
+        jt = np.full(len(p), np.nan)
     if len(p) > slots:
         return None
-    p, mid, is_arc = _canonicalise(p, mid, is_arc)
+    p, mid, is_arc, jt = _canonicalise(p, mid, is_arc, jt)
 
     chord = 0.5 * (p + np.roll(p, -1, 0))     # edge i runs corner i -> i+1
     bulge = (mid - chord) * is_arc[:, None]
@@ -180,6 +191,7 @@ def frame_target(part, frame, slots: int = EDGE_SLOTS, canonical: bool = True):
     x[:n, 6] = is_arc
     x[n:, 7] = 1.0                            # unused slots
     x[:n, 8:11] = edge_normals(p)
+    x[:n, G1_CH] = np.where(np.isfinite(jt) & (jt < G1_DEG), 1.0, 0.0)
     return x
 
 
@@ -214,7 +226,7 @@ def edge_normals(P, win: int = NRM_WIN, tol: float = NRM_TOL):
     return N
 
 
-def _canonicalise(p, mid, is_arc):
+def _canonicalise(p, mid, is_arc, jt=None):
     """Same rule as the sampled ring: a fixed start corner and turn direction.
 
     A closed loop has no natural first edge, and the traversal picks the lowest
@@ -222,20 +234,137 @@ def _canonicalise(p, mid, is_arc):
     the same thing everywhere or the model fits an arbitrary rotation per part
     on top of the shape.
     """
+    if jt is None:
+        jt = np.full(len(p), np.nan)
     area = np.cross(p - p.mean(0), np.roll(p, -1, 0) - p.mean(0)).sum(0)
     if area[2] < 0:
         # reversing a loop of EDGES shifts them: edge i of the reversed loop
         # starts at what was corner i+1, so the arrays roll by one after the
         # flip. Getting this wrong pairs each corner with the wrong bulge.
+        # jt lives on the CORNER, so it follows p, without the extra roll.
         p = p[::-1].copy()
+        jt = jt[::-1].copy()
         mid = np.roll(mid[::-1].copy(), -1, 0)
         is_arc = np.roll(is_arc[::-1].copy(), -1, 0)
     s = int(np.argmax(p[:, 0]))
-    return np.roll(p, -s, 0), np.roll(mid, -s, 0), np.roll(is_arc, -s, 0)
+    return (np.roll(p, -s, 0), np.roll(mid, -s, 0), np.roll(is_arc, -s, 0),
+            np.roll(jt, -s, 0))
+
+
+def _edge_tangent(p0, mid, p1, is_arc, at_end):
+    """Unit tangent along the p0 -> p1 travel of one realized edge."""
+    from .codec import circle_through
+
+    if is_arc:
+        cc = circle_through(p0, mid, p1)
+        if cc is not None:
+            c, n, _ = cc
+            pt = p1 if at_end else p0
+            t = np.cross(n, pt - c)
+            nt = np.linalg.norm(t)
+            if nt > 1e-9:
+                t = t / nt
+                ref = (p1 - mid) if at_end else (mid - p0)
+                return t if t @ ref >= 0 else -t
+    d = p1 - p0
+    return d / max(np.linalg.norm(d), 1e-12)
+
+
+def _bulge_from_tangent(p0, p1, t, at_end):
+    """The arc through p0 and p1 whose tangent at one end is `t`, as its bulge.
+
+    Tangent-chord: the angle theta between the end tangent and the chord is
+    half the sweep, so the sagitta is |chord|/2 * tan(theta/2), bulging toward
+    the side the tangent leans at the start -- and away from it at the end.
+    Returns None when t is (anti)parallel to the chord (straight, or a
+    near-full circle no junction should ask for).
+    """
+    c = p1 - p0
+    L = np.linalg.norm(c)
+    if L < 1e-9:
+        return None
+    ch = c / L
+    comp = t - (t @ ch) * ch
+    s = np.linalg.norm(comp)
+    theta = np.arctan2(s, t @ ch)
+    if s < 1e-9 or theta > 2.8:            # straight enough / degenerate
+        return np.zeros(3) if theta < 0.05 else None
+    nhat = comp / s if not at_end else -comp / s
+    return (L / 2.0) * np.tan(theta / 2.0) * nhat
+
+
+def enforce_g1(p, bulge, is_arc, g1):
+    """Re-solve arc bulges so every flagged junction is tangent-continuous.
+
+    Corner i joins edge i-1 to edge i; where g1[i] is set the two must leave
+    that corner with one tangent. A LINE's tangent is rigid, so a line-arc
+    junction hands the line's direction to the arc; an arc-arc junction takes
+    the average of the two current tangents. The arc through two fixed corners
+    with one end tangent is unique, so the solve is local and exact; an arc
+    constrained at BOTH ends is over-determined and takes the mean of the two
+    solutions. Returns (bulge, residual_deg): the turn left at junctions the
+    solve could not satisfy (line-line, or that mean), for tier 1 to count.
+    """
+    # ponytail: one local pass, no iteration -- residual reports what is left
+    n = len(p)
+    nxt = np.roll(p, -1, 0)
+    mid = 0.5 * (p + nxt) + bulge
+    want_start = [None] * n
+    want_end = [None] * n
+    residual = 0.0
+    for i in range(n):
+        if not g1[i]:
+            continue
+        j = (i - 1) % n
+        t_in = _edge_tangent(p[j], mid[j], nxt[j], is_arc[j], at_end=True)
+        t_out = _edge_tangent(p[i], mid[i], nxt[i], is_arc[i], at_end=False)
+        if not is_arc[j] and not is_arc[i]:
+            residual += np.degrees(np.arccos(np.clip(t_in @ t_out, -1, 1)))
+            continue
+        if not is_arc[j]:
+            t = t_in
+        elif not is_arc[i]:
+            t = t_out
+        else:
+            t = t_in + t_out
+            if np.linalg.norm(t) < 1e-6:
+                continue
+            t = t / np.linalg.norm(t)
+        if is_arc[i]:
+            want_start[i] = t
+        if is_arc[j]:
+            want_end[j] = t
+    out = bulge.copy()
+    for k in range(n):
+        if want_start[k] is None and want_end[k] is None:
+            continue
+        cand = []
+        if want_start[k] is not None:
+            b = _bulge_from_tangent(p[k], nxt[k], want_start[k], at_end=False)
+            if b is not None:
+                cand.append(b)
+        if want_end[k] is not None:
+            b = _bulge_from_tangent(p[k], nxt[k], want_end[k], at_end=True)
+            if b is not None:
+                cand.append(b)
+        if not cand:
+            continue
+        out[k] = np.mean(cand, axis=0)
+        if len(cand) == 2:
+            m = 0.5 * (p[k] + nxt[k]) + out[k]
+            for want, at_end in ((want_start[k], False), (want_end[k], True)):
+                got = _edge_tangent(p[k], m, nxt[k], True, at_end)
+                residual += np.degrees(np.arccos(np.clip(got @ want, -1, 1)))
+    return out, float(residual)
 
 
 def realize_frame(x, per_edge: int = 24, arc_thresh: float = 0.5):
     """Slots back to a polyline, for drawing and for measuring against the truth.
+
+    When the tensor carries the G1 channel (KB 18), flagged junctions are made
+    tangent-continuous by construction before drawing: the arcs' bulges are
+    re-solved from the junction condition, so a jittered bulge cannot put a
+    false corner where the representation says there is none.
 
     An arc is drawn as the circle through its two corners and its bulged
     midpoint -- the same construction `codec.realize_edge` uses -- so a frame
@@ -254,6 +383,10 @@ def realize_frame(x, per_edge: int = 24, arc_thresh: float = 0.5):
     if len(p) < 3:
         return np.zeros((0, 3))
     bulge, is_arc = x[live, 3:6], x[live, 6] > arc_thresh
+    if x.shape[1] > G1_CH:
+        g1 = x[live, G1_CH] > 0.5
+        if g1.any():
+            bulge, _ = enforce_g1(p, bulge, is_arc, g1)
     nxt = np.roll(p, -1, 0)
     mid = 0.5 * (p + nxt) + bulge
 
@@ -323,8 +456,40 @@ def demo():
     print("ok")
 
 
+def g1_demo():
+    """A stadium: two lines and two semicircular caps, every junction G1.
+    Jittered bulges must come back tangent-continuous through enforce_g1."""
+    p = np.array([[0., 0, 0], [10, 0, 0], [10, 4, 0], [0, 4, 0]])
+    is_arc = np.array([False, True, False, True])
+    bulge = np.array([[0., 0, 0], [2, 0, 0], [0, 0, 0], [-2, 0, 0]])
+    g1 = np.array([True] * 4)
+
+    def worst_junction(b):
+        mid = 0.5 * (p + np.roll(p, -1, 0)) + b
+        w = 0.0
+        for i in range(4):
+            j = (i - 1) % 4
+            t_in = _edge_tangent(p[j], mid[j], p[(j + 1) % 4], is_arc[j], True)
+            t_out = _edge_tangent(p[i], mid[i], p[(i + 1) % 4], is_arc[i], False)
+            w = max(w, np.degrees(np.arccos(np.clip(t_in @ t_out, -1, 1))))
+        return w
+
+    rng = np.random.default_rng(0)
+    jittered = bulge + rng.normal(scale=0.5, size=bulge.shape) * is_arc[:, None]
+    before = worst_junction(jittered)
+    fixed, res = enforce_g1(p, jittered, is_arc, g1)
+    after = worst_junction(fixed)
+    print(f"worst junction angle: jittered {before:.2f}deg -> enforced {after:.3f}deg"
+          f"  (solver residual {res:.3f}deg)")
+    assert before > 3.0 and after < 0.5, (before, after)
+    # both ends of one arc constrained by rigid lines: exact for this geometry
+    assert res < 0.5, res
+    print("ok")
+
+
 if __name__ == "__main__":
     demo()
+    g1_demo()
 
 
 CONSIST_LAMBDA = 0.0    # OFF -- see below
@@ -667,8 +832,8 @@ def bend_demo():
 
 # ------------------------------------------------- multi-loop generalisation
 
-MULTI_CH = 12           # frame channels + one loop-end flag
-LOOP_END = 11           # channel: this slot is the LAST edge of its loop
+MULTI_CH = FRAME_CH + 1  # frame channels + one loop-end flag
+LOOP_END = FRAME_CH      # channel: this slot is the LAST edge of its loop
 
 
 def boundary_loops(part):
@@ -765,7 +930,7 @@ def multi_frame_target(part, frame, slots: int = EDGE_SLOTS):
         mids = np.stack([m if m is not None else c for c, m, a in chain])
         p, _ = to_frame(corners, np.zeros_like(corners), frame)
         mid, _ = to_frame(mids, np.zeros_like(mids), frame)
-        p, mid, is_arc = _canonicalise(p, mid, is_arc)
+        p, mid, is_arc, _ = _canonicalise(p, mid, is_arc)
         chord = 0.5 * (p + np.roll(p, -1, 0))
         x[at:at + n, 0:3] = p
         x[at:at + n, 3:6] = (mid - chord) * is_arc[:, None]
@@ -877,7 +1042,7 @@ def bend_multi_target(part, frame, slots: int = BEND_SLOTS,
     """(slots, BEND_MULTI_CH): folds, beads and the rest in one tensor.
 
         [0:3] endpoint 1   [3:6] endpoint 2   [6] is_arc   [7] unused
-        [8:11] bulge       [11] loop_end      [12:12+n_cls] class one-hot
+        [8:11] bulge       [LOOP_END] loop_end  [MULTI_CH:] class one-hot
 
     A straight or arc fold is one slot. A bead is a chain of slots whose last
     one sets loop_end, exactly the mechanism the multi-loop outline uses -- so a
@@ -891,7 +1056,7 @@ def bend_multi_target(part, frame, slots: int = BEND_SLOTS,
     F = bend_features(part)
     if not F:
         return None
-    ch = 12 + n_cls
+    ch = MULTI_CH + n_cls
     x = np.zeros((slots, ch))
     x[:, 7] = 1.0
     at = 0
@@ -908,7 +1073,7 @@ def bend_multi_target(part, frame, slots: int = BEND_SLOTS,
             x[at, 6] = 1.0 if float(np.linalg.norm(mid - chord)) / span > 0.02 else 0.0
             x[at, 7] = 0.0
             x[at, 8:11] = (mid - chord) * x[at, 6]
-            x[at, 12 + ci] = 1.0
+            x[at, MULTI_CH + ci] = 1.0
             at += 1
             continue
         # closed: lay the ring down as a chain of straight slots and close it
@@ -920,7 +1085,7 @@ def bend_multi_target(part, frame, slots: int = BEND_SLOTS,
             x[at + j, 0:3] = r[j]
             x[at + j, 3:6] = r[(j + 1) % k]
             x[at + j, 7] = 0.0
-            x[at + j, 12 + ci] = 1.0
+            x[at + j, MULTI_CH + ci] = 1.0
         x[at + k - 1, LOOP_END] = 1.0
         at += k
     return x if at else None
@@ -945,7 +1110,7 @@ def bend_multi_demo():
         if a is None or b is None:
             continue
         for i in np.flatnonzero(a[:, 7] < 0.5):
-            cls_seen.add(BEND_CLASSES[int(np.argmax(a[i, 12:]))])
+            cls_seen.add(BEND_CLASSES[int(np.argmax(a[i, MULTI_CH:]))])
         A = realize_bend(a[:, :FRAME_CH])
         B = realize_bend(b)
         if A and B:
@@ -959,14 +1124,14 @@ def bend_multi_demo():
     from types import SimpleNamespace
     t = np.linspace(0, 2 * np.pi, 24, endpoint=False)
     ring = np.stack([np.cos(t) * 12, np.sin(t) * 12, np.zeros_like(t)], 1)
-    x = np.zeros((BEND_SLOTS, 12 + len(BEND_CLASSES)))
+    x = np.zeros((BEND_SLOTS, MULTI_CH + len(BEND_CLASSES)))
     x[:, 7] = 1.0
     k = 8
     r = _densify(np.concatenate([ring, ring[:1]]), k + 1)[:k]
     for j in range(k):
         x[j, 0:3], x[j, 3:6] = r[j], r[(j + 1) % k]
         x[j, 7] = 0.0
-        x[j, 12 + BEND_CLASSES.index("bead")] = 1.0
+        x[j, MULTI_CH + BEND_CLASSES.index("bead")] = 1.0
     x[k - 1, LOOP_END] = 1.0
     seg = realize_bend(x[:, :FRAME_CH])
     ends = np.concatenate([[s[0], s[-1]] for s in seg])
