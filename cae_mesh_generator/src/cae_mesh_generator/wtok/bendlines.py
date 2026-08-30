@@ -38,13 +38,19 @@ def _wireframe(part_name: str, root: pathlib.Path | None = None):
     return json.loads(f.read_text()) if f.exists() else None
 
 
-def chain_polylines(polys, weld: float = WELD_MM):
+def chain_polylines(polys, weld: float = WELD_MM, through_junctions: bool = False):
     """Join polylines that share an endpoint into maximal curves.
 
     A curve stops where nothing continues it, or where it closes on itself.
-    Junctions where three or more curves meet are left as separate curves -- a
-    mesher needs the junction to be a node, and forcing a choice of which pair
-    to continue would invent structure that is not in the part.
+    Junctions where three or more curves meet are left as separate curves by
+    default -- a mesher needs the junction to be a node, and forcing a choice of
+    which branch continues would invent structure the part does not have.
+
+    `through_junctions` continues anyway, taking the branch that turns least.
+    That is right where the curve is known in advance to be a single loop: an
+    outline touches itself at a few points (measured: 2 of 22 junctions on a
+    typical part have degree 4) and stopping there splits one boundary into five
+    pieces. It is wrong for bend lines, where a junction is a real node.
     """
     at = collections.defaultdict(list)
 
@@ -55,6 +61,13 @@ def chain_polylines(polys, weld: float = WELD_MM):
         at[key(p[0])].append((i, 0))
         at[key(p[-1])].append((i, 1))
 
+    def heading(seg, at_end):
+        if len(seg) < 2:                # a one-point piece has no direction
+            return np.zeros(3)
+        d = (seg[-1] - seg[-2]) if at_end else (seg[0] - seg[1])
+        n = float(np.linalg.norm(d))
+        return d / n if n > 1e-12 else np.zeros(3)
+
     used, out = set(), []
     for i0 in range(len(polys)):
         if i0 in used:
@@ -63,13 +76,27 @@ def chain_polylines(polys, weld: float = WELD_MM):
         cur = [np.asarray(polys[i0], float)]
         for forward in (True, False):
             while True:
-                tip = cur[-1][-1] if forward else cur[0][0]
+                seg_now = cur[-1] if forward else cur[0]
+                tip = seg_now[-1] if forward else seg_now[0]
                 here = at[key(tip)]
-                if len(here) != 2:          # an end, or a junction: stop
+                if len(here) < 2:
                     break
+                if len(here) != 2 and not through_junctions:
+                    break               # a junction: a mesher needs it as a node
                 nxt = [(i, e) for i, e in here if i not in used]
                 if not nxt:
                     break
+                if len(nxt) > 1:
+                    # straightest continuation, so a self-touching outline
+                    # carries on around instead of turning up a side branch
+                    h = heading(seg_now, forward)
+                    def align(ie):
+                        s = np.asarray(polys[ie[0]], float)
+                        s = s if ie[1] == 0 else s[::-1]
+                        d = s[1] - s[0]
+                        n = float(np.linalg.norm(d))
+                        return float(h @ (d / n)) if n > 1e-12 else -1.0
+                    nxt.sort(key=align, reverse=True)
                 i, e = nxt[0]
                 used.add(i)
                 seg = np.asarray(polys[i], float)
@@ -78,6 +105,8 @@ def chain_polylines(polys, weld: float = WELD_MM):
                     cur.append(seg[1:])
                 else:
                     cur.insert(0, seg[:-1])
+                if key(cur[-1][-1]) == key(cur[0][0]):
+                    break                       # closed on itself
         out.append(np.concatenate(cur))
     return out
 
@@ -104,7 +133,8 @@ def outline_polylines(part, root=None):
         return []
     polys = [np.asarray(e["polyline"], float) for e in d["edges"]
              if e["type"] == "outer_boundary" and len(e["polyline"]) >= 2]
-    return chain_polylines(polys) if polys else []
+    # an outline is one loop, so walk through the points where it touches itself
+    return chain_polylines(polys, through_junctions=True) if polys else []
 
 
 def describe(curves):

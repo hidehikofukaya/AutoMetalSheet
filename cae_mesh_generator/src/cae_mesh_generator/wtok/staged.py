@@ -29,6 +29,8 @@ from torch.utils.data import Dataset
 
 from .constants import stable_seed
 from .feature import CTRL, FEAT_CH, FEAT_SLOTS, PARAM
+from .deltatok import DTOK_CH, curves_to_delta, delta_to_curves
+from .tokens import TOK_CH, TOK_N, curves_to_tokens, tokens_to_curves
 from .frame import BEND_SLOTS, EDGE_SLOTS, FRAME_CH, MULTI_CH
 from .meshgen import (CH as MESH_CH, FIELD_CAP, fastener_frame, fastener_disc,
                       fix_points_mm, fps_order, frame_cond_rows, to_frame)
@@ -45,11 +47,14 @@ STAGES = ("outline", "bend", "surface")
 # the series wherever "bend" would.
 STAGE_ORDER = {"outline": 0, "outline_frame": 0, "outline_multi": 0,
                "bend": 1, "bend_pc": 1, "bend_frame": 1, "feature": 1,
-               "surface": 2}
+               "bend_tok": 1, "outline_tok": 0,
+               "bend_delta": 1, "outline_delta": 0, "surface": 2}
 # how many channels each stage's target carries. Only the parametric frame
 # differs: it adds the arc bulge and the arc flag to the usual 7.
 STAGE_CH = {"outline_frame": FRAME_CH, "bend_frame": FRAME_CH,
-            "outline_multi": MULTI_CH, "feature": FEAT_CH}
+            "outline_multi": MULTI_CH, "feature": FEAT_CH,
+            "bend_tok": TOK_CH, "outline_tok": TOK_CH,
+            "bend_delta": DTOK_CH, "outline_delta": DTOK_CH}
 GUARD_PER_FIX = 8
 CH = 7          # xyz 3, tangent-or-normal 3, off-the-part flag 1
 
@@ -201,6 +206,29 @@ def stage_target(part, mesh_dir, stage: str, n_pts: int, rng):
     if stage == "outline_frame":
         from .frame import frame_target
         return frame_target(part, frame)
+    if stage in ("outline_delta", "bend_delta"):
+        from .bendlines import mesh_bend_lines, outline_polylines
+        cur = (outline_polylines(part) if stage == "outline_delta"
+               else mesh_bend_lines(part, classes=("bend_line", "crease")))
+        if not cur:
+            return None
+        return curves_to_delta(cur, frame, n_tok=n_pts)[0]
+    if stage == "outline_tok":
+        # The simplest possible test of the token layout: an outline is ONE
+        # closed curve, so a correct output has exactly one `end` and `close`
+        # set throughout. If tokens cannot do that, the tangle in the bend
+        # output is the representation's fault rather than the bends'.
+        from .bendlines import outline_polylines
+        cur = outline_polylines(part)
+        if not cur:
+            return None
+        return curves_to_tokens(cur, frame, n_tok=n_pts)[0]
+    if stage == "bend_tok":
+        from .bendlines import mesh_bend_lines
+        cur = mesh_bend_lines(part, classes=("bend_line", "crease"))
+        if not cur:
+            return None
+        return curves_to_tokens(cur, frame, n_tok=n_pts)[0]
     if stage == "outline_multi":
         from .frame import multi_frame_target
         return multi_frame_target(part, frame)
@@ -310,6 +338,10 @@ class StageDataset(Dataset):
                                "outline_multi": EDGE_SLOTS,
                                "bend_frame": BEND_SLOTS,
                                "feature": FEAT_SLOTS,
+                               "bend_tok": TOK_N,
+                               "outline_tok": TOK_N,
+                               "bend_delta": TOK_N,
+                               "outline_delta": TOK_N,
                                "bend": BEND_STRANDS * BEND_PER_STRAND,
                                "bend_pc": N_BEND,
                                "surface": N_SURFACE}[stage]
@@ -340,7 +372,7 @@ class StageDataset(Dataset):
     def ctx_len(self):
         """Rows of context this run always emits, whatever is withheld."""
         n = 0
-        if self.stage in ("bend_frame", "feature"):
+        if self.stage in ("bend_frame", "feature", "bend_tok", "bend_delta"):
             n += EDGE_SLOTS
         if self.surf_curv:
             n += 256
@@ -372,14 +404,15 @@ class StageDataset(Dataset):
         x = x.copy()
 
         if self.stage in ("outline_frame", "outline_multi", "bend_frame",
-                          "feature"):
+                          "feature", "bend_tok", "outline_tok",
+                          "bend_delta", "outline_delta"):
             # No outlier injection: an edge is not a point that can be nudged
             # off the surface, and the unused-slot flag already carries the
             # only "this is not part of the shape" the frame has.
             fx, fn = fastener_disc(p, GUARD_PER_FIX, rng=rng)
             f, fd = to_frame(fx, fn, fastener_frame(p))
             ctx, n_ctx = np.zeros((1, ch), np.float32), 0
-            if self.stage in ("bend_frame", "feature"):
+            if self.stage in ("bend_frame", "feature", "bend_tok", "bend_delta"):
                 # the OUTLINE frame is what stage 2 reads. Its slots are edges,
                 # not points, and the context encoder wants xyz + a direction,
                 # so each edge is handed over as its corner and its chord.
@@ -736,7 +769,13 @@ def flow_loss(model, batch, p_drop: float = 0.0, n_pin: int = 0):
         # position 1.0, direction 0.2, flag 0.5. The parametric frame reads the
         # same way: corner 1.0, bulge 0.2, then the arc and unused flags 0.5 --
         # the bulge is a small offset and would otherwise be drowned out.
-        if x1.shape[-1] == FEAT_CH:
+        if x1.shape[-1] == DTOK_CH:
+            # step 1.0 -- it IS the shape now | the three flags 0.5 | unused 0.5
+            w = [1., 1., 1., .5, .5, .5, .5]
+        elif x1.shape[-1] == TOK_CH:
+            # xyz 1.0 | tangent 0.3 | end 0.5 | close 0.5 | unused 0.5
+            w = [1., 1., 1., .3, .3, .3, .5, .5, .5]
+        elif x1.shape[-1] == FEAT_CH:
             # kind 0.5 | unused 0.5 | ANCHORS 1.0 (they place the whole curve)
             # control offsets 0.3 | parameters 0.5
             w = ([.5] * 4 + [1.] * 4 + [.3] * (PARAM - CTRL)
@@ -815,6 +854,25 @@ def probe(model, ds, device, n_parts=12, steps=24, scale=2.0):
         ctx = it["ctx"][None].to(device) if model.cross else None
         x = sample(model, cond, fix, ctx, ds.n_pts, steps, scale)[0]
         p = x[:, :3].cpu().numpy().astype(np.float64)
+        if ds.stage in ("bend_delta", "outline_delta"):
+            g = x.cpu().numpy().astype(np.float64)
+            w = it["x"].numpy().astype(np.float64)
+            gc, wc = delta_to_curves(g), delta_to_curves(w)
+            ends.append(abs(len(gc) - len(wc)) / max(len(wc), 1))
+            mm = fastener_frame(ds.parts[i])[2]
+            cvs.append(mm * float(cKDTree(np.concatenate(wc)).query(
+                np.concatenate(gc))[0].mean()) if gc and wc else 99.0)
+            continue
+        if ds.stage in ("bend_tok", "outline_tok"):
+            g = x.cpu().numpy().astype(np.float64)
+            w = it["x"].numpy().astype(np.float64)
+            gc, wc = tokens_to_curves(g), tokens_to_curves(w)
+            # how many curves came out, against how many the part has
+            ends.append(abs(len(gc) - len(wc)) / max(len(wc), 1))
+            mm = fastener_frame(ds.parts[i])[2]
+            cvs.append(mm * float(cKDTree(np.concatenate(wc)).query(
+                np.concatenate(gc))[0].mean()) if gc and wc else 99.0)
+            continue
         if ds.stage == "feature":
             from .feature import KINDS, realize_features
             from .frame import frame_target, realize_frame
@@ -908,15 +966,20 @@ def train(args):
     print(f"stage {args.stage}: train {len(train_parts)} val {len(val_parts)}",
           flush=True)
 
-    cross = (args.stage not in ("outline", "outline_frame", "outline_multi")
+    cross = (args.stage not in ("outline", "outline_frame", "outline_multi",
+                                "outline_tok", "outline_delta")
              or bool(args.cloud_bank) or bool(args.surf_curv))
     if args.cloud_drop and not args.cloud_bank:
         raise SystemExit("--cloud-drop needs --cloud-bank")
     # bend_frame slots are separate folds with no order between them, only the
     # canonical longest-first ranking, so no positional encoding applies.
+    # bend_tok tokens are an ordered sequence -- curves laid end to end, points
+    # in traversal order -- so slot i means the same thing on every part
     ordered = {"outline": "loop", "outline_frame": "loop",
                "outline_multi": "loop", "bend": "strand",
-               "feature": "slot"}.get(args.stage, "")
+               "feature": "slot", "bend_tok": "slot",
+               "outline_tok": "slot", "bend_delta": "slot",
+               "outline_delta": "slot"}.get(args.stage, "")
     # bend_pc is deliberately unordered: with no slot structure there is nothing
     # for a positional encoding to encode.
     ds = StageDataset(train_parts, md, args.stage, base_seed=7,
