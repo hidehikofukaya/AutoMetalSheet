@@ -246,7 +246,28 @@ if __name__ == "__main__":
     demo()
 
 
-CONSIST_LAMBDA = 2.0    # swept, not tuned: see below
+CONSIST_LAMBDA = 0.0    # OFF -- see below
+
+
+# A signed-sagitta form of the bulge was tried and reverted (2026-08-31).
+# The idea was to make the arc's direction structural: store the bulge as one
+# signed number along the loop's in-plane outward direction, so it could not
+# point out of plane and could not bow the wrong way. Measured, the model gets
+# the direction wrong on 23% of edges, so the motivation was real.
+#
+# It fails because an outline loop in 3D is not planar enough for its "outward"
+# direction to be right everywhere. Projecting the true bulge onto it keeps a
+# median 0.913 of the magnitude but only 0.133 at the 25th percentile, and 40%
+# of arcs lose more than HALF their bulge -- those get drawn as straight chords,
+# which is exactly the angular corner the user spotted in the teacher overlay.
+#
+# The circle centre was rejected before that, also on measurement: it reaches
+# 2116mm on a part a tenth that size, because a gentle arc has a huge radius.
+# The fillet assumption fails too -- only 15% of outline arcs are tangent to
+# their neighbours and only 29% of consecutive arcs share a centre.
+#
+# So the free 3-vector bulge stands. Its 23% wrong-direction rate costs 0.03mm
+# of Chamfer and remains an open defect.
 
 
 def consistent_corners(P, N, lam: float = CONSIST_LAMBDA):
@@ -264,6 +285,12 @@ def consistent_corners(P, N, lam: float = CONSIST_LAMBDA):
     corners with a fixed 4-plane cap and a hand-set tolerance; it drove the
     twist to zero and moved the shape 0.34mm further from the part, and was
     dropped.
+
+    DEFAULT IS NOW 0 (off). The lambda below was swept on generations from the
+    11-channel model as it stood in August, and re-sweeping it after later
+    changes gave 4.95mm at lam=0 against 10.69mm at lam=2, with the twist no
+    better either way. A post-process tuned against one checkpoint does not
+    survive the next one; it is left available but not applied by default.
 
     lam trades consistency against staying near the emitted corners. Median
     over THREE independent draws x 30 val parts:
