@@ -42,7 +42,8 @@ def main():
 
     env = dict(os.environ, PYTHONPATH=str(root),
                WTOK_SPEC_FILE=str(data / "spec_vectors.json"))
-    sweep = json.loads(os.environ.get("WTOK_SWEEP", "[]")) or [
+    # the kernel script exports WTOK_SWEEP="" when no sweep is given
+    sweep = json.loads(os.environ.get("WTOK_SWEEP") or "[]") or [
         {"tag": "base", "dim": 256, "layers": 8, "epochs": 300},
         {"tag": "wide", "dim": 384, "layers": 8, "epochs": 300},
         {"tag": "deep", "dim": 256, "layers": 14, "epochs": 300},
