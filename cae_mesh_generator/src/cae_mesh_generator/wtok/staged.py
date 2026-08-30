@@ -28,6 +28,7 @@ from scipy.spatial import cKDTree
 from torch.utils.data import Dataset
 
 from .constants import stable_seed
+from .feature import CTRL, FEAT_CH, FEAT_SLOTS, PARAM
 from .frame import BEND_SLOTS, EDGE_SLOTS, FRAME_CH, MULTI_CH
 from .meshgen import (CH as MESH_CH, FIELD_CAP, fastener_frame, fastener_disc,
                       fix_points_mm, fps_order, frame_cond_rows, to_frame)
@@ -43,11 +44,12 @@ STAGES = ("outline", "bend", "surface")
 # points with the 32x20 slot scaffolding taken away. It sits between the two in
 # the series wherever "bend" would.
 STAGE_ORDER = {"outline": 0, "outline_frame": 0, "outline_multi": 0,
-               "bend": 1, "bend_pc": 1, "bend_frame": 1, "surface": 2}
+               "bend": 1, "bend_pc": 1, "bend_frame": 1, "feature": 1,
+               "surface": 2}
 # how many channels each stage's target carries. Only the parametric frame
 # differs: it adds the arc bulge and the arc flag to the usual 7.
 STAGE_CH = {"outline_frame": FRAME_CH, "bend_frame": FRAME_CH,
-            "outline_multi": MULTI_CH}
+            "outline_multi": MULTI_CH, "feature": FEAT_CH}
 GUARD_PER_FIX = 8
 CH = 7          # xyz 3, tangent-or-normal 3, off-the-part flag 1
 
@@ -171,6 +173,25 @@ def smooth_curve(pts, k_max=K_MAX, dk_max=DK_MAX, iters=60):
     return P
 
 
+def curvature_field(P, N, k=14):
+    """How fast the normal turns at each point -- |grad n| up to a scale.
+
+    This is what makes a bend visible without naming it. Measured against the
+    sidecar's true ridge curves: on a ridge the normal turns 8.20 deg per
+    neighbourhood, off it 0.13 deg, a factor of 63, and the same number holds
+    for a fold, a bead ridge and a flange root alike. No class, no count, no
+    assumption that a feature is extruded along a spine -- a dimple or a louvre
+    lip raises the same field.
+
+    Absolute dot product, so it does not need the normals to agree on a side,
+    which a point cloud's normals never do.
+    """
+    nb = cKDTree(P).query(P, k=min(k, len(P)))[1]
+    a = np.degrees(np.arccos(np.clip(
+        np.abs(np.einsum("ij,ikj->ik", N, N[nb])), 0, 1)))
+    return a.mean(1)
+
+
 def stage_target(part, mesh_dir, stage: str, n_pts: int, rng):
     """The true point set for one stage, in the fastener frame.
 
@@ -183,6 +204,17 @@ def stage_target(part, mesh_dir, stage: str, n_pts: int, rng):
     if stage == "outline_multi":
         from .frame import multi_frame_target
         return multi_frame_target(part, frame)
+    if stage == "feature":
+        # anchored to the outline, so the target depends on WHICH outline: the
+        # true one here, the generated one once a bank exists. Both are
+        # canonicalised rings, so a fraction along one means the same relative
+        # place on the other -- which is the point of anchoring at all.
+        from .feature import feature_target
+        from .frame import frame_target, realize_frame
+        ft = frame_target(part, frame)
+        if ft is None:
+            return None
+        return feature_target(part, frame, realize_frame(ft, per_edge=60))
     if stage == "bend_frame":
         from .frame import bend_frame_target
         return bend_frame_target(part, frame)
@@ -277,6 +309,7 @@ class StageDataset(Dataset):
                                "outline_frame": EDGE_SLOTS,
                                "outline_multi": EDGE_SLOTS,
                                "bend_frame": BEND_SLOTS,
+                               "feature": FEAT_SLOTS,
                                "bend": BEND_STRANDS * BEND_PER_STRAND,
                                "bend_pc": N_BEND,
                                "surface": N_SURFACE}[stage]
@@ -298,6 +331,7 @@ class StageDataset(Dataset):
                 if c.is_dir():
                     self.cloud_bank.append(c)
         self.cloud_drop = 0.0
+        self.surf_curv = False
         self.n_context = n_context
         self.outlier_rate = outlier_rate
         self.cache: dict = {}
@@ -306,8 +340,10 @@ class StageDataset(Dataset):
     def ctx_len(self):
         """Rows of context this run always emits, whatever is withheld."""
         n = 0
-        if self.stage == "bend_frame":
+        if self.stage in ("bend_frame", "feature"):
             n += EDGE_SLOTS
+        if self.surf_curv:
+            n += 256
         if self.cloud_bank:
             n += 256
         return max(n, 1)
@@ -335,14 +371,15 @@ class StageDataset(Dataset):
             x[:, -1] = 1.0                             # every slot unused
         x = x.copy()
 
-        if self.stage in ("outline_frame", "outline_multi", "bend_frame"):
+        if self.stage in ("outline_frame", "outline_multi", "bend_frame",
+                          "feature"):
             # No outlier injection: an edge is not a point that can be nudged
             # off the surface, and the unused-slot flag already carries the
             # only "this is not part of the shape" the frame has.
             fx, fn = fastener_disc(p, GUARD_PER_FIX, rng=rng)
             f, fd = to_frame(fx, fn, fastener_frame(p))
             ctx, n_ctx = np.zeros((1, ch), np.float32), 0
-            if self.stage == "bend_frame":
+            if self.stage in ("bend_frame", "feature"):
                 # the OUTLINE frame is what stage 2 reads. Its slots are edges,
                 # not points, and the context encoder wants xyz + a direction,
                 # so each edge is handed over as its corner and its chord.
@@ -354,7 +391,11 @@ class StageDataset(Dataset):
                     d = np.roll(o[live, 0:3], -1, 0) - o[live, 0:3]
                     ctx[:, 3:6] = d / np.maximum(
                         np.linalg.norm(d, axis=1, keepdims=True), 1e-9)
-                    ctx[:, 6:] = o[live, 6:][:, :ch - 6]
+                    # the outline frame is 11 wide; a stage with more channels
+                    # gets the rest left at zero rather than a shape error
+                    extra = o[live, 6:]
+                    n_extra = min(extra.shape[1], ch - 6)
+                    ctx[:, 6:6 + n_extra] = extra[:, :n_extra]
                     n_ctx = len(ctx)
                     # pad to a fixed length so the batch stacks. Repeats rather
                     # than zeros: a zero row is a point at the origin, and the
@@ -363,6 +404,21 @@ class StageDataset(Dataset):
                     if n_ctx < EDGE_SLOTS:
                         ctx = np.concatenate(
                             [ctx, ctx[np.arange(EDGE_SLOTS - n_ctx) % n_ctx]])
+            if self.surf_curv:
+                # ORACLE: the true surface with its curvature field, to bound
+                # what a curvature field can buy before one is generated
+                d = np.load(self.dir / f"{p.name}.npz")
+                sp = np.maximum(d["env_hi"] - d["env_lo"], 1e-9)
+                P = d["xyz"].astype(np.float64) * sp + d["env_lo"]
+                sel = rng.choice(len(P), min(256, len(P)), replace=False)
+                P, Nn = P[sel], d["normal"][sel].astype(np.float64)
+                g = curvature_field(P, Nn)
+                Pf, Nf = to_frame(P, Nn, fastener_frame(p))
+                add = np.zeros((len(Pf), ch), np.float32)
+                add[:, :3], add[:, 3:6] = Pf, Nf
+                add[:, 6] = g / 30.0                      # degrees -> O(1)
+                ctx = add if n_ctx == 0 else np.concatenate([ctx, add])
+                n_ctx = len(ctx)
             if self.cloud_bank and rng.random() >= self.cloud_drop:
                 bk = self.cloud_bank[rng.integers(len(self.cloud_bank))]
                 cf = bk / f"{p.name}.npy"
@@ -583,6 +639,23 @@ class StageFlow(nn.Module):
         self.dim = dim
 
     @staticmethod
+    def slot_pe(n, dim, device):
+        """Plain sinusoidal encoding of a slot index.
+
+        Not cyclic and not two-part: the feature slots are a short ordered list
+        (fold, fold, then the bead or flange), so all a slot needs is its own
+        identity. Without it the model produced the right multiset of features
+        and scattered them across arbitrary slots -- (bead, fold, fold) as often
+        as (fold, fold, bead) -- because a loss compared slot by slot has no way
+        to say which slot a feature belongs in. Fifth time in this project that
+        meaningful slots turned out to need an encoding.
+        """
+        i = torch.arange(n, device=device).float()[:, None]
+        k = torch.arange(dim // 2, device=device).float()
+        f = torch.exp(-np.log(10000.0) * 2 * k / dim)[None]
+        return torch.cat([torch.sin(i * f), torch.cos(i * f)], -1)[:, :dim]
+
+    @staticmethod
     def strand_pe(n, dim, device, per=None):
         """Which strand a slot belongs to, and where it sits along that strand.
 
@@ -630,6 +703,8 @@ class StageFlow(nn.Module):
             h = h + self.ring_pe(x.shape[1], self.dim, x.device)[None]
         elif self.ordered == "strand":
             h = h + self.strand_pe(x.shape[1], self.dim, x.device)[None]
+        elif self.ordered == "slot":
+            h = h + self.slot_pe(x.shape[1], self.dim, x.device)[None]
         c = self.t_mlp(timestep_embedding(t, self.dim))
         # the fastening points and the frame rows are known for every stage
         mem = torch.cat([self.cond(cond), self.fixp(fix)], dim=1)
@@ -661,11 +736,17 @@ def flow_loss(model, batch, p_drop: float = 0.0, n_pin: int = 0):
         # position 1.0, direction 0.2, flag 0.5. The parametric frame reads the
         # same way: corner 1.0, bulge 0.2, then the arc and unused flags 0.5 --
         # the bulge is a small offset and would otherwise be drowned out.
-        base = [1., 1., 1., .2, .2, .2, .5, .5, .2, .2, .2, .5]
-        W_CH = (torch.tensor([1., 1., 1., .2, .2, .2, .5], device=x1.device)
-                if x1.shape[-1] == CH else
-                torch.tensor(base + [.5] * max(0, x1.shape[-1] - len(base)),
-                             device=x1.device)[:x1.shape[-1]])
+        if x1.shape[-1] == FEAT_CH:
+            # kind 0.5 | unused 0.5 | ANCHORS 1.0 (they place the whole curve)
+            # control offsets 0.3 | parameters 0.5
+            w = ([.5] * 4 + [1.] * 4 + [.3] * (PARAM - CTRL)
+                 + [.5] * (FEAT_CH - PARAM))
+        elif x1.shape[-1] == CH:
+            w = [1., 1., 1., .2, .2, .2, .5]
+        else:
+            base = [1., 1., 1., .2, .2, .2, .5, .5, .2, .2, .2, .5]
+            w = base + [.5] * max(0, x1.shape[-1] - len(base))
+        W_CH = torch.tensor(w[:x1.shape[-1]], device=x1.device)
     x0 = torch.randn_like(x1)
     t = torch.rand(B, device=x1.device)
     xt = (1 - t[:, None, None]) * x0 + t[:, None, None] * x1
@@ -734,6 +815,23 @@ def probe(model, ds, device, n_parts=12, steps=24, scale=2.0):
         ctx = it["ctx"][None].to(device) if model.cross else None
         x = sample(model, cond, fix, ctx, ds.n_pts, steps, scale)[0]
         p = x[:, :3].cpu().numpy().astype(np.float64)
+        if ds.stage == "feature":
+            from .feature import KINDS, realize_features
+            from .frame import frame_target, realize_frame
+            g = x.cpu().numpy().astype(np.float64)
+            w = it["x"].numpy().astype(np.float64)
+            ft = frame_target(ds.parts[i], fastener_frame(ds.parts[i]))
+            loop = realize_frame(ft, per_edge=60)
+            gf, wf = realize_features(g, loop), realize_features(w, loop)
+            # the kinds are the thing to get right; the anchors cannot be wrong
+            kg = [k for k, _, _ in gf]
+            kw = [k for k, _, _ in wf]
+            ends.append(0.0 if kg == kw else 1.0)
+            mm = fastener_frame(ds.parts[i])[2]
+            cvs.append(mm * float(cKDTree(np.concatenate([p for _, p, _ in wf])
+                       ).query(np.concatenate([p for _, p, _ in gf]))[0].mean())
+                       if gf and wf else 99.0)
+            continue
         if ds.stage == "bend_frame":
             from .frame import realize_bend
             g = x.cpu().numpy().astype(np.float64)
@@ -811,20 +909,23 @@ def train(args):
           flush=True)
 
     cross = (args.stage not in ("outline", "outline_frame", "outline_multi")
-             or bool(args.cloud_bank))
+             or bool(args.cloud_bank) or bool(args.surf_curv))
     if args.cloud_drop and not args.cloud_bank:
         raise SystemExit("--cloud-drop needs --cloud-bank")
     # bend_frame slots are separate folds with no order between them, only the
     # canonical longest-first ranking, so no positional encoding applies.
     ordered = {"outline": "loop", "outline_frame": "loop",
-               "outline_multi": "loop", "bend": "strand"}.get(args.stage, "")
+               "outline_multi": "loop", "bend": "strand",
+               "feature": "slot"}.get(args.stage, "")
     # bend_pc is deliberately unordered: with no slot structure there is nothing
     # for a positional encoding to encode.
     ds = StageDataset(train_parts, md, args.stage, base_seed=7,
                       outlier_rate=args.outlier_rate, cloud_bank=args.cloud_bank)
     ds.cloud_drop = args.cloud_drop
+    ds.surf_curv = bool(args.surf_curv)
     vs = StageDataset(val_parts, md, args.stage, base_seed=555,
                       cloud_bank=args.cloud_bank)
+    vs.surf_curv = bool(args.surf_curv)
     dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
     model = StageFlow(args.dim, args.layers, args.heads, cross, ordered,
                       ch=STAGE_CH.get(args.stage, CH)).to(args.device)
@@ -919,6 +1020,9 @@ def main():
     ap.add_argument("--cloud-bank", default="",
                     help="directory of precomputed bulk-generator clouds to "
                          "condition on (one <part>.npy of (N,6) per part)")
+    ap.add_argument("--surf-curv", action="store_true",
+                    help="ORACLE: condition on the true surface and its "
+                         "curvature field, to bound what one can buy")
     ap.add_argument("--cloud-drop", type=float, default=0.0,
                     help="probability of withholding the cloud during training, "
                          "so the model does not learn to depend on it")

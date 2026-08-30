@@ -22,6 +22,8 @@ Branch: `feat/softmin-guidance-poc`
 | 8 | [08_night_202608_30.md](08_night_202608_30.md) | 2026-08-30 夜間の実施記録と判定 | 続きをやる人 |
 | 9 | [09_generalisation.md](09_generalisation.md) | 穴・ビードへの一般化と、データ側への依頼 | 抽出を拡張する人 |
 | 10 | [10_sidecar_finding.md](10_sidecar_finding.md) | **曲げ表現が根本的に誤っていた。**生成物の90.6%はビードの稜線 | 曲げに関わる人。必読 |
+| 11 | [11_generality_audit.md](11_generality_audit.md) | 特定形状への特化の洗い出し。構造的な問題と上限の切り分け | 設計を変える人 |
+| 12 | [12_conditioning_rule.md](12_conditioning_rule.md) | **導出できる情報は効かない。**4度の失敗と1つの成功 | 条件を足そうとする人。必読 |
 
 ---
 
