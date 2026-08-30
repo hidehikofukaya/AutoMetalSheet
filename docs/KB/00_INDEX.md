@@ -29,7 +29,8 @@ Branch: `feat/softmin-guidance-poc`
 | 13 | [13_mechanics_geometry.md](13_mechanics_geometry.md) | 材料力学×幾何の整理。何を入力に、何を教師信号にできるか | 情報を増やそうとする人 |
 | 14 | [14_delta_tokens.md](14_delta_tokens.md) | 変位トークン。**保留中、次は曲げで試す** | 続きをやる人 |
 | 15 | [15_micro_structure_design.md](15_micro_structure_design.md) | 微細構造の設計と結果(A✗ B△ C○、関係損失✗) | 経緯を追う人 |
-| 16 | [16_engineering_structure.md](16_engineering_structure.md) | **目標の再定義。**is_arcは許容差の産物。工学的妥当性の指標、教師の正準化、展開図表現 | **次に実装する人。必読** |
+| 16 | [16_engineering_structure.md](16_engineering_structure.md) | 目標の再定義。is_arcは許容差の産物。教師の正準化、展開図表現 | 次に実装する人 |
+| 17 | [17_rationality.md](17_rationality.md) | **合理性 = 形の理由を説明できること。**3層評価(製造可能性/簡潔性/機能)。座面余裕比0.763という不合格 | **次に実装する人。必読** |
 
 ---
 
