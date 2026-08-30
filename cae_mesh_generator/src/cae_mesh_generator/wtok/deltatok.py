@@ -11,12 +11,26 @@ Measured on the true targets before building this: a displacement field has 54x
 less spread than a position field, and integrating one with 2% per-token noise
 drifts 0.34mm (p90 0.55) against a current position error of 7.7mm.
 
-    [0:3]   step -- displacement to the next token, or the absolute position of
-            a curve's FIRST token
-    [3]     start -- this token begins a curve, so [0:3] is a position
-    [4]     end   -- this token finishes a curve
-    [5]     close -- that curve returns to its own start
-    [6]     unused
+    [0:3]   step  -- displacement to the next token; zero on a start token
+    [3:6]   origin -- absolute position; meaningful only on a start token
+    [6]     start -- this token begins a curve
+    [7]     end   -- this token finishes a curve
+    [8]     close -- that curve returns to its own start
+    [9]     unused
+
+The step and the origin are SEPARATE channels because they are separated by a
+factor of fifty in scale (a step is ~2mm, a position ~100mm). Sharing three
+channels between them, with one loss weight, buried the origin in the step's
+error: measured, the start points came out 37.9mm wrong while the steps were
+1.46mm wrong -- a 26x split that a single channel cannot express.
+
+Both are SCALED so their spread is order 1. Flow matching starts from a unit
+normal, and a raw step is 0.0057 in frame units -- 175x below the noise it has
+to emerge from. The first attempt left it raw and the model produced steps whose
+error (1.46mm) exceeded the step itself (1.0mm), so the direction was free and
+integrating 512 of them could not make a shape. Cutting the token count would
+also fatten the step, but the bend stage cannot afford it: at 128 tokens a curve
+gets 3 points, and there are 26 curves to feed.
 
 A closed curve is closed by construction: its last step is not read from the
 model at all but computed as whatever remains to return to the start. Closure
@@ -30,8 +44,11 @@ from __future__ import annotations
 import numpy as np
 
 TOK_N = 512             # capacity, not a count
-DTOK_CH = 7
-STEP, START, END, CLOSE, UNUSED = slice(0, 3), 3, 4, 5, 6
+DTOK_CH = 10
+STEP_SCALE = 100.0      # a step is ~0.006 in frame units; this lifts it to ~0.6
+ORIGIN_SCALE = 2.0      # a position is ~0.15; this lifts it to ~0.3
+STEP, ORIGIN = slice(0, 3), slice(3, 6)
+START, END, CLOSE, UNUSED = 6, 7, 8, 9
 
 
 def _arc(c):
@@ -74,9 +91,9 @@ def curves_to_delta(curves, frame=None, n_tok: int = TOK_N, min_pts: int = 3):
             p = p[::-1]
         if frame is not None:
             p, _ = to_frame(p, np.zeros_like(p), frame)
-        x[at, STEP] = p[0]                      # a start token carries a POSITION
+        x[at, ORIGIN] = p[0] * ORIGIN_SCALE      # where this curve begins
         x[at, START] = 1.0
-        x[at + 1:at + len(p), STEP] = np.diff(p, axis=0)
+        x[at + 1:at + len(p), STEP] = np.diff(p, axis=0) * STEP_SCALE
         x[at:at + len(p), UNUSED] = 0.0
         x[at + len(p) - 1, END] = 1.0
         if closed:
@@ -111,9 +128,9 @@ def delta_to_curves(x, thr: float = 0.5):
     for idx in out:
         if len(idx) < 2:
             continue
-        p = [x[idx[0], STEP].copy()]
+        p = [x[idx[0], ORIGIN] / ORIGIN_SCALE]
         for j in idx[1:]:
-            p.append(p[-1] + x[j, STEP])
+            p.append(p[-1] + x[j, STEP] / STEP_SCALE)
         p = np.stack(p)
         if x[idx[0], CLOSE] > thr:
             # drop the emitted last step and close the loop exactly
@@ -158,7 +175,8 @@ def demo():
             # closure must survive a corrupted step field
             y = x.copy()
             live = y[:, UNUSED] < 0.5
-            y[live, STEP] += rng.normal(scale=0.02, size=(int(live.sum()), 3))
+            y[live, STEP] += rng.normal(scale=0.02*STEP_SCALE,
+                                        size=(int(live.sum()), 3))
             for c in delta_to_curves(y):
                 if len(c) > 2 and np.linalg.norm(c[0] - c[-1]) < 1e-9:
                     gap.append(0.0)

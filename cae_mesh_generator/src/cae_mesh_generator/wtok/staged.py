@@ -770,8 +770,10 @@ def flow_loss(model, batch, p_drop: float = 0.0, n_pin: int = 0):
         # same way: corner 1.0, bulge 0.2, then the arc and unused flags 0.5 --
         # the bulge is a small offset and would otherwise be drowned out.
         if x1.shape[-1] == DTOK_CH:
-            # step 1.0 -- it IS the shape now | the three flags 0.5 | unused 0.5
-            w = [1., 1., 1., .5, .5, .5, .5]
+            # step and origin are scaled to comparable spread in deltatok, so
+            # they take the same weight. The origin keeps a little more because
+            # it places an entire curve while a step moves one token.
+            w = [1., 1., 1., 1.5, 1.5, 1.5, .5, .5, .5, .5]
         elif x1.shape[-1] == TOK_CH:
             # xyz 1.0 | tangent 0.3 | end 0.5 | close 0.5 | unused 0.5
             w = [1., 1., 1., .3, .3, .3, .5, .5, .5]
