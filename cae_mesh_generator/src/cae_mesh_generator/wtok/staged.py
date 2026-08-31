@@ -375,6 +375,13 @@ class StageDataset(Dataset):
         self.outlier_rate = outlier_rate
         self.cache: dict = {}
         self.self_bank: dict = {}       # stage name -> {part: (n, CH)}
+        # Batching with a VARIABLE fastener count: cond rows and guard-disc
+        # rows follow the part (frame_cond_rows emits one row per fastener),
+        # so a batch mixing counts cannot stack. Pad both to this dataset's
+        # own maximum -- a capacity counted from the data, not a fixed N.
+        n_fix = [sum(1 for v in p.vertices if v.get("T") == "FIX")
+                 for p in self.parts]
+        self.max_fix = max(n_fix) if n_fix else 1
 
     def ctx_len(self):
         """Rows of context this run always emits, whatever is withheld."""
@@ -418,7 +425,13 @@ class StageDataset(Dataset):
             # only "this is not part of the shape" the frame has.
             fx, fn = fastener_disc(p, GUARD_PER_FIX, rng=rng)
             f, fd = to_frame(fx, fn, fastener_frame(p))
-            cond = frame_cond_rows(p)
+            cond = frame_cond_rows(p, rows=self.max_fix + 1)
+            if len(f) < self.max_fix * GUARD_PER_FIX:
+                # pad by repeating real disc points, not zeros: a zero row is
+                # a point at the frame origin, which would invent structure
+                idx = np.arange(self.max_fix * GUARD_PER_FIX - len(f)) % len(f)
+                f = np.concatenate([f, f[idx]])
+                fd = np.concatenate([fd, fd[idx]])
             if self.use_spec:
                 # The design spec, as one extra condition row. It is the
                 # generator's own input, so it is not derivable from the
