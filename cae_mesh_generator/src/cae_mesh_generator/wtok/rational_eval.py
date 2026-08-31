@@ -29,11 +29,21 @@ K_DRAWS = 9
 
 
 def load_model(path, device):
+    """Rebuild a StageFlow from its checkpoint alone: channel width from the
+    weights, cross-attention from whether the context encoder was saved, and
+    the slot structure from the stage it was trained for. The old hardcoded
+    cross=False/'loop' silently mis-built every non-outline model."""
     ck = torch.load(path, map_location=device, weights_only=False)
     a = ck["args"]
     ch = ck["model"]["inp.weight"].shape[1]     # the layout the ckpt was trained on
-    m = StageFlow(a["dim"], a["layers"], a["heads"], cross=False,
-                  ordered="loop", ch=ch, rel=a.get("rel_attn", False)).to(device)
+    cross = any(k.startswith("enc.") for k in ck["model"])
+    ordered = {"outline": "loop", "outline_frame": "loop", "outline_multi": "loop",
+               "bend": "strand", "feature": "slot", "bend_tok": "slot",
+               "outline_tok": "slot", "bend_delta": "slot", "outline_delta": "slot",
+               "chain_set": "slot", "chain_edges": "strand"}.get(
+                   a.get("stage", "outline_frame"), "loop")
+    m = StageFlow(a["dim"], a["layers"], a["heads"], cross=cross,
+                  ordered=ordered, ch=ch, rel=a.get("rel_attn", False)).to(device)
     m.load_state_dict(ck["model"])
     m.eval()
     return m, ck.get("epoch", -1), a, ch
