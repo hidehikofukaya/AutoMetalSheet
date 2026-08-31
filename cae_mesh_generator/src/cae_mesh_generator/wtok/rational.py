@@ -171,7 +171,8 @@ def junction_match(x_gen, x_true, tol):
 
     def corners(x):
         live = x[:, 7] < 0.5
-        return x[live, 0:3], x[live, G1_CH] > 0.5
+        from .frame import G1_SMOOTH
+        return x[live, 0:3], x[live, G1_CH] > G1_SMOOTH
 
     if x_gen.shape[1] <= 11 or x_true.shape[1] <= 11:
         return None

@@ -25,8 +25,10 @@ import numpy as np
 
 EDGE_SLOTS = 32         # max measured 26 (24 with the CATIA decomposition)
 FRAME_CH = 12           # corner 3, arc bulge 3, is_arc 1, unused 1, normal 3, g1 1
-G1_CH = 11              # junction with the PREVIOUS edge is tangent-continuous
+G1_CH = 11              # smoothness of the junction with the PREVIOUS edge
 G1_DEG = 3.0            # tangent angle below this is G1, not a corner (KB 18)
+# the G1 channel carries 1 - clip(jt,0,45)/45; smooth means jt < G1_DEG:
+G1_SMOOTH = 1.0 - G1_DEG / 45.0
 NRM_WIN = 1             # corners each side of an edge used to fit its plane
 NRM_TOL = 0.06          # third singular value over the first; above it, not flat
 
@@ -191,7 +193,15 @@ def frame_target(part, frame, slots: int = EDGE_SLOTS, canonical: bool = True):
     x[:n, 6] = is_arc
     x[n:, 7] = 1.0                            # unused slots
     x[:n, 8:11] = edge_normals(p)
-    x[:n, G1_CH] = np.where(np.isfinite(jt) & (jt < G1_DEG), 1.0, 0.0)
+    # SMOOTHNESS, not a bit: 1 - clip(jt,0,45)/45. The binary flag collapsed
+    # to the 91% prior and mislabelled 38.5% of real corners (KB 18.7), and
+    # every realization-side override lost to the flag in the conflict-band
+    # measurement -- so the fix is to hand the model the teacher's own
+    # quantity, the junction angle. The encoding keeps 1=smooth/0=corner, so
+    # old binary checkpoints realize identically (their outputs are bimodal at
+    # 0/1 on either side of any threshold in between).
+    x[:n, G1_CH] = np.where(np.isfinite(jt),
+                            1.0 - np.clip(jt, 0.0, 45.0) / 45.0, 0.0)
     return x
 
 
@@ -393,7 +403,7 @@ def realize_frame(x, per_edge: int = 24, arc_thresh: float = 0.5):
         return np.zeros((0, 3))
     bulge, is_arc = x[live, 3:6], x[live, 6] > arc_thresh
     if x.shape[1] > G1_CH:
-        g1 = x[live, G1_CH] > 0.5
+        g1 = x[live, G1_CH] > G1_SMOOTH
         if g1.any():
             bulge, _ = enforce_g1(p, bulge, is_arc, g1)
     nxt = np.roll(p, -1, 0)
