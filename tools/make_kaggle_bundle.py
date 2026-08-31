@@ -54,6 +54,10 @@ CODE_FILES = [
     "wtok/judge.py",
     "wtok/rational.py",
     "wtok/rational_eval.py",
+    "wtok/chains.py",
+    "wtok/chain_eval.py",
+    "wtok/kaggle_chains.py",
+    "wtok/rational_eval.py",
     "wtok/tokens.py",
     "wtok/deltatok.py",
     "wtok/feature.py",
@@ -121,6 +125,10 @@ def main() -> None:
     sv = data / "spec_vectors.json"
     if sv.exists():
         files.append((sv, "spec_vectors.json"))
+    # precomputed chain targets (KB 20): Kaggle cannot read the 244MB wireframes
+    ct = data / "chain_targets"
+    if ct.exists():
+        files += [(f, f"chain_targets/{f.name}") for f in sorted(ct.glob("*.npz"))]
     zip_dir(OUT / "wtok_synth_data.zip", files)
     print(f"\nUpload {OUT}:\n"
           f"  wtok_code.zip       -> Kaggle Dataset 'wtok-code'\n"

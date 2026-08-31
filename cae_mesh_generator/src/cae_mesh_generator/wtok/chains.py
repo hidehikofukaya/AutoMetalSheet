@@ -160,6 +160,60 @@ def _arclen(c):
     return float(np.linalg.norm(np.diff(c, axis=0), axis=1).sum())
 
 
+def _cache_dir():
+    d = os.environ.get("WTOK_CHAINS", "")
+    return pathlib.Path(d) if d else None
+
+
+def export_cache(out_dir, wtok="runs/wtok_synth_g1", limit=0):
+    """Precompute chain targets for every part into compact npz files, so a
+    machine without the 244MB wireframes (Kaggle) can train the chain stages.
+    One file per part: the live 2a rows, the stacked 2b tensors, closed flags."""
+    from .dataset_curve import load_curve_parts
+    from .meshgen import fastener_frame
+
+    out = pathlib.Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    parts = load_curve_parts(_ROOT / wtok)
+    if limit:
+        parts = parts[:limit]
+    n_ok = n_none = 0
+    for k, p in enumerate(parts):
+        f = out / f"{p.name}.npz"
+        if f.exists():
+            n_ok += 1
+            continue
+        t = chain_targets(p, fastener_frame(p))
+        if t is None:
+            np.savez_compressed(f, none=np.array([1]))
+            n_none += 1
+            continue
+        x2a, c2b = t
+        np.savez_compressed(
+            f, x2a=x2a.astype(np.float32),
+            x2b=np.stack([x for x, _ in c2b]).astype(np.float32),
+            closed=np.array([c for _, c in c2b], np.uint8))
+        n_ok += 1
+        if (k + 1) % 200 == 0:
+            print(f"{k + 1}/{len(parts)}", flush=True)
+    print(f"exported {n_ok} parts ({n_none} without chains) -> {out}")
+
+
+def load_cached_targets(part_name, cache=None):
+    cache = cache or _cache_dir()
+    if cache is None:
+        return False, None
+    f = pathlib.Path(cache) / f"{part_name}.npz"
+    if not f.exists():
+        return False, None
+    d = np.load(f)
+    if "none" in d:
+        return True, None
+    x2a = d["x2a"].astype(np.float64)
+    c2b = [(x.astype(np.float64), bool(c)) for x, c in zip(d["x2b"], d["closed"])]
+    return True, (x2a, c2b)
+
+
 def chain_targets(part, frame, root=None,
                   chain_slots: int = CHAIN_SLOTS, edge_slots: int = CEDGE_SLOTS):
     """(x2a, chains2b) in the fastener frame, canonicalised, or None.
@@ -171,6 +225,9 @@ def chain_targets(part, frame, root=None,
     """
     from .meshgen import to_frame
 
+    hit, cached = load_cached_targets(getattr(part, "name", str(part)))
+    if hit:
+        return cached
     raw = chain_primitives(part, root)
     if not raw:
         return None

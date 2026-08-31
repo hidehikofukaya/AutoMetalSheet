@@ -1238,7 +1238,7 @@ def probe(model, ds, device, n_parts=12, steps=24, scale=2.0):
 def train(args):
     out = pathlib.Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    torch.manual_seed(0)
+    torch.manual_seed(getattr(args, "seed", 0))
     md = pathlib.Path(args.dataset) / "parts"
     parts = load_curve_parts(pathlib.Path(args.wtok))
     have = {f.stem for f in md.glob("*.npz")}
@@ -1405,6 +1405,9 @@ def main():
     ap.add_argument("--cloud-drop", type=float, default=0.0,
                     help="probability of withholding the cloud during training, "
                          "so the model does not learn to depend on it")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="torch seed; the g1a==g1b sweep ran twice bit-identical "
+                         "because this did not exist (KB 18.6)")
     ap.add_argument("--corner-t", type=float, default=0.0,
                     help="bend_tok: corner tokens at this many sheet thicknesses "
                          "of chordal tolerance (0 = dense resampled tokens)")
