@@ -156,7 +156,7 @@ def dens(c, step=1.0):
 | 締結点フレーム | **任意個数(N≥2)に一般化済み** | `wtok/meshgen.py` |
 | 曲げ線の抽出 | **count-free。**曲率の被覆は完全(0.0%) | `wtok/bendlines.py` |
 | 曲げ線の表現 | 密トークンはジグザグ(余剰回転 教師比12×)。角トークン(`--corner-t 0.25`)は `end` の取りこぼしで曲線間を飛ぶ → **区切りを構造で保証する表現(変位+角)が次** | `wtok/tokens.py`, KB 17.5 |
-| 外形 | パラメトリック辺 + **座面拘束サンプリング + 合理性ランク**(座面比 0.76→1.02、近傍 3.9→2.9mm、訓練なし) | `wtok/frame.py`, `wtok/rational.py` |
+| 外形 | **CATIAエッジ分割の教師 + G1チャンネル + 実現時G1強制**(KB 18採用: 実現余剰回転 教師比+274°→+104°、座面合格97%、900epが最良)。残: G1フラグ過剰(実在角の12%を接線化) | `wtok/frame.py`, `wtok/convert.py`, `wtok/rational_eval.py` |
 | 評価 | **3層合理性**(製造可能性/簡潔性/機能)。Chamfer・is_arc は評価から外した | `wtok/rational.py`, KB 17 |
 | 面 | 未着手 | — |
 | B-rep | 先送り(`surface_frame` の生成が要る) | — |
