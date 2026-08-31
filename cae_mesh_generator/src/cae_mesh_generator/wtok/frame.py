@@ -349,7 +349,16 @@ def enforce_g1(p, bulge, is_arc, g1):
                 cand.append(b)
         if not cand:
             continue
-        out[k] = np.mean(cand, axis=0)
+        b = np.mean(cand, axis=0)
+        # blow-up guard: solving a junction the model drew badly can demand a
+        # near-full-circle arc, which realizes as a spike (measured: parts with
+        # a spike 7% -> 10% when enforcement is on). A junction solve that
+        # needs a sagitta beyond half the chord is a conflict, not a fix --
+        # keep the drawn bulge and let the residual report it.
+        if np.linalg.norm(b) > 0.5 * np.linalg.norm(nxt[k] - p[k]):
+            residual += 90.0
+            continue
+        out[k] = b
         if len(cand) == 2:
             m = 0.5 * (p[k] + nxt[k]) + out[k]
             for want, at_end in ((want_start[k], False), (want_end[k], True)):

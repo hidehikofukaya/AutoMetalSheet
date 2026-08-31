@@ -22,7 +22,7 @@ from scipy.spatial import cKDTree
 from .dataset_curve import load_curve_parts
 from .frame import EDGE_SLOTS, G1_CH, frame_target, medoid, realize_frame
 from .meshgen import fastener_disc, fastener_frame, frame_cond_rows, to_frame
-from .rational import junction_match, rank, score, seat_project, seats
+from .rational import despike, junction_match, rank, score, seat_project, seats
 from .staged import GUARD_PER_FIX, StageFlow, sample
 
 K_DRAWS = 9
@@ -108,7 +108,7 @@ def main():
                 out.append(x[0].cpu().numpy().astype(np.float64))
             return out
 
-        draws = k_draws(constrain)
+        draws = [despike(x, t / fr[2]) for x in k_draws(constrain)]
         order, _ = rank(draws, fr, P, r, t)
         best = draws[order[0]]
         # the baseline column stays what KB 17.5 measured: unconstrained
@@ -141,11 +141,14 @@ def main():
 
     print(f"ckpt {a.ckpt} ep {ep}  ch {ch}  {len(rows)} val parts, K={K_DRAWS}")
     print(f"{'':<14}{'seat':>7}{'seat>=0.95':>11}{'excess':>8}{'sliver':>8}"
-          f"{'edges':>7}{'near mm':>9}")
+          f"{'spikes':>8}{'cross':>7}{'edges':>7}{'near mm':>9}")
     for tag in ("teacher", "medoid", "ranked"):
         ok = [r[tag]["seat"] >= 0.95 for r in rows if tag in r and r[tag]]
+        sp = [r[tag].get("spikes", 0) > 0 for r in rows if tag in r and r[tag]]
+        cx = [r[tag].get("crossings", 0) > 0 for r in rows if tag in r and r[tag]]
         print(f"{tag:<14}{med_of(tag,'seat'):>7.3f}{100*np.mean(ok):>10.0f}%"
               f"{med_of(tag,'excess_turn'):>8.0f}{med_of(tag,'sliver'):>8.2f}"
+              f"{100*np.mean(sp):>7.0f}%{100*np.mean(cx):>6.0f}%"
               f"{med_of(tag,'edges'):>7.0f}{med_of(tag,'near_mm'):>9.2f}")
     if ch > 11:
         print(f"junction (ranked): g0_missed {med_of('ranked','g0_missed'):.2f}  "

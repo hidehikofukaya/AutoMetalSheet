@@ -74,6 +74,8 @@ def score(x, frame, seat_pts, seat_r, t_mm):
         # tier 1
         "sliver": float(np.mean(L < t_mm)),
         "sharp": float(np.mean(np.array(rt) < RT_MIN)) if rt else 0.0,
+        "spikes": _spikes(poly),
+        "crossings": _crossings(poly),
         # tier 2
         "excess_turn": float(turn.sum() - 360.0),
         "ambiguous": float(np.mean((turn > AMBIG[0]) & (turn < AMBIG[1]))),
@@ -83,8 +85,49 @@ def score(x, frame, seat_pts, seat_r, t_mm):
     }
 
 
+def _spikes(poly):
+    """Needles on the realized curve: a junction turning back on itself."""
+    d = np.diff(np.concatenate([poly, poly[:1]]), axis=0)
+    L = np.linalg.norm(d, axis=1)
+    T = d[L > 1e-12] / L[L > 1e-12, None]
+    turn = np.degrees(np.arccos(np.clip(
+        np.einsum("ij,ij->i", T, np.roll(T, -1, 0)), -1, 1)))
+    return int((turn > 150.0).sum())
+
+
+def _crossings(poly):
+    """Self-intersections of the loop projected on its own principal plane.
+
+    DIAGNOSTIC ONLY -- the TEACHER fails this on 17% of parts: a legitimately
+    folded outline overlaps itself in any single projection. It stays out of
+    tier 1 and out of the rank key; read it only relative to the teacher.
+    """
+    c0 = poly.mean(0)
+    _, _, V = np.linalg.svd(poly - c0)
+    q = (poly - c0) @ V[:2].T
+    n = len(q)
+    a = q
+    b = np.roll(q, -1, 0)
+    hits = 0
+    for i in range(n):
+        # vectorised segment-vs-segment test against all non-neighbours > i+1
+        js = np.arange(i + 2, n - (1 if i == 0 else 0))
+        if not len(js):
+            continue
+        d1 = b[i] - a[i]
+        d2 = (b[js] - a[js])
+        w = a[js] - a[i]
+        den = d1[0] * d2[:, 1] - d1[1] * d2[:, 0]
+        ok = np.abs(den) > 1e-12
+        s = (w[:, 0] * d2[:, 1] - w[:, 1] * d2[:, 0]) / np.where(ok, den, 1)
+        r = (w[:, 0] * d1[1] - w[:, 1] * d1[0]) / np.where(ok, den, 1)
+        hits += int((ok & (s > 0) & (s < 1) & (r > 0) & (r < 1)).sum())
+    return hits
+
+
 def passes_tier1(s):
-    return s is not None and s["sliver"] == 0.0 and s["sharp"] == 0.0
+    return (s is not None and s["sliver"] == 0.0 and s["sharp"] == 0.0
+            and s.get("spikes", 0) == 0)
 
 
 def rank(frames, frame, seat_pts, seat_r, t_mm, teacher=None):
@@ -96,14 +139,21 @@ def rank(frames, frame, seat_pts, seat_r, t_mm, teacher=None):
     sc = [score(f, frame, seat_pts, seat_r, t_mm) for f in frames]
     ref_turn = teacher["excess_turn"] if teacher else 0.0
 
+    # Spikes are a LATE tiebreaker, not a gate, and the parsimony reference
+    # stays zero. Both alternatives were A/B'd on identical draws (30 parts,
+    # K=9): a hard spike gate rejected the only good-shape draws on messy
+    # parts (>8mm failures 4 -> 5) and a consensus-median reference degraded
+    # two more parts (4 -> 5, one 9.0 -> 15.5mm). A spike is real (teacher 0%)
+    # but local; a wrong shape is global -- so shape-bearing criteria keep
+    # precedence and the spike only breaks ties.
     def key(i):
         s = sc[i]
         if s is None:
-            return (2, 0.0, 0.0)
-        t1 = 0 if passes_tier1(s) else 1
+            return (99, 0.0, 0.0, 0)
+        t1 = 0 if (s["sliver"] == 0 and s["sharp"] == 0) else 1
         seat_pen = max(0.0, 1.0 - s["seat"])            # 0 once the seat is clear
         pars = abs(s["excess_turn"] - ref_turn)
-        return (t1, seat_pen, pars)
+        return (t1, seat_pen, pars, s.get("spikes", 0))
 
     order = sorted(range(len(frames)), key=key)
     return order, sc
@@ -137,6 +187,51 @@ def junction_match(x_gen, x_true, tol):
             "g1_as_g0": float(np.mean(g1_as_g0)) if g1_as_g0 else 0.0,
             "g1_share_true": float(np.mean(g1t)),
             "g1_share_gen": float(np.mean(g1g))}
+
+
+def despike(x, t_u, turn_deg: float = 150.0, prom_t: float = 2.0):
+    """Remove crack-like needles from a generated frame.
+
+    A needle is a corner whose junction turns back on itself (> `turn_deg`)
+    with a prominence under `prom_t` sheet thicknesses -- measured on the
+    ranked picks: every one of 9 spikes had prominence 0.1-1.7mm at t 1.2-2.1,
+    while a real feature that turns that hard does not exist in the teacher
+    (0% of parts). Deleting the corner bridges its neighbours; the loop stays
+    a loop. Input-derived (thickness) and property-based (the turn), so it is
+    the same class of repair as seat_project.
+    """
+    x = x.copy()
+    live = np.flatnonzero(x[:, 7] < 0.5)
+    changed = True
+    while changed and len(live) > 4:
+        changed = False
+        P = x[live, 0:3]
+        n = len(P)
+        d = np.roll(P, -1, 0) - P
+        T = d / np.maximum(np.linalg.norm(d, axis=1, keepdims=True), 1e-12)
+        turn = np.degrees(np.arccos(np.clip(
+            np.einsum("ij,ij->i", np.roll(T, 1, 0), T), -1, 1)))
+        for i in np.flatnonzero(turn > turn_deg):
+            a, b = P[(i - 1) % n], P[(i + 1) % n]
+            ch = b - a
+            L = max(np.linalg.norm(ch), 1e-12)
+            w = P[i] - a
+            prom = np.linalg.norm(w - (w @ ch / L) * (ch / L))
+            if prom < prom_t * t_u:
+                prev, nxt_ = live[(i - 1) % n], live[(i + 1) % n]
+                x[live[i], 7] = 1.0              # slot off
+                x[live[i], 0:7] = 0.0
+                # the bridging edge lives on the previous slot as a LINE (its
+                # old arc no longer fits), and neither of its junctions is
+                # known tangent any more
+                x[prev, 3:6] = 0.0
+                x[prev, 6] = 0.0
+                if x.shape[1] > 11:
+                    x[nxt_, 11] = 0.0
+                live = np.flatnonzero(x[:, 7] < 0.5)
+                changed = True
+                break
+    return x
 
 
 def seat_project(x, frame, seat_pts, seat_axes, seat_r, margin=1.0):
