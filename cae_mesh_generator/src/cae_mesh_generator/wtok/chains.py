@@ -38,7 +38,11 @@ CE_G1 = 8               # channel index of the G1 flag
 G1_DEG = 3.0            # same junction threshold as the outline (KB 18)
 WELD_MM = 0.05          # cluster weld; grid rounding broke a loop at 0.008mm
 MIN_EDGE_MM = 0.01      # the extractor emits 0.008mm garbage edges (KB 18.5)
-CLASSES = ("bend_line", "crease")
+# bend_line alone was WRONG (user-caught, 2026-09-01): the extractor types the
+# bead ridge fillets / corner patches as surface_frame and the fold crossings
+# as seam, and the extraction-side reply had explicitly advised passing
+# surface_frame through. bend_line-only teachers miss the bead corners.
+CLASSES = ("bend_line", "surface_frame", "crease", "seam")
 
 _ROOT = pathlib.Path(__file__).resolve().parents[4]
 
