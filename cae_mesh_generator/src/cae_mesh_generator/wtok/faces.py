@@ -6,9 +6,9 @@ bounds exactly two faces, so generating one closed boundary ring per face
 reconstructs the whole network structurally -- and the rings ARE the face
 patch boundaries a B-rep needs.
 
-Level 2a: which faces exist -- one slot per non-wall face (boundary centroid,
-          loop-plane normal, log perimeter), perimeter-ranked. 112 slots is
-          capacity (measured max 98, KB 21.5), not a count.
+Level 2a: which faces exist -- one slot per face (boundary centroid,
+          loop-plane normal, log perimeter), perimeter-ranked. 144 slots is
+          capacity (measured 125 faces/part with every face), not a count.
 Level 2b: one face's boundary ring -- the outline-frame machinery at a smaller
           size (measured max 11 edges vs the outline's 24). Closed by
           construction, so the open-end snap constraint of KB 20 has nothing
@@ -32,9 +32,13 @@ from scipy.spatial import cKDTree
 from .chains import MIN_EDGE_MM, WELD_MM, _fit_edge, realize_chain
 from .frame import G1_SMOOTH, _canonicalise, _edge_tangent
 
-FACE_SLOTS = 112        # capacity: measured max 98 non-wall faces (KB 21.5)
+# capacity: 125 faces/part with EVERY face (KB 21.9). face_wall=True is not a
+# thickness side wall (a midsurface has none) -- it marks all planar faces plus
+# some curved ones, and excluding it dropped every panel and flange from the
+# teacher (user-caught: "only the beads are faces")
+FACE_SLOTS = 144
 FACE_CH = 8             # centroid 3 | loop-plane normal 3 | log-perimeter 1 | unused 1
-FRING_SLOTS = 16        # capacity: measured max 11 edges/face (KB 21.5)
+FRING_SLOTS = 24        # capacity: measured max 16 edges/loop with all faces
 FRING_CH = 10           # corner 3 | bulge 3 | is_arc 1 | unused 1 | g1 1 | spare 1
 FR_G1 = 8               # channel index of the smoothness value
 SELF_LOOP_MM = 0.2      # an edge whose endpoints weld to the SAME node and is
@@ -53,7 +57,7 @@ def _wireframe(part_name: str, root=None):
 
 
 def face_loops(part, root=None):
-    """Every non-wall face's boundary as an ordered closed ring of primitives.
+    """Every face's boundary as an ordered closed ring of primitives.
 
     Returns (loops, stats): loops is a list of dicts
       {face_id, corners (n,3), mids (n,3), is_arc (n,), jt (n,), perimeter}
@@ -65,7 +69,6 @@ def face_loops(part, root=None):
     d = _wireframe(getattr(part, "name", str(part)), root)
     if d is None:
         return [], {}
-    wall = d["face_wall"]
     by_face: dict[int, list] = {}
     for e in d["edges"]:
         if len(e["polyline"]) < 2:
@@ -74,8 +77,7 @@ def face_loops(part, root=None):
         if np.linalg.norm(np.diff(pl, axis=0), axis=1).sum() < MIN_EDGE_MM:
             continue
         for k in e["face_ids"]:
-            if not wall[k]:
-                by_face.setdefault(k, []).append(pl)
+            by_face.setdefault(k, []).append(pl)
 
     loops, stats = [], {"unclosed": 0, "multi_loop": 0, "single_edge": 0,
                         "skipped_perimeter_mm": 0.0}
@@ -304,10 +306,8 @@ def demo():
         got = [g for g in got if g is not None]
 
         d = _wireframe(p.name)
-        wall = d["face_wall"]
         raw = [np.asarray(e["polyline"], float) for e in d["edges"]
-               if any(not wall[k] for k in e["face_ids"])
-               and len(e["polyline"]) >= 2]
+               if len(e["polyline"]) >= 2]
         per_all = sum(np.linalg.norm(np.diff(c, axis=0), axis=1).sum() for c in raw)
         skip_share.append(stats["skipped_perimeter_mm"] / max(per_all, 1e-9))
         if not got or not raw:
