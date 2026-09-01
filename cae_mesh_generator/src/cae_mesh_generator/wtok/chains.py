@@ -334,8 +334,11 @@ def enforce_g1_chain(p, bulge, is_arc, g1, closed):
     return out, float(residual)
 
 
-def realize_chain(x, closed, per_edge: int = 24):
-    """One 2b tensor back to a polyline (frame units)."""
+def realize_chain(x, closed, per_edge: int = 24, g1_thresh: float = 0.5):
+    """One 2b tensor back to a polyline (frame units).
+
+    g1_thresh: 0.5 for the binary chain flag; face rings carry the KB 18.8
+    smoothness value and pass frame.G1_SMOOTH instead."""
     from .codec import realize_edge
 
     live = x[:, 7] < 0.5
@@ -346,7 +349,7 @@ def realize_chain(x, closed, per_edge: int = 24):
     n_e = n if closed else n - 1
     bulge = x[live, 3:6][:n_e]
     is_arc = x[live, 6][:n_e]
-    g1 = x[live, CE_G1] > 0.5
+    g1 = x[live, CE_G1] > g1_thresh
     bulge, _ = enforce_g1_chain(p, bulge, is_arc, g1, closed)
     pts = []
     for i in range(n_e):
