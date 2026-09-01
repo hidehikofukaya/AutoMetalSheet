@@ -70,7 +70,16 @@ def ring_stats(rings, outline, t_u):
             "faces": len(rings)}
 
 
-def gen_faces(p, models, device, steps=24):
+def _ring_key(poly):
+    d = np.diff(poly, axis=0)
+    L = np.linalg.norm(d, axis=1)
+    T = d[L > 1e-12] / L[L > 1e-12, None]
+    turn = np.degrees(np.arccos(np.clip(
+        np.einsum("ij,ij->i", T, np.roll(T, -1, 0)), -1, 1)))
+    return (int((turn > 150).sum()), max(float(turn.sum()) - 360.0, 0.0))
+
+
+def gen_faces(p, models, device, steps=24, ring_k=1, ring_despike=False):
     """One part end to end; K_DRAWS full-pipeline draws, self-consistency rank."""
     (m_out, ta_out), (m2a, ta2a), (m2b, ta2b) = models
     fr, cond, fix = part_inputs(p, ta_out.get("use_spec", False), device)
@@ -127,15 +136,32 @@ def gen_faces(p, models, device, steps=24):
             cond2.append(np.concatenate([cond[0].cpu().numpy(), row]))
         cond2 = torch.from_numpy(np.stack(cond2)).float().to(device)
         B = len(rows)
-        g = torch.Generator(device).manual_seed(seed + 7)
-        xb = sample(m2b, cond2, fix.repeat(B, 1, 1),
-                    octx(xb_ch).repeat(B, 1, 1), FRING_SLOTS, steps,
-                    ta2b.get("cfg_scale", 1.0), gen=g).cpu().numpy().astype(np.float64)
+        # ring_k draws per face; rings are independent, so the pick is
+        # PER RING by (spikes, excess) -- the 2b-intrinsic wiggle is the one
+        # defect a per-ring choice can reach (KB 21.6.1)
+        cands = []
+        for k in range(ring_k):
+            g = torch.Generator(device).manual_seed(seed + 7 + 101 * k)
+            xb = sample(m2b, cond2, fix.repeat(B, 1, 1),
+                        octx(xb_ch).repeat(B, 1, 1), FRING_SLOTS, steps,
+                        ta2b.get("cfg_scale", 1.0), gen=g
+                        ).cpu().numpy().astype(np.float64)
+            cands.append(xb)
         rings = []
-        for x in xb:
-            c = realize_face_ring(x)
-            if c is not None and len(c) >= 4:
-                rings.append(c)
+        for i in range(B):
+            best = None
+            for k in range(ring_k):
+                x = cands[k][i]
+                if ring_despike:
+                    x = despike(x, t_u)
+                c = realize_face_ring(x)
+                if c is None or len(c) < 4:
+                    continue
+                key = _ring_key(c)
+                if best is None or key < best[0]:
+                    best = (key, c)
+            if best is not None:
+                rings.append(best[1])
         return rings
 
     xb_ch = 10
@@ -157,6 +183,8 @@ def main():
     ap.add_argument("--outline", default="runs/frame_g1sm2/best.pt")
     ap.add_argument("--wtok", default="runs/wtok_synth_g1")
     ap.add_argument("--parts", type=int, default=30)
+    ap.add_argument("--ring-k", type=int, default=1)
+    ap.add_argument("--ring-despike", action="store_true")
     ap.add_argument("--out", default="")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     a = ap.parse_args()
@@ -181,7 +209,8 @@ def main():
             continue
         x2a_t, r2b_t, _ = tt
         teach = [c for c in (realize_face_ring(x) for x in r2b_t) if c is not None]
-        r = gen_faces(p, models, a.device)
+        r = gen_faces(p, models, a.device, ring_k=a.ring_k,
+                      ring_despike=a.ring_despike)
         u, t = r["u"], r["t"]
         t_u = t / u
         st = ring_stats(teach, realize_frame(ft, 60), t_u)
