@@ -1347,6 +1347,7 @@ def train(args):
     CORNER_T = float(getattr(args, "corner_t", 0.0))
     if W_D1 or W_D2:
         print(f"relational loss: D1 {W_D1}  D2 {W_D2}", flush=True)
+    ds.chain_noise = float(getattr(args, "desc_noise", 0.0))
     ds.cloud_drop = args.cloud_drop
     ds.surf_curv = bool(args.surf_curv)
     ds.use_spec = vs_use = bool(args.use_spec)
@@ -1468,6 +1469,12 @@ def main():
     ap.add_argument("--cloud-drop", type=float, default=0.0,
                     help="probability of withholding the cloud during training, "
                          "so the model does not learn to depend on it")
+    ap.add_argument("--desc-noise", type=float, default=0.0,
+                    help="chain_edges/face_ring: gaussian noise on the 2a "
+                         "descriptor row at train time (frame units). 0.02 "
+                         "matches the measured generated-2a centroid error; "
+                         "facering1 ran at 0 and learned to trust a perfect "
+                         "upstream (KB 21.6.1)")
     ap.add_argument("--seed", type=int, default=0,
                     help="torch seed; the g1a==g1b sweep ran twice bit-identical "
                          "because this did not exist (KB 18.6)")
