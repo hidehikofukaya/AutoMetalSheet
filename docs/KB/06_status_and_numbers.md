@@ -4,6 +4,76 @@ Date: 2026-08-30 / Branch: `feat/softmin-guidance-poc`
 
 ---
 
+## 6.0 セッション引き継ぎ(2026-09-01 追記)
+
+HEAD: `8cfdb0f`(G1チャンネルが接合の滑らかさを連続値で運ぶ)。KB 00-21 はここまで
+コミット済み・最新。**以下は作業ツリーに残っている未コミット差分の棚卸し**
+(このセッションでは変更していない。次にやる人向けの整理のみ)。
+
+### A. 意図的なリポジトリ整理(未コミットのまま放置)
+
+`_archive_pre_annotation_tool/` に旧トップレベル資料(`AGENTS.md` 1546行版、
+`archi.md`、`PROJECT_SUMMARY.md`、`V2_ARCHITECTURE.md`、`CLAUDE_full_history.md`)を
+退避済み。ルートから `biw_poc/`(STPデータ込みで1.7M行)、`fable/*`、`学習資料/*` を
+削除。新パッケージ `annotation_tool/` を追加。**意図(旧prototypeの整理)は明確**
+だが未コミット。
+
+**要確認**: 作業ツリーの `AGENTS.md` は HEAD 比で 1546→123行に激減しており、
+中身が現行方針(締結点のみからワイヤーフレームE2E生成、wtok/KB体制)ではなく
+旧 mesh 生成MVP方向(`fill_volume`、CATIA COM調査)の短縮版になっている。
+**意図した更新か、古い版への巻き戻りかを本人に確認してからコミットすること。**
+
+### B. 進行中の実装(未コミット、KB未記録)
+
+`wtok/ridge.py`: displacement のみでの選別が破綻していた問題
+(帯 0.12 以内なら全点がoutlineとbendの両方に選ばれ、部品全体を「敷き詰めて」
+10.26mm を稼いでいた)に対し、on-curve logit ヘッドを追加。加えて
+`resample_polyline`(直線35.7mm間隔 vs 円弧0.5mm間隔という**保存形式由来の
+密度差**を弧長で均一化。KB 05 A1 の density 習慣そのもの)と、FPS点順序
+(`even=`、生成器の点配置分布に合わせる)を実装。**KBへの記録がまだ無い**
+(14 delta_tokens か新規番号を検討)。
+
+### C. 新規モジュール(未コミット)
+
+`wtok/kernel.py` `wtok/loop.py` `wtok/validity.py` は既に本ファイル §6.6
+コード地図に記載済みなのに git 未追跡 → 前セッションでの**コミット漏れ**。
+`wireflow/` `cga/` `twopoint/` `model/`(autoencoder系)は現行KB本線とは別の
+実験トラック(`~/.claude/…/memory/project_wireflow_cga_status.md` 参照。
+oracle A_ij 注入待ちで停滞中)。本線の作業とは独立に扱ってよい。
+
+### D. ドキュメント(未コミット)
+
+`docs/current_architecture.md`(+101/-14)、`docs/session_knowledge_202608.md`
+(2026-08-28 測定撤回の追記、+235行、内容は有効・既読)、
+`docs/loop_architecture_proposal.md` `docs/overnight_plan_202608.md`
+`docs/overnight_results.md` `docs/progress_202608.md` `docs/research_log.md`
+`docs/staged_generator_design.md`、`docs/figures/*.png`、
+`docs/requests/2026-08-30_wireframe_extraction_REPLY.md`。KB 00 の「過去の資料」
+表が指す原典の一部と重なるので、コミット時にKB統合済みかどうかの重複確認が要る。
+
+### E. その他
+
+`kaggle_bundle/`(学習バンドルzip)、`tools/cleanup_workspace.py`、
+`run_hole_filler_web.bat`、`run_viewer.bat`、`runs/`(学習成果物、通常git対象外)。
+
+### 外部ブロッカー: face_ids 回答待ち
+
+KB 21(面ループ表現)は `docs/requests/2026-09-01_face_ids.md` の回答待ち。
+宛先は**このリポジトリ外の別セッション**(CATIA側の抽出担当)。ファイル経由の
+手紙形式でやり取りしている(`docs/requests/*_REPLY*.md` が過去の往復)。
+回答が来るまで面ループの実装には着手できない。待機中にできる作業は
+KB 21 §21.4(外形G1フラグ較正、0044系)。
+
+### 次にやること(推奨順)
+
+1. `docs/requests/` に face_ids への回答が届いていないか確認
+2. `AGENTS.md` の内容(A参照)を本人に確認してからコミット
+3. B・C・Dを論理的なコミット単位に分けてコミット(巨大な biw_poc 削除は
+   単独コミット推奨。差分行数が大きいためレビューしやすく分離)
+4. `wtok/ridge.py` の変更をKBに記録してから続行
+
+---
+
 ## 6.1 外形フレーム生成器 — 現行最良
 
 **チェックポイント**: `runs/frame3/best.pt`(epoch 250、1000部品、11ch、CFG 1.0)
