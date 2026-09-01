@@ -49,16 +49,19 @@ STAGE_ORDER = {"outline": 0, "outline_frame": 0, "outline_multi": 0,
                "bend": 1, "bend_pc": 1, "bend_frame": 1, "feature": 1,
                "bend_tok": 1, "outline_tok": 0,
                "bend_delta": 1, "outline_delta": 0,
-               "chain_set": 1, "chain_edges": 1, "surface": 2}
+               "chain_set": 1, "chain_edges": 1,
+               "face_set": 1, "face_ring": 1, "surface": 2}
 # how many channels each stage's target carries. Only the parametric frame
 # differs: it adds the arc bulge and the arc flag to the usual 7.
 from .chains import CEDGE_CH, CEDGE_SLOTS, CHAIN_CH, CHAIN_SLOTS
+from .faces import FACE_CH, FACE_SLOTS, FRING_CH, FRING_SLOTS
 
 STAGE_CH = {"outline_frame": FRAME_CH, "bend_frame": FRAME_CH,
             "outline_multi": MULTI_CH, "feature": FEAT_CH,
             "bend_tok": TOK_CH, "outline_tok": TOK_CH,
             "bend_delta": DTOK_CH, "outline_delta": DTOK_CH,
-            "chain_set": CHAIN_CH, "chain_edges": CEDGE_CH}
+            "chain_set": CHAIN_CH, "chain_edges": CEDGE_CH,
+            "face_set": FACE_CH, "face_ring": FRING_CH}
 GUARD_PER_FIX = 8
 CH = 7          # xyz 3, tangent-or-normal 3, off-the-part flag 1
 
@@ -260,6 +263,10 @@ def stage_target(part, mesh_dir, stage: str, n_pts: int, rng):
         from .chains import chain_targets
         t = chain_targets(part, frame)
         return None if t is None else t[0]
+    if stage == "face_set":
+        from .faces import face_targets
+        t = face_targets(part, frame)
+        return None if t is None else t[0]
     if stage == "surface":
         d = np.load(pathlib.Path(mesh_dir) / f"{part.name}.npz")
         span = np.maximum(d["env_hi"] - d["env_lo"], 1e-9)
@@ -358,6 +365,8 @@ class StageDataset(Dataset):
                                "outline_delta": TOK_N,
                                "chain_set": CHAIN_SLOTS,
                                "chain_edges": CEDGE_SLOTS,
+                               "face_set": FACE_SLOTS,
+                               "face_ring": FRING_SLOTS,
                                "bend": BEND_STRANDS * BEND_PER_STRAND,
                                "bend_pc": N_BEND,
                                "surface": N_SURFACE}[stage]
@@ -404,6 +413,16 @@ class StageDataset(Dataset):
                     self.chain_index += [(i, j) for j in range(len(t[1]))]
         elif stage == "chain_set":
             self.parts = [p for p in self.parts if self._chains(p) is not None]
+        elif stage == "face_ring":
+            # 2b items are FACES, one sample per ring, exactly the chain_edges
+            # pattern; chain_noise doubles as the 2a-descriptor noise knob
+            self.chain_index = []
+            for i, p in enumerate(self.parts):
+                t = self._faces(p)
+                if t is not None:
+                    self.chain_index += [(i, j) for j in range(len(t[1]))]
+        elif stage == "face_set":
+            self.parts = [p for p in self.parts if self._faces(p) is not None]
 
     def _chains(self, p):
         key = ("chains", p.name)
@@ -412,11 +431,19 @@ class StageDataset(Dataset):
             self.cache[key] = chain_targets(p, fastener_frame(p))
         return self.cache[key]
 
+    def _faces(self, p):
+        key = ("faces", p.name)
+        if key not in self.cache:
+            from .faces import face_targets
+            t = face_targets(p, fastener_frame(p))
+            self.cache[key] = None if t is None else t[:2]   # drop the stats
+        return self.cache[key]
+
     def ctx_len(self):
         """Rows of context this run always emits, whatever is withheld."""
         n = 0
         if self.stage in ("bend_frame", "feature", "bend_tok", "bend_delta",
-                          "chain_set", "chain_edges"):
+                          "chain_set", "chain_edges", "face_set", "face_ring"):
             n += EDGE_SLOTS
         if self.surf_curv:
             n += 256
@@ -428,7 +455,7 @@ class StageDataset(Dataset):
         self.epoch = int(e)
 
     def __len__(self):
-        return (len(self.chain_index) if self.stage == "chain_edges"
+        return (len(self.chain_index) if self.stage in ("chain_edges", "face_ring")
                 else len(self.parts))
 
     def _target(self, part, stage, n, rng):
@@ -439,7 +466,7 @@ class StageDataset(Dataset):
 
     def __getitem__(self, i):
         cj = None
-        if self.stage == "chain_edges":
+        if self.stage in ("chain_edges", "face_ring"):
             pi, cj = self.chain_index[i]
             p = self.parts[pi]
         else:
@@ -451,6 +478,9 @@ class StageDataset(Dataset):
         if self.stage == "chain_edges":
             x2a, c2b = self._chains(p)
             x, chain_closed = c2b[cj]
+        elif self.stage == "face_ring":
+            x2a, r2b = self._faces(p)
+            x = r2b[cj]                    # always closed: a face boundary
         else:
             x = self._target(p, self.stage, self.n_pts, rng)
         if x is None:                                  # no curve of this class
@@ -461,7 +491,8 @@ class StageDataset(Dataset):
         if self.stage in ("outline_frame", "outline_multi", "bend_frame",
                           "feature", "bend_tok", "outline_tok",
                           "bend_delta", "outline_delta",
-                          "chain_set", "chain_edges"):
+                          "chain_set", "chain_edges",
+                          "face_set", "face_ring"):
             # No outlier injection: an edge is not a point that can be nudged
             # off the surface, and the unused-slot flag already carries the
             # only "this is not part of the shape" the frame has.
@@ -500,9 +531,21 @@ class StageDataset(Dataset):
                 row[0, 6] = d9[6] + rng.normal(0, self.chain_noise)
                 row[0, 7] = d9[7]
                 cond = np.concatenate([cond, row])
+            if self.stage == "face_ring":
+                # the face's own 2a descriptor: centroid, loop-plane normal,
+                # log-perimeter -- FACE_CH is 8, the cond row width. Same
+                # noising as the chain descriptor, same knob.
+                d8 = x2a[cj]
+                row = np.zeros((1, cond.shape[1]), np.float32)
+                row[0, 0:3] = d8[0:3] + rng.normal(0, self.chain_noise, 3)
+                v = d8[3:6] + rng.normal(0, self.chain_noise, 3)
+                row[0, 3:6] = v / max(np.linalg.norm(v), 1e-9)
+                row[0, 6] = d8[6] + rng.normal(0, self.chain_noise)
+                cond = np.concatenate([cond, row])
             ctx, n_ctx = np.zeros((1, ch), np.float32), 0
             if self.stage in ("bend_frame", "feature", "bend_tok", "bend_delta",
-                              "chain_set", "chain_edges"):
+                              "chain_set", "chain_edges",
+                              "face_set", "face_ring"):
                 # the OUTLINE frame is what stage 2 reads. Its slots are edges,
                 # not points, and the context encoder wants xyz + a direction,
                 # so each edge is handed over as its corner and its chord.
@@ -1173,6 +1216,27 @@ def probe(model, ds, device, n_parts=12, steps=24, scale=2.0):
             cvs.append(mm * float(cKDTree(b).query(a)[0].mean())
                        if a is not None and b is not None else 99.0)
             continue
+        if ds.stage == "face_set":
+            g = x.cpu().numpy().astype(np.float64)
+            w = it["x"].numpy().astype(np.float64)
+            lg, lw = g[:, -1] < 0.5, w[:, -1] < 0.5
+            nw = max(int(lw.sum()), 1)
+            ends.append(abs(int(lg.sum()) - nw) / nw)
+            mm = fastener_frame(ds.parts[i])[2]
+            cvs.append(mm * float(cKDTree(w[lw, 0:3]).query(g[lg, 0:3])[0].mean())
+                       if lg.any() else 99.0)
+            continue
+        if ds.stage == "face_ring":
+            from .faces import realize_face_ring
+            g = x.cpu().numpy().astype(np.float64)
+            w = it["x"].numpy().astype(np.float64)
+            a, b = realize_face_ring(g), realize_face_ring(w)
+            nw = max(int((w[:, 7] < .5).sum()), 1)
+            ends.append(abs(int((g[:, 7] < .5).sum()) - nw) / nw)
+            mm = fastener_frame(ds.parts[ds.chain_index[i][0]])[2]
+            cvs.append(mm * float(cKDTree(b).query(a)[0].mean())
+                       if a is not None and b is not None else 99.0)
+            continue
         if ds.stage == "bend_frame":
             from .frame import realize_bend
             g = x.cpu().numpy().astype(np.float64)
@@ -1274,7 +1338,10 @@ def train(args):
                "feature": "slot", "bend_tok": "slot",
                "outline_tok": "slot", "bend_delta": "slot",
                "outline_delta": "slot",
-               "chain_set": "slot", "chain_edges": "strand"}.get(args.stage, "")
+               "chain_set": "slot", "chain_edges": "strand",
+               # face rings are CLOSED by construction, so they get the ring PE
+               # the chains compromised away (KB 20's open/closed mix is gone)
+               "face_set": "slot", "face_ring": "loop"}.get(args.stage, "")
     # bend_pc is deliberately unordered: with no slot structure there is nothing
     # for a positional encoding to encode.
     ds = StageDataset(train_parts, md, args.stage, base_seed=7,
