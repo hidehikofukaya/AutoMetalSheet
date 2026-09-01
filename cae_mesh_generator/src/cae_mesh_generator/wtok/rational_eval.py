@@ -37,11 +37,8 @@ def load_model(path, device):
     a = ck["args"]
     ch = ck["model"]["inp.weight"].shape[1]     # the layout the ckpt was trained on
     cross = any(k.startswith("enc.") for k in ck["model"])
-    ordered = {"outline": "loop", "outline_frame": "loop", "outline_multi": "loop",
-               "bend": "strand", "feature": "slot", "bend_tok": "slot",
-               "outline_tok": "slot", "bend_delta": "slot", "outline_delta": "slot",
-               "chain_set": "slot", "chain_edges": "strand"}.get(
-                   a.get("stage", "outline_frame"), "loop")
+    from .staged import ORDERED_PE
+    ordered = ORDERED_PE.get(a.get("stage", "outline_frame"), "loop")
     m = StageFlow(a["dim"], a["layers"], a["heads"], cross=cross,
                   ordered=ordered, ch=ch, rel=a.get("rel_attn", False)).to(device)
     m.load_state_dict(ck["model"])

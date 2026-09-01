@@ -62,6 +62,15 @@ STAGE_CH = {"outline_frame": FRAME_CH, "bend_frame": FRAME_CH,
             "bend_delta": DTOK_CH, "outline_delta": DTOK_CH,
             "chain_set": CHAIN_CH, "chain_edges": CEDGE_CH,
             "face_set": FACE_CH, "face_ring": FRING_CH}
+# slot structure per stage, THE single source for building StageFlow -- the
+# eval loader once kept its own copy, missed the face stages, and rebuilt a
+# slot-PE model with ring PE (E2E chamfer 27mm from a 1.8mm-probe checkpoint)
+ORDERED_PE = {"outline": "loop", "outline_frame": "loop", "outline_multi": "loop",
+              "bend": "strand", "feature": "slot", "bend_tok": "slot",
+              "outline_tok": "slot", "bend_delta": "slot", "outline_delta": "slot",
+              "chain_set": "slot", "chain_edges": "strand",
+              "face_set": "slot", "face_ring": "loop"}
+
 GUARD_PER_FIX = 8
 CH = 7          # xyz 3, tangent-or-normal 3, off-the-part flag 1
 
@@ -1328,20 +1337,7 @@ def train(args):
     # canonical longest-first ranking, so no positional encoding applies.
     # bend_tok tokens are an ordered sequence -- curves laid end to end, points
     # in traversal order -- so slot i means the same thing on every part
-    # chain_set rows are a length-ranked list (slot); chain_edges corners are a
-    # traversal (strand). Closed chains would want ring_pe -- v1 uses strand
-    # for both and carries the closed flag in the descriptor row instead, an
-    # explicit compromise recorded in KB 20 (61% of chains are closed; revisit
-    # if they underperform open ones).
-    ordered = {"outline": "loop", "outline_frame": "loop",
-               "outline_multi": "loop", "bend": "strand",
-               "feature": "slot", "bend_tok": "slot",
-               "outline_tok": "slot", "bend_delta": "slot",
-               "outline_delta": "slot",
-               "chain_set": "slot", "chain_edges": "strand",
-               # face rings are CLOSED by construction, so they get the ring PE
-               # the chains compromised away (KB 20's open/closed mix is gone)
-               "face_set": "slot", "face_ring": "loop"}.get(args.stage, "")
+    ordered = ORDERED_PE.get(args.stage, "")
     # bend_pc is deliberately unordered: with no slot structure there is nothing
     # for a positional encoding to encode.
     ds = StageDataset(train_parts, md, args.stage, base_seed=7,
