@@ -164,6 +164,56 @@ def face_loops(part, root=None):
     return loops, stats
 
 
+def _cache_dir():
+    d = os.environ.get("WTOK_FACES", "")
+    return pathlib.Path(d) if d else None
+
+
+def export_cache(out_dir, wtok="runs/wtok_synth_g1", limit=0):
+    """Precompute face targets into compact npz files so a machine without the
+    v4.5 wireframes (Kaggle) can train the face stages -- the chains.py move."""
+    from .dataset_curve import load_curve_parts
+    from .meshgen import fastener_frame
+
+    out = pathlib.Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    parts = load_curve_parts(_ROOT / wtok)
+    if limit:
+        parts = parts[:limit]
+    n_ok = n_none = 0
+    for k, p in enumerate(parts):
+        f = out / f"{p.name}.npz"
+        if f.exists():
+            n_ok += 1
+            continue
+        t = face_targets(p, fastener_frame(p))
+        if t is None:
+            np.savez_compressed(f, none=np.array([1]))
+            n_none += 1
+            continue
+        x2a, r2b, _ = t
+        np.savez_compressed(f, x2a=x2a.astype(np.float32),
+                            x2b=np.stack(r2b).astype(np.float32))
+        n_ok += 1
+        if (k + 1) % 200 == 0:
+            print(f"{k + 1}/{len(parts)}", flush=True)
+    print(f"exported {n_ok} parts ({n_none} without faces) -> {out}")
+
+
+def load_cached_targets(part_name, cache=None):
+    cache = cache or _cache_dir()
+    if cache is None:
+        return False, None
+    f = pathlib.Path(cache) / f"{part_name}.npz"
+    if not f.exists():
+        return False, None
+    d = np.load(f)
+    if "none" in d:
+        return True, None
+    return True, (d["x2a"].astype(np.float64),
+                  [x.astype(np.float64) for x in d["x2b"]], {})
+
+
 def face_targets(part, frame, root=None,
                  face_slots: int = FACE_SLOTS, ring_slots: int = FRING_SLOTS):
     """(x2a, rings2b, stats) in the fastener frame, canonicalised, or None.
@@ -174,6 +224,9 @@ def face_targets(part, frame, root=None,
     """
     from .meshgen import to_frame
 
+    hit, cached = load_cached_targets(getattr(part, "name", str(part)))
+    if hit:
+        return cached
     raw, stats = face_loops(part, root)
     if not raw:
         return None

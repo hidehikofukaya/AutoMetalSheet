@@ -57,6 +57,9 @@ CODE_FILES = [
     "wtok/chains.py",
     "wtok/chain_eval.py",
     "wtok/kaggle_chains.py",
+    "wtok/faces.py",
+    "wtok/face_eval.py",
+    "wtok/kaggle_faces.py",
     "wtok/rational_eval.py",
     "wtok/tokens.py",
     "wtok/deltatok.py",
@@ -129,6 +132,9 @@ def main() -> None:
     ct = data / "chain_targets"
     if ct.exists():
         files += [(f, f"chain_targets/{f.name}") for f in sorted(ct.glob("*.npz"))]
+    fc = data / "face_targets"
+    if fc.exists():
+        files += [(f, f"face_targets/{f.name}") for f in sorted(fc.glob("*.npz"))]
     zip_dir(OUT / "wtok_synth_data.zip", files)
     print(f"\nUpload {OUT}:\n"
           f"  wtok_code.zip       -> Kaggle Dataset 'wtok-code'\n"
