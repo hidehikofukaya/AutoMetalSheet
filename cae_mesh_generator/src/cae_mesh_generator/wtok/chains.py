@@ -334,13 +334,36 @@ def enforce_g1_chain(p, bulge, is_arc, g1, closed):
     return out, float(residual)
 
 
+def arc_points(a, m, b, n: int):
+    """The circular arc a -> b through m, n points including both ends; None
+    when the three points are collinear. Same construction as realize_frame.
+
+    Until 2026-09-02 realize_chain called codec.realize_edge(a, m, b, n), whose
+    signature is (Q, e, samples); the TypeError was swallowed by a bare except
+    and EVERY chain and face-ring arc realized as its chord. The round-trip
+    gates (0.34 / 0.49mm) did not catch it: arcs are 23% of edges at ~1mm
+    sagitta. Caught by the user comparing the teacher against CATIA.
+    """
+    from .codec import circle_through
+
+    cc = circle_through(a, m, b)
+    if cc is None:
+        return None
+    c, nrm, r = cc
+    e1 = (a - c) / max(np.linalg.norm(a - c), 1e-12)
+    e2 = np.cross(nrm, e1)
+    a_m = np.arctan2((m - c) @ e2, (m - c) @ e1) % (2 * np.pi)
+    a_e = np.arctan2((b - c) @ e2, (b - c) @ e1) % (2 * np.pi)
+    sweep = a_e if a_m <= a_e else a_e - 2 * np.pi
+    t = np.linspace(0.0, sweep, n)
+    return c + r * (np.cos(t)[:, None] * e1 + np.sin(t)[:, None] * e2)
+
+
 def realize_chain(x, closed, per_edge: int = 24, g1_thresh: float = 0.5):
     """One 2b tensor back to a polyline (frame units).
 
     g1_thresh: 0.5 for the binary chain flag; face rings carry the KB 18.8
     smoothness value and pass frame.G1_SMOOTH instead."""
-    from .codec import realize_edge
-
     live = x[:, 7] < 0.5
     p = x[live, 0:3]
     n = len(p)
@@ -356,11 +379,7 @@ def realize_chain(x, closed, per_edge: int = 24, g1_thresh: float = 0.5):
         a, b = p[i], p[(i + 1) % n]
         seg = None
         if is_arc[i] > 0.5:
-            m = 0.5 * (a + b) + bulge[i]
-            try:
-                seg = realize_edge(a, m, b, per_edge)
-            except Exception:
-                seg = None
+            seg = arc_points(a, 0.5 * (a + b) + bulge[i], b, per_edge)
         if seg is None:
             seg = np.linspace(a, b, per_edge)
         pts.append(seg if not pts else seg[1:])
@@ -380,6 +399,17 @@ def realize_chains(x2a, chains2b, per_edge: int = 24):
 
 def demo():
     """Coverage, capacity and the round trip against the raw polylines."""
+    # A4: calibrate on a shape with a known answer -- a square whose one edge
+    # is a semicircular bulge must realize with that sagitta, not its chord
+    xs = np.zeros((CEDGE_SLOTS, CEDGE_CH)); xs[:, 7] = 1.0
+    sq = np.array([[0, 0, 0], [10, 0, 0], [10, 10, 0], [0, 10, 0]], float)
+    xs[:4, 0:3] = sq; xs[:4, 7] = 0.0
+    xs[0, 3:6] = [0, -5.0, 0]; xs[0, 6] = 1.0          # edge 0: bulge 5 below
+    poly = realize_chain(xs, closed=True, per_edge=32)
+    sag = -poly[:, 1].min()
+    print(f"calibration: semicircle sagitta 5.000 -> realized {sag:.3f}")
+    # 32 samples on a semicircle discretize to ~0.006mm; a chord fallback gives 0
+    assert abs(sag - 5.0) < 0.02, "arc realization is broken (chord fallback)"
     from .bendlines import mesh_bend_lines
     from .meshgen import fastener_frame
     from .dataset_curve import load_curve_parts
