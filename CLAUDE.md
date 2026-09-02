@@ -158,7 +158,7 @@ def dens(c, step=1.0):
 | 曲げ線の表現 | 密トークンはジグザグ(余剰回転 教師比12×)。角トークン(`--corner-t 0.25`)は `end` の取りこぼしで曲線間を飛ぶ → **区切りを構造で保証する表現(変位+角)が次** | `wtok/tokens.py`, KB 17.5 |
 | 外形 | **CATIAエッジ分割の教師 + G1連続値チャンネル + 実現時G1強制 + despike**(KB 18.8: g0_missed 0、座面100%、スパイク0%、近傍2.1mm。標準ckpt `runs/frame_g1sm2`。近傍改善は部品数2200と交絡、帰属未分離)。残: モード取り違え4/30部品(選択不能と実証、KB 18.7) | `wtok/frame.py`, `wtok/convert.py`, `wtok/rational_eval.py` |
 | 評価 | **3層合理性**(製造可能性/簡潔性/機能)。Chamfer・is_arc は評価から外した | `wtok/rational.py`, KB 17 |
-| 面 | 未着手 | — |
+| 面(曲げ) | **面ループ表現(KB 21、全面教師)**: 2a面集合+2b境界リング、教師自己整合0%。Kaggle v2: unmatched 11%・余剰3.4×・Chamfer 3.4mm(未合格、学習量で改善中) | `wtok/faces.py`, `wtok/face_eval.py` |
 | B-rep | 先送り(`surface_frame` の生成が要る) | — |
 
 **破棄済み**(記録として残置): `wtok/feature.py`(種別one-hot)、
