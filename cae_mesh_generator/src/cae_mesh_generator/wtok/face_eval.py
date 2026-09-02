@@ -40,8 +40,13 @@ def dens(c, step):
     return np.stack([np.interp(w, s, c[:, d]) for d in range(3)], 1)
 
 
-def ring_stats(rings, outline, t_u):
-    """(unmatched share, total excess turn) -- both teacher-free."""
+def ring_stats(rings, outline, t_u, corners=None):
+    """(unmatched share, total excess turn) -- both teacher-free.
+
+    `corners`: per-ring corner arrays; when given, excess turning is taken on
+    the corner polygon, not the realized curve. A realized arc turns by its
+    sweep legitimately, so on true arcs the curve-based number is dominated
+    by arc sweep (teacher floor 12,568deg) and no longer measures wiggle."""
     if not rings:
         return None
     pts = [dens(r, max(t_u, 1e-6)) for r in rings]
@@ -59,7 +64,7 @@ def ring_stats(rings, outline, t_u):
         unmatched += int((best > 2 * t_u).sum())
         total += len(q)
     excess = 0.0
-    for r in rings:
+    for r in (corners if corners is not None else rings):
         d = np.diff(np.concatenate([r, r[:1]]), axis=0)
         L = np.linalg.norm(d, axis=1)
         T = d[L > 1e-12] / L[L > 1e-12, None]
@@ -125,7 +130,7 @@ def gen_faces(p, models, device, steps=24, ring_k=1, ring_despike=False):
                     )[0].cpu().numpy().astype(np.float64)
         rows = xa[xa[:, FACE_CH - 1] < 0.5]
         if not len(rows):
-            return []
+            return [], []
         cond2 = []
         for d8 in rows:
             row = np.zeros((1, cond.shape[2]), np.float32)
@@ -147,7 +152,7 @@ def gen_faces(p, models, device, steps=24, ring_k=1, ring_despike=False):
                         ta2b.get("cfg_scale", 1.0), gen=g
                         ).cpu().numpy().astype(np.float64)
             cands.append(xb)
-        rings = []
+        rings, corners = [], []
         for i in range(B):
             best = None
             for k in range(ring_k):
@@ -159,15 +164,16 @@ def gen_faces(p, models, device, steps=24, ring_k=1, ring_despike=False):
                     continue
                 key = _ring_key(c)
                 if best is None or key < best[0]:
-                    best = (key, c)
+                    best = (key, c, x[x[:, 7] < 0.5, 0:3])
             if best is not None:
                 rings.append(best[1])
-        return rings
+                corners.append(best[2])
+        return rings, corners
 
     xb_ch = 10
     with torch.no_grad():
         sets = [once(31337 * s + 1) for s in range(K_DRAWS)]
-    scored = [(ring_stats(rs, outline, t_u), rs) for rs in sets]
+    scored = [(ring_stats(rs, outline, t_u, cs), rs) for rs, cs in sets]
     order2 = sorted(range(len(scored)), key=lambda i: (
         (9, 0) if scored[i][0] is None
         else (scored[i][0]["unmatched"], scored[i][0]["excess"])))
@@ -209,11 +215,12 @@ def main():
             continue
         x2a_t, r2b_t, _ = tt
         teach = [c for c in (realize_face_ring(x) for x in r2b_t) if c is not None]
+        teach_c = [x[x[:, 7] < 0.5, 0:3] for x in r2b_t]
         r = gen_faces(p, models, a.device, ring_k=a.ring_k,
                       ring_despike=a.ring_despike)
         u, t = r["u"], r["t"]
         t_u = t / u
-        st = ring_stats(teach, realize_frame(ft, 60), t_u)
+        st = ring_stats(teach, realize_frame(ft, 60), t_u, teach_c)
         row = {"part": p.name, "teacher": st, "single": r["single"],
                "ranked": r["score"]}
         if r["rings"] and teach:
