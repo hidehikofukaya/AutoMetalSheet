@@ -36,9 +36,13 @@ from .frame import G1_SMOOTH, _canonicalise, _edge_tangent
 # thickness side wall (a midsurface has none) -- it marks all planar faces plus
 # some curved ones, and excluding it dropped every panel and flange from the
 # teacher (user-caught: "only the beads are faces")
-FACE_SLOTS = 144
+# WTOK_FACES_MODE=curved restricts the teacher to non-planar faces (KB 21.11:
+# planar panels are the complement of outline + curved rings, so generating
+# them is learning something derivable). Capacities follow the mode.
+FACES_MODE = os.environ.get("WTOK_FACES_MODE", "all")
+FACE_SLOTS = 112 if FACES_MODE == "curved" else 144
 FACE_CH = 8             # centroid 3 | loop-plane normal 3 | log-perimeter 1 | unused 1
-FRING_SLOTS = 24        # capacity: measured max 16 edges/loop with all faces
+FRING_SLOTS = 16 if FACES_MODE == "curved" else 24
 FRING_CH = 10           # corner 3 | bulge 3 | is_arc 1 | unused 1 | g1 1 | spare 1
 FR_G1 = 8               # channel index of the smoothness value
 SELF_LOOP_MM = 0.2      # an edge whose endpoints weld to the SAME node and is
@@ -70,6 +74,9 @@ def face_loops(part, root=None):
     if d is None:
         return [], {}
     by_face: dict[int, list] = {}
+    keep = [True] * len(d["face_types"])
+    if FACES_MODE == "curved":
+        keep = [not w for w in d["face_wall"]]      # face_wall == planar (+few)
     for e in d["edges"]:
         if len(e["polyline"]) < 2:
             continue
@@ -77,7 +84,8 @@ def face_loops(part, root=None):
         if np.linalg.norm(np.diff(pl, axis=0), axis=1).sum() < MIN_EDGE_MM:
             continue
         for k in e["face_ids"]:
-            by_face.setdefault(k, []).append(pl)
+            if keep[k]:
+                by_face.setdefault(k, []).append(pl)
 
     loops, stats = [], {"unclosed": 0, "multi_loop": 0, "single_edge": 0,
                         "skipped_perimeter_mm": 0.0}

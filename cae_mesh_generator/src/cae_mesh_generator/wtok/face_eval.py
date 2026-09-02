@@ -84,7 +84,23 @@ def _ring_key(poly):
     return (int((turn > 150).sum()), max(float(turn.sum()) - 360.0, 0.0))
 
 
-def gen_faces(p, models, device, steps=24, ring_k=1, ring_despike=False):
+def outline_pin(x, outline, reach):
+    """Ring corners within `reach` (frame units) of the outline polyline are
+    moved onto it. A face that touches the outline shares those edges with
+    stage 1's result, so this is the same kind of input-derived constraint
+    as the fastener seat: nothing about shape is decided here."""
+    x = x.copy()
+    live = np.flatnonzero(x[:, 7] < 0.5)
+    if not len(live):
+        return x
+    d, j = cKDTree(outline).query(x[live, 0:3])
+    hit = d < reach
+    x[live[hit], 0:3] = outline[j[hit]]
+    return x
+
+
+def gen_faces(p, models, device, steps=24, ring_k=1, ring_despike=False,
+              outline_pin_t=0.0):
     """One part end to end; K_DRAWS full-pipeline draws, self-consistency rank."""
     (m_out, ta_out), (m2a, ta2a), (m2b, ta2b) = models
     fr, cond, fix = part_inputs(p, ta_out.get("use_spec", False), device)
@@ -144,12 +160,23 @@ def gen_faces(p, models, device, steps=24, ring_k=1, ring_despike=False):
         # ring_k draws per face; rings are independent, so the pick is
         # PER RING by (spikes, excess) -- the 2b-intrinsic wiggle is the one
         # defect a per-ring choice can reach (KB 21.6.1)
+        con2 = None
+        if outline_pin_t > 0:
+            reach = outline_pin_t * t_u
+
+            def con2(x1):
+                y = x1.clone()
+                for b in range(y.shape[0]):
+                    y[b] = torch.from_numpy(outline_pin(
+                        y[b].cpu().numpy().astype(np.float64), outline, reach
+                    ).astype(np.float32)).to(y.device)
+                return y
         cands = []
         for k in range(ring_k):
             g = torch.Generator(device).manual_seed(seed + 7 + 101 * k)
             xb = sample(m2b, cond2, fix.repeat(B, 1, 1),
                         octx(xb_ch).repeat(B, 1, 1), FRING_SLOTS, steps,
-                        ta2b.get("cfg_scale", 1.0), gen=g
+                        ta2b.get("cfg_scale", 1.0), gen=g, constrain=con2
                         ).cpu().numpy().astype(np.float64)
             cands.append(xb)
         rings, corners = [], []
@@ -191,6 +218,9 @@ def main():
     ap.add_argument("--parts", type=int, default=30)
     ap.add_argument("--ring-k", type=int, default=1)
     ap.add_argument("--ring-despike", action="store_true")
+    ap.add_argument("--outline-pin", type=float, default=0.0,
+                    help="pin ring corners within this many thicknesses of "
+                         "the generated outline onto it during 2b sampling")
     ap.add_argument("--out", default="")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     a = ap.parse_args()
@@ -217,7 +247,7 @@ def main():
         teach = [c for c in (realize_face_ring(x) for x in r2b_t) if c is not None]
         teach_c = [x[x[:, 7] < 0.5, 0:3] for x in r2b_t]
         r = gen_faces(p, models, a.device, ring_k=a.ring_k,
-                      ring_despike=a.ring_despike)
+                      ring_despike=a.ring_despike, outline_pin_t=a.outline_pin)
         u, t = r["u"], r["t"]
         t_u = t / u
         st = ring_stats(teach, realize_frame(ft, 60), t_u, teach_c)
