@@ -43,6 +43,8 @@ def source_dir(tag: str) -> pathlib.Path | None:
         return SYN / "prod02" / f"chunk_{int(tag[3:]):02d}"
     if tag.startswith("c") and tag[1:].isdigit():
         return SYN / "prod01" / f"chunk_{int(tag[1:]):02d}"
+    if tag.startswith("f") and tag[1:].isdigit():          # flange01 (2026-09-03)
+        return SYN / "flange01" / f"chunk_{int(tag[1:]):02d}"
     return None
 
 
