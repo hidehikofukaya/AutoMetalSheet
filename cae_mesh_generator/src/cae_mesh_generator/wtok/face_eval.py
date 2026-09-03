@@ -216,6 +216,8 @@ def main():
     ap.add_argument("--outline", default="runs/frame_g1sm2/best.pt")
     ap.add_argument("--wtok", default="runs/wtok_synth_g1")
     ap.add_argument("--parts", type=int, default=30)
+    ap.add_argument("--val-list", default="val_names_100.json",
+                    help="name list under --wtok (val_flange_30.json = flange holdout)")
     ap.add_argument("--ring-k", type=int, default=1)
     ap.add_argument("--ring-despike", action="store_true")
     ap.add_argument("--outline-pin", type=float, default=0.0,
@@ -230,7 +232,7 @@ def main():
     models = [load_model(c, a.device)[0::2] for c in (a.outline, a.ckpt2a, a.ckpt2b)]
     models = [(m, t) for m, t in models]
     wtok = pathlib.Path(a.wtok)
-    names = set(json.load(open(wtok / "val_names_100.json")))
+    names = set(json.load(open(wtok / a.val_list)))
     mesh = pathlib.Path("runs/mesh_synth/parts")
     if mesh.exists():
         names &= {f.stem for f in mesh.glob("*.npz")}
