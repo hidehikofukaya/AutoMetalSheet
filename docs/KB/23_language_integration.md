@@ -85,3 +85,7 @@ flowchart LR
 
 - 2026-09-03: ユーザー決定「外形・曲げ・面に一定の成果が出たら、推奨の方法で PoC を実施」。
   KB 22 ロードマップに P6 として登録。
+- 2026-09-03: **PartMaker 刷新の引継ぎ書**を `C:\Users\hide2\IdeaBox\PartMaker\docs\HANDOVER_partmaker_renewal.md`
+  に配置(Gemini が刷新を担当)。結論: CATIA/DELMIA COM → **OCCT で STEP 直接生成**(解析曲面のみ、面名を XCAF で付与)。
+  言語 PoC の材料として**構築プログラム・キャプション・面ラベル・展開図**の出力を要求。ML 側の在り方の選択肢
+  α(現行+教師強化)/ β(構築プログラムを中間表現に)/ γ(外形はフロー、面は構築)を同書 §6 に記載。推奨は α から。
