@@ -157,6 +157,20 @@ def gen_faces(p, models, device, steps=24, ring_k=1, ring_despike=False,
             cond2.append(np.concatenate([cond[0].cpu().numpy(), row]))
         cond2 = torch.from_numpy(np.stack(cond2)).float().to(device)
         B = len(rows)
+        ctx2 = octx(xb_ch)
+        if ta2b.get("sib_ctx", False):
+            # KB 21.19: the generated 2a rows of this part as sibling context,
+            # laid out exactly as StageDataset does (marker in the last column)
+            sib = np.zeros((FACE_SLOTS, xb_ch), np.float32)
+            m = len(rows)
+            sib[:m, 0:3] = rows[:, 0:3]
+            v = rows[:, 3:6]
+            sib[:m, 3:6] = v / np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-9)
+            sib[:m, 6] = rows[:, 6]
+            sib[:m, 7] = 1.0                 # marker column, as in StageDataset
+            if m < FACE_SLOTS:
+                sib[m:] = sib[np.arange(FACE_SLOTS - m) % m]
+            ctx2 = torch.cat([ctx2, torch.from_numpy(sib).float().to(device)[None]], 1)
         # ring_k draws per face; rings are independent, so the pick is
         # PER RING by (spikes, excess) -- the 2b-intrinsic wiggle is the one
         # defect a per-ring choice can reach (KB 21.6.1)
@@ -175,7 +189,7 @@ def gen_faces(p, models, device, steps=24, ring_k=1, ring_despike=False,
         for k in range(ring_k):
             g = torch.Generator(device).manual_seed(seed + 7 + 101 * k)
             xb = sample(m2b, cond2, fix.repeat(B, 1, 1),
-                        octx(xb_ch).repeat(B, 1, 1), FRING_SLOTS, steps,
+                        ctx2.repeat(B, 1, 1), FRING_SLOTS, steps,
                         ta2b.get("cfg_scale", 1.0), gen=g, constrain=con2
                         ).cpu().numpy().astype(np.float64)
             cands.append(xb)

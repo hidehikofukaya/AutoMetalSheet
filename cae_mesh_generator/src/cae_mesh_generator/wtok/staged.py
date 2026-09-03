@@ -454,6 +454,8 @@ class StageDataset(Dataset):
         if self.stage in ("bend_frame", "feature", "bend_tok", "bend_delta",
                           "chain_set", "chain_edges", "face_set", "face_ring"):
             n += EDGE_SLOTS
+        if self.stage == "face_ring" and getattr(self, "sib_ctx", False):
+            n += FACE_SLOTS                # the part's other faces (KB 21.19)
         if self.surf_curv:
             n += 256
         if self.cloud_bank:
@@ -579,6 +581,31 @@ class StageDataset(Dataset):
                     if n_ctx < EDGE_SLOTS:
                         ctx = np.concatenate(
                             [ctx, ctx[np.arange(EDGE_SLOTS - n_ctx) % n_ctx]])
+            if self.stage == "face_ring" and getattr(self, "sib_ctx", False):
+                # KB 21.19: the SIBLING descriptors -- every 2a row of the part,
+                # own face included -- as context rows. A ring generated alone
+                # cannot know where the faces it must share edges with are;
+                # the siblings are not derivable from its own descriptor plus
+                # the outline, so this is new information (KB 12). Same noise
+                # as the own-descriptor row: the stage must not trust a perfect
+                # upstream. Marker in the last column tells them from outline
+                # rows.
+                sib = np.zeros((FACE_SLOTS, ch), np.float32)
+                live = x2a[x2a[:, FACE_CH - 1] < 0.5]
+                m = len(live)
+                if m:
+                    sib[:m, 0:3] = live[:, 0:3] + rng.normal(0, self.chain_noise, (m, 3))
+                    v = live[:, 3:6] + rng.normal(0, self.chain_noise, (m, 3))
+                    sib[:m, 3:6] = v / np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-9)
+                    sib[:m, 6] = live[:, 6] + rng.normal(0, self.chain_noise, m)
+                    # marker in column 7: an outline row carries its unused
+                    # flag there (0 for live rows) while its G1 value lands in
+                    # column 9, so the last column would not tell them apart
+                    sib[:m, 7] = 1.0
+                    if m < FACE_SLOTS:               # repeat, never zero rows
+                        sib[m:] = sib[np.arange(FACE_SLOTS - m) % m]
+                ctx = sib if n_ctx == 0 else np.concatenate([ctx, sib])
+                n_ctx = len(ctx)
             if self.surf_curv:
                 # ORACLE: the true surface with its curvature field, to bound
                 # what a curvature field can buy before one is generated
@@ -1348,11 +1375,13 @@ def train(args):
     if W_D1 or W_D2:
         print(f"relational loss: D1 {W_D1}  D2 {W_D2}", flush=True)
     ds.chain_noise = float(getattr(args, "desc_noise", 0.0))
+    ds.sib_ctx = bool(getattr(args, "sib_ctx", False))
     ds.cloud_drop = args.cloud_drop
     ds.surf_curv = bool(args.surf_curv)
     ds.use_spec = vs_use = bool(args.use_spec)
     vs = StageDataset(val_parts, md, args.stage, base_seed=555,
                       cloud_bank=args.cloud_bank)
+    vs.sib_ctx = ds.sib_ctx
     vs.surf_curv = bool(args.surf_curv)
     vs.use_spec = bool(args.use_spec)
     dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
@@ -1475,6 +1504,10 @@ def main():
                          "matches the measured generated-2a centroid error; "
                          "facering1 ran at 0 and learned to trust a perfect "
                          "upstream (KB 21.6.1)")
+    ap.add_argument("--sib-ctx", action="store_true",
+                    help="face_ring: hand the part's other 2a descriptors to the "
+                         "ring as context rows (KB 21.19), so shared edges can "
+                         "agree. face_eval reads the flag from the checkpoint")
     ap.add_argument("--seed", type=int, default=0,
                     help="torch seed; the g1a==g1b sweep ran twice bit-identical "
                          "because this did not exist (KB 18.6)")
