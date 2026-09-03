@@ -124,6 +124,9 @@ def main() -> None:
     done, missing, failed, t0 = 0, [], [], time.time()
     for i, f in enumerate(src):
         name = f.stem
+        if (out / f"{name}.npz").exists():          # resumable: new batches only
+            done += 1
+            continue
         mid = find_mid(name)
         if mid is None:
             missing.append(name)

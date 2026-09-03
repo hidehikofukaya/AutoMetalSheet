@@ -39,7 +39,10 @@ SYNTH_BASE = pathlib.Path("C:/Users/hide2/IdeaBox/PartMaker/synthetic_parts")
 GROUPS = ([("batch02", "batch02")]
           + [(f"prod01/chunk_0{i}", f"c0{i}") for i in range(1, 7)]
           + [("prod02/chunk_01", "p2c01"), ("prod02/chunk_02", "p2c02"),
-             ("prod02/chunk_03", "p2c03"), ("prod02/chunk_04", "p2c04")])
+             ("prod02/chunk_03", "p2c03"), ("prod02/chunk_04", "p2c04")]
+          # flange01: a NEW part family (507 parts, 2026-09-03) -- the first
+          # data beyond the two-point bead family the whole project trained on
+          + [(f"flange01/chunk_0{i}", f"f0{i}") for i in range(1, 8)])
 
 
 def load_synth_joints(group_dir: pathlib.Path) -> dict[str, list[dict]]:
