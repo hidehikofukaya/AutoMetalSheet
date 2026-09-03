@@ -30,6 +30,7 @@ Branch: `feat/softmin-guidance-poc`
 | 14 | [14_delta_tokens.md](14_delta_tokens.md) | 変位トークン。**保留中、次は曲げで試す** | 続きをやる人 |
 | 15 | [15_micro_structure_design.md](15_micro_structure_design.md) | 微細構造の設計と結果(A✗ B△ C○、関係損失✗) | 経緯を追う人 |
 | 16 | [16_engineering_structure.md](16_engineering_structure.md) | 目標の再定義。is_arcは許容差の産物。教師の正準化、展開図表現 | 次に実装する人 |
+| 22 | [22_status_roadmap.md](22_status_roadmap.md) | **総括(2026-09-03)**: 成果 / ボトルネック B1-B6 / ロードマップ P0-P5 と見積り | **全員。現在地を知りたい人はここから** |
 | 21 | [21_face_loops.md](21_face_loops.md) | **面ループ表現(案A承認)。**面=生成単位、境界閉リング=外形フレーム同型。face_ids依頼中 | **次に実装する人。必読** |
 | 20 | [20_bend_design.md](20_bend_design.md) | **曲げ表現の設計案(承認待ち)。**CATIAプリミティブ+2段チェーン生成。幾何区切りの棄却測定、容量、外形スナップ拘束 | **次に実装する人。必読** |
 | 19 | [19_generality_and_needles.md](19_generality_and_needles.md) | 汎用性監査(生成N=2-5通過、N混在バッチ修正、残ギャップ5件)+針の根本原因(H1/H2棄却、H3積分が1/3、64stepは修復後に無効) | 現況 |
