@@ -1,0 +1,6 @@
+[
+  {"tag": "2b_sib_2677_s0", "stage": "face_ring", "epochs": 140, "seed": 0, "parts": 2677, "batch": 64, "rel": 1, "extra": ["--sib-ctx"], "hours": 20},
+  {"tag": "2b_sib_2677_s1", "stage": "face_ring", "epochs": 140, "seed": 1, "parts": 2677, "batch": 64, "rel": 1, "extra": ["--sib-ctx"], "hours": 20},
+  {"tag": "2b_base_2677_s0", "stage": "face_ring", "epochs": 140, "seed": 0, "parts": 2677, "batch": 64, "rel": 1, "hours": 20},
+  {"tag": "2a_2677_s1", "stage": "face_set", "epochs": 600, "seed": 1, "parts": 2677, "batch": 16, "rel": 1, "probe_every": 30, "hours": 8}
+]

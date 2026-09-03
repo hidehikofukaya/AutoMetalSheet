@@ -1384,7 +1384,14 @@ def train(args):
     vs.sib_ctx = ds.sib_ctx
     vs.surf_curv = bool(args.surf_curv)
     vs.use_spec = bool(args.use_spec)
-    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
+    # The per-item work (guard disc, targets, context rows, KD-trees) is Python
+    # and dominates the step on a small model: the local 1660S sat at 30-50%
+    # utilisation. Workers are the lever on Linux (fork); on Windows spawn
+    # re-imports torch per worker, so the default stays 0 there.
+    nw = int(getattr(args, "workers", 0))
+    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, drop_last=True,
+                    num_workers=nw, persistent_workers=nw > 0,
+                    prefetch_factor=4 if nw > 0 else None)
     model = StageFlow(args.dim, args.layers, args.heads, cross, ordered,
                       ch=STAGE_CH.get(args.stage, CH),
                       rel=bool(args.rel_attn)).to(args.device)
@@ -1508,6 +1515,8 @@ def main():
                     help="face_ring: hand the part's other 2a descriptors to the "
                          "ring as context rows (KB 21.19), so shared edges can "
                          "agree. face_eval reads the flag from the checkpoint")
+    ap.add_argument("--workers", type=int, default=0,
+                    help="DataLoader workers (Linux/vast.ai: 8-12; Windows: 0)")
     ap.add_argument("--seed", type=int, default=0,
                     help="torch seed; the g1a==g1b sweep ran twice bit-identical "
                          "because this did not exist (KB 18.6)")

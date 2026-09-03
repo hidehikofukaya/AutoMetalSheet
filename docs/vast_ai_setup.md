@@ -1,0 +1,97 @@
+# vast.ai 運用手順(2026-09-04)
+
+役割分担(合意済み): ① Kaggle = PoC(探索)、② ローカル GPU = 1 ジョブ上限で評価・診断と短い学習、
+③ vast.ai = 本番(**多部品 × 複数シードを 1 インスタンスで並列**)。評価器は常にローカル。
+
+---
+
+## 1. ユーザーがやること(vast.ai 側)
+
+### 初回のみ
+1. https://vast.ai でアカウント作成、クレジット入金(まず $10〜20)
+2. **SSH 公開鍵を登録**: Account → SSH Keys。ローカルに鍵が無ければ PowerShell で
+   ```
+   ssh-keygen -t ed25519 -C vast
+   type $env:USERPROFILE\.ssh\id_ed25519.pub
+   ```
+   の出力を貼る
+3. **API キー**を取得(Account → API Key)し、`vastai` CLI を入れる:
+   ```
+   pip install vastai
+   vastai set api-key <キー>
+   ```
+   (CLI は任意。Web UI だけでも運用できる)
+
+### インスタンスを借りるとき
+4. Web UI の **Search** で条件を入れる(価格より効く順):
+   - GPU: **RTX 4070 Ti / 4070 / 4060 Ti 16GB**(本番)、**RTX 3060 12GB**(探索・単発)
+   - **vCPU ≥ 8(12 推奨)、RAM ≥ 24GB**、Disk ≥ 60GB(NVMe)
+   - Reliability ≥ 0.98、Verified、DL 帯域 ≥ 200 Mbps
+   - 種別: 本番は **On-demand**、短いスイープは **Interruptible**(`--resume` で復帰できる)
+   - Image/Template: **PyTorch(最新 CUDA 12 系)**、Launch mode: **SSH**
+   CLI なら:
+   ```
+   vastai search offers 'gpu_name in [RTX_4070_Ti,RTX_4070,RTX_3060] cpu_cores>=8 cpu_ram>=24 reliability>0.98 verified=true inet_down>200 disk_space>=60' -o dph
+   vastai create instance <offer_id> --image pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime --disk 60 --ssh
+   ```
+5. 起動後、Instances で **SSH 接続コマンド**(`ssh -p <port> root@<host>`)を控える
+6. 接続コマンド(ホスト・ポート)を私に渡す → 以降の転送・起動・回収は私が行う
+   (私が実行できない場合は §3 のコマンドをそのまま打つ)
+7. 終わったら **Destroy**(Stop だけだとディスク課金が続く)
+
+### 毎回の確認
+- 起動直後に `nvidia-smi` と `nproc` で GPU と vCPU が広告どおりか見る(違う機体はすぐ Destroy)
+- 課金は時間単位。本番 1 日 ≈ $2〜4(4070 Ti)、$1.5(3060)
+
+---
+
+## 2. こちら(AutoMetalSheet 側)が用意済みのもの
+
+| 物 | 場所 | 内容 |
+|---|---|---|
+| `--workers` フラグ | `wtok/staged.py` | DataLoader 並列(Linux で 8〜12)。ローカルは 0 のまま |
+| 複数アーム起動 | `tools/vast/run_arms.py` | sweep JSON の各アームを 1 GPU 上で同時実行(`--parallel 4`)。`last.pt` があれば自動 `--resume` |
+| 初期設定 | `tools/vast/setup.sh` | zip 展開・依存確認・機体確認 |
+| スイープ例 | `tools/vast/sweep_example.json` | 2b sib×2 シード + 2b 基準 + 2a seed1(すべて 2677 部品) |
+| スペック表 | `tools/export_spec_vectors.py` | PartMaker が見えない機体向け(`spec_vectors.json`)。新チャンク取り込み後に再実行 |
+| バンドル | `tools/make_kaggle_bundle.py --data-dir runs/wtok_synth_g1 --val-list runs/wtok_synth_g1/val_names_100.json` | `kaggle_bundle/wtok_code.zip`(コード)+ `wtok_synth_data.zip`(parts / face_targets / spec / val リスト 3 種)。Kaggle と共通 |
+
+---
+
+## 3. 1 サイクルの手順(私が実行。手動なら同じコマンド)
+
+```bash
+# 0. ローカルで最新化
+python tools/export_spec_vectors.py --wtok runs/wtok_synth_g1
+python tools/make_kaggle_bundle.py --data-dir runs/wtok_synth_g1 --val-list runs/wtok_synth_g1/val_names_100.json
+
+# 1. 転送(PowerShell / Git Bash)
+scp -P <port> kaggle_bundle/wtok_code.zip kaggle_bundle/wtok_synth_data.zip tools/vast/setup.sh tools/vast/run_arms.py tools/vast/sweep_example.json root@<host>:/workspace/upload/
+
+# 2. 機体で初期設定と起動
+ssh -p <port> root@<host>
+bash /workspace/upload/setup.sh
+mkdir -p /workspace/code/tools/vast && cp /workspace/upload/run_arms.py /workspace/code/tools/vast/
+cd /workspace/code && nohup python tools/vast/run_arms.py /workspace/upload/sweep_example.json \
+    --data /workspace/data --out /workspace/runs --workers 8 --parallel 4 > /workspace/runs/arms.log 2>&1 &
+tail -f /workspace/runs/arms.log        # 各アームは /workspace/runs/<tag>.log
+
+# 3. 回収(ローカルから。ckpt と履歴だけ。評価はローカルで)
+scp -P <port> -r root@<host>:/workspace/runs/<tag> runs/vast_<tag>
+python -m cae_mesh_generator.wtok.face_eval --ckpt2a runs/faceset_2677/best.pt --ckpt2b runs/vast_<tag>/best.pt --ring-k 3 --ring-despike --val-list val_flange_30.json
+```
+
+---
+
+## 4. 昇格ゲート(Kaggle/ローカルの PoC → vast 本番)
+
+1. オラクル分解(D1/D2)で「効く余地」が見えている
+2. PoC で相対改善がノイズ幅(近傍 ±0.2mm、余剰 ±0.2×、未整合 ±1pt)を超えた
+3. 本番は seed ≥ 2 で回し、平均で判定する(習慣 B1/B2)
+
+## 5. 注意
+
+- Interruptible で落ちたら同じ sweep を再投入するだけ(`last.pt` から再開)
+- 1 アーム ≈ 2〜2.5GB VRAM。12GB なら `--parallel 4`、8GB なら 3、16GB 以上なら 6
+- `OMP_NUM_THREADS=2` を各アームに設定済み(numpy が全コアを奪い合わないため)
+- `mesh_synth` の npz は学習に不要(曲率オラクル `--surf-curv` を使うときだけ)
