@@ -42,7 +42,11 @@ GROUPS = ([("batch02", "batch02")]
              ("prod02/chunk_03", "p2c03"), ("prod02/chunk_04", "p2c04")]
           # flange01: a NEW part family (507 parts, 2026-09-03) -- the first
           # data beyond the two-point bead family the whole project trained on
-          + [(f"flange01/chunk_0{i}", f"f0{i}") for i in range(1, 8)])
+          + [(f"flange01/chunk_0{i}", f"f0{i}") for i in range(1, 8)]
+          # occt11/occt12 (2026-09-04): PartMaker's OCCT backend (STEP-native,
+          # no CATIA). occt11 = bead/flange with 0-2 folds, occt12 = rib/plain
+          # with 0-1 folds -- the first parts with fewer than 2 folds
+          + [("occt11/chunk_01", "o11c01"), ("occt12/chunk_01", "o12c01")])
 
 
 def load_synth_joints(group_dir: pathlib.Path) -> dict[str, list[dict]]:
