@@ -89,7 +89,22 @@ python -m cae_mesh_generator.wtok.face_eval --ckpt2a runs/faceset_2677/best.pt -
 2. PoC で相対改善がノイズ幅(近傍 ±0.2mm、余剰 ±0.2×、未整合 ±1pt)を超えた
 3. 本番は seed ≥ 2 で回し、平均で判定する(習慣 B1/B2)
 
-## 5. 注意
+## 5. 初回運用で分かったこと(2026-09-04、インスタンス 49803200、RTX 3060 12GB、$0.058/h)
+
+- **CLI は 2FA セッションが要る**: `vastai tfa send-sms` → `vastai tfa login --method-type sms --secret <S> -c <CODE>`。
+  API キーだけでは `show instances` も 401
+- **SSH は直接ポートで**: `ssh3.vast.ai:<port>` のプロキシは `kex_exchange_identification: Connection closed` で入れなかった
+  (Jupyter モードで作った機体)。`vastai show instances --raw` の `ports['22/tcp'][0]['HostPort']` と `public_ipaddr` へ直接
+  `ssh -p <HostPort> root@<ip>` で入れる
+- **base-image には torch が無い**: `source /venv/main/bin/activate && uv pip install torch numpy scipy matplotlib`(2〜3 分)。
+  非対話 ssh では `python` が無いので venv を activate してから使う。機体のガイドは `/etc/vast-agents-guide.md`
+- **`cpu_cores_effective` を見る**(この機体は 56 コア表示で実効 9.3)。`--workers 2 × --parallel 4` で十分
+- **VRAM**: 2b@2677(batch 64、兄弟文脈あり)は **4.1GB/アーム**、2a は 1.1GB。12GB で 2b×3 + 2a×1 が上限(11.4GB)。
+  4 アーム同時だと GPU が 100% になり、2a は 61s/epoch(ローカル単独 17s、3060 単独見込み ~8s)。
+  **演算が飽和するので「同時アーム数」は 12GB/3060 では 3 が実効的**。4070 Ti 以上なら 4〜5
+- `/workspace` は volume ではない(recycle/destroy で消える)。結果は必ず回収する
+
+## 6. 注意
 
 - Interruptible で落ちたら同じ sweep を再投入するだけ(`last.pt` から再開)
 - 1 アーム ≈ 2〜2.5GB VRAM。12GB なら `--parallel 4`、8GB なら 3、16GB 以上なら 6
