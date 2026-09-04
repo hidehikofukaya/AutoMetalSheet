@@ -1134,6 +1134,7 @@ def sample(model, cond, fix, ctx, n_pts, steps=24, scale=2.0, gen=None,
 # ------------------------------------------------------------------ training
 
 import argparse
+import copy
 import json
 import re
 import time
@@ -1413,9 +1414,18 @@ def train(args):
                                                        args.lr * 0.05)
     start, best, hist = 1, float("inf"), []
     last = out / "last.pt"
+    # KB 21.24 (brush-up 5): an exponential moving average of the weights is
+    # what gets probed and saved as "model"; the raw weights ride along as
+    # "model_raw" so a resume continues the optimiser trajectory. The probe on
+    # the 5-family outline swung 1.9-2.8 between neighbouring checkpoints with
+    # the raw weights; the EMA is the standard remedy for that.
+    ema_decay = float(getattr(args, "ema", 0.0))
+    ema = copy.deepcopy(model).eval() if ema_decay > 0 else None
     if args.resume and last.exists():
         ck = torch.load(last, map_location=args.device, weights_only=False)
-        model.load_state_dict(ck["model"])
+        model.load_state_dict(ck.get("model_raw", ck["model"]))
+        if ema is not None:
+            ema.load_state_dict(ck["model"])
         opt.load_state_dict(ck["opt"])
         start = ck["epoch"] + 1
         best = ck.get("best", best)
@@ -1436,24 +1446,30 @@ def train(args):
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
+            if ema is not None:
+                with torch.no_grad():
+                    for pe, pm in zip(ema.parameters(), model.parameters()):
+                        pe.mul_(ema_decay).add_(pm.detach(), alpha=1.0 - ema_decay)
             tot += float(loss.detach())
             n += 1
         sched.step()
         msg = f"epoch {epoch}: loss {tot/max(n,1):.5f} ({time.time()-t0:.1f}s)"
         row = {"epoch": epoch, "loss": tot / max(n, 1)}
         if epoch % args.probe_every == 0:
-            e, cv = probe(model, vs, args.device, args.probe_parts, args.steps,
-                          args.cfg_scale)
+            e, cv = probe(ema if ema is not None else model, vs, args.device,
+                          args.probe_parts, args.steps, args.cfg_scale)
             row.update(ends=e, spacing_cv=cv)
             score = e + cv                      # both are "lower is better"
             msg += f"  | ends {100*e:.1f}% spacing_cv {cv:.3f}"
             if score < best:
                 best = score
                 msg += " *best*"
-                safe_save({"model": model.state_dict(), "opt": opt.state_dict(),
+                safe_save({"model": (ema if ema is not None else model).state_dict(),
+                           "model_raw": model.state_dict(), "opt": opt.state_dict(),
                            "epoch": epoch, "best": best, "args": vars(args)},
                           out / "best.pt")
-            safe_save({"model": model.state_dict(), "opt": opt.state_dict(),
+            safe_save({"model": (ema if ema is not None else model).state_dict(),
+                       "model_raw": model.state_dict(), "opt": opt.state_dict(),
                        "epoch": epoch, "best": best, "args": vars(args)}, last)
         hist.append(row)
         (out / "history.json").write_text(json.dumps(hist), encoding="utf-8")
@@ -1529,6 +1545,9 @@ def main():
     ap.add_argument("--train-filter", default="",
                     help="regex on part names for the TRAINING pool (e.g. '^o1' = the "
                          "OCCT families). Val parts come from --val-list regardless")
+    ap.add_argument("--ema", type=float, default=0.0,
+                    help="EMA decay of the weights for probing/saving (0 = off; "
+                         "0.999 is the usual value at ~230 steps/epoch)")
     ap.add_argument("--workers", type=int, default=0,
                     help="DataLoader workers (Linux/vast.ai: 8-12; Windows: 0)")
     ap.add_argument("--seed", type=int, default=0,

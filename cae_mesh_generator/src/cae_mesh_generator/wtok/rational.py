@@ -271,6 +271,81 @@ def seat_project(x, frame, seat_pts, seat_axes, seat_r, margin=1.0):
     return x
 
 
+def seat_edge_project(x, frame, seat_pts, seat_axes, seat_r, margin=1.0):
+    """KB 21.24 (brush-up 3): corners outside the disc are not enough -- an EDGE
+    between two corners can still cut straight through the seat (occt12 tabs,
+    occt13: seat ratio 0.80-0.96 with every corner on the rim).
+
+    Applied ONCE after sampling, not inside the sampling constraint: run at
+    every flow step it also fires on the noisy intermediate states and bends the
+    whole trajectory (occt12 near 0.61 -> 3.0mm when it was inside `constrain`).
+
+    For each chord, take its closest point to the seat centre in the seat's
+    plane; if that point is inside the disc and within the sheet's slab, push
+    both endpoints outward along the in-plane normal until the chord clears the
+    rim. Chords only (the bulge of an arc is left as is); two passes settle the
+    neighbours."""
+    from .meshgen import to_frame
+
+    x = x.copy()
+    u = frame[2]
+    live = np.flatnonzero(x[:, 7] < 0.5)
+    n = len(live)
+    if n < 3:
+        return x
+    P = x[live, 0:3]
+    sf, af = to_frame(seat_pts, seat_axes, frame)
+    r = (seat_r * margin) / u
+    for _ in range(2):
+        for c, a in zip(sf, af):
+            a = a / max(np.linalg.norm(a), 1e-12)
+            for i in range(n):
+                j = (i + 1) % n
+                p0, p1 = P[i], P[j]
+                d = p1 - p0
+                dd = float(d @ d)
+                if dd < 1e-12:
+                    continue
+                s = float(np.clip(((c - p0) @ d) / dd, 0.0, 1.0))
+                if not (0.0 < s < 1.0):
+                    continue
+                q = p0 + s * d
+                w = q - c
+                hq = float(w @ a)
+                rad = w - hq * a
+                dist = float(np.linalg.norm(rad))
+                if dist < r and abs(hq) < r:
+                    dirn = rad / dist if dist > 1e-9 else np.cross(a, d)
+                    dirn = dirn - float(dirn @ a) * a
+                    nd = float(np.linalg.norm(dirn))
+                    if nd < 1e-9:
+                        continue
+                    dirn /= nd
+                    push = (r - dist) * dirn
+                    P[i] = p0 + push
+                    P[j] = p1 + push
+    x[live, 0:3] = P
+    return x
+
+
+def _seat_project_selfcheck():
+    """A square whose bottom edge cuts through a seat: corners are outside the
+    disc, so the old projection leaves the edge inside. After the edge pass no
+    chord comes within the rim."""
+    x = np.zeros((4, 12))
+    x[:, 0:3] = [[-2, -2, 0], [2, -2, 0], [2, 2, 0], [-2, 2, 0]]
+    frame = (np.zeros(3), np.eye(3), 1.0)
+    seat = np.array([[0.0, -2.0, 0.0]])          # centre on the bottom edge
+    axis = np.array([[0.0, 0.0, 1.0]])
+    y = seat_edge_project(seat_project(x, frame, seat, axis, 1.0), frame, seat, axis, 1.0)
+    P = y[:, 0:3]
+    worst = min(np.linalg.norm(np.cross(P[(i + 1) % 4] - P[i], seat[0] - P[i])) / np.linalg.norm(P[(i + 1) % 4] - P[i])
+                if 0 < ((seat[0] - P[i]) @ (P[(i + 1) % 4] - P[i])) / ((P[(i + 1) % 4] - P[i]) @ (P[(i + 1) % 4] - P[i])) < 1
+                else 9.0 for i in range(4))
+    assert worst >= 1.0 - 1e-6, worst
+    return worst
+
+
 def bend_score(curves, outline, u, t_mm, attach_t: float = 2.0):
     """The same question for bend lines: is every feature explainable?
 

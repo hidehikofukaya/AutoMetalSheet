@@ -22,7 +22,7 @@ from scipy.spatial import cKDTree
 from .dataset_curve import load_curve_parts
 from .frame import EDGE_SLOTS, G1_CH, frame_target, medoid, realize_frame
 from .meshgen import fastener_disc, fastener_frame, frame_cond_rows, to_frame
-from .rational import despike, junction_match, rank, score, seat_project, seats
+from .rational import despike, junction_match, rank, score, seat_edge_project, seat_project, seats
 from .staged import GUARD_PER_FIX, StageFlow, sample
 
 K_DRAWS = 9
@@ -73,6 +73,7 @@ def main():
     ap.add_argument("--parts", type=int, default=30)
     ap.add_argument("--steps", type=int, default=24)
     ap.add_argument("--out", default="")
+    ap.add_argument("--no-edge-seat", action="store_true", help="skip the post-sampling chord/seat projection (KB 21.24)")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     a = ap.parse_args()
     out = pathlib.Path(a.out or (pathlib.Path(a.ckpt).parent / "rational_eval"))
@@ -116,6 +117,8 @@ def main():
             return out
 
         draws = [despike(x, t / fr[2]) for x in k_draws(constrain)]
+        if not a.no_edge_seat:          # brush-up 3: chords must clear the seats
+            draws = [seat_edge_project(x, fr, P, A, r) for x in draws]
         order, _ = rank(draws, fr, P, r, t)
         best = draws[order[0]]
         # the baseline column stays what KB 17.5 measured: unconstrained

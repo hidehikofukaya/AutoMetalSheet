@@ -14,7 +14,7 @@ from scipy.spatial import cKDTree
 
 from .dataset_curve import load_curve_parts
 from .frame import EDGE_SLOTS, frame_target, realize_frame
-from .rational import despike, rank, score, seat_project, seats
+from .rational import despike, rank, score, seat_edge_project, seat_project, seats
 from .rational_eval import K_DRAWS, load_model, part_inputs
 from .staged import sample
 
@@ -58,7 +58,7 @@ def main():
         for k in range(K_DRAWS):
             g = torch.Generator(a.device).manual_seed(1000 + k)
             x = sample(model, cond, fix, None, EDGE_SLOTS, a.steps, targs.get("cfg_scale", 1.0), gen=g, constrain=constrain)
-            draws.append(despike(x[0].cpu().numpy().astype(np.float64), t / fr[2]))
+            draws.append(seat_edge_project(despike(x[0].cpu().numpy().astype(np.float64), t / fr[2]), fr, P, A, r))
         ref = realize_frame(xt, 60)
         near = []
         for x in draws:
