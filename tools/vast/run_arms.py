@@ -76,9 +76,10 @@ def main():
         while pending and len(running) < a.parallel:
             cfg = pending.pop(0)
             cmd = build_cmd(cfg, data, out, a.workers, val_list)
+            arm_env = dict(env, **{k: str(v) for k, v in cfg.get("env", {}).items()})
             log = open(out / f"{cfg['tag']}.log", "a")
             print(f"[{time.strftime('%H:%M')}] start {cfg['tag']}: {' '.join(cmd[4:])}", flush=True)
-            running.append((cfg["tag"], subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT), log))
+            running.append((cfg["tag"], subprocess.Popen(cmd, env=arm_env, stdout=log, stderr=subprocess.STDOUT), log))
         time.sleep(20)
         still = []
         for tag, proc, log in running:

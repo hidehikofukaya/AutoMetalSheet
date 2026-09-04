@@ -538,3 +538,17 @@ B-spline 混在(B-spline は occt11 21%、occt12 66% = リブの膨らみ)。CAT
 対策: `staged.py --train-filter REGEX`(学習プールを名前で絞る。フィルタ有効時はタグ別の内訳を印字)。
 `tools/train_occt.sh` と `tools/vast/sweep_occt.json` に `--train-filter ^o1` を入れ、ローカル(3 段)と vast(2b 4 アーム)を
 再投入(occt11 1170 + occt12 770 = 1940、印字で確認済み)。今後、混在コーパスでの学習は**必ずタグ内訳を確認**する(習慣 A3 の学習版)。
+
+## 21.22 3 点締結の初データ(occt13/15/16)と容量、CATIA 原データの消失(2026-09-04 深夜)
+
+- PartMaker が **3 点締結** 3 族を追加: occt13(three_point)、occt15(three_point_tri)、occt16(three_point_span)、各 600。
+  取り込み 1800/1800(FIX 頂点 3 個を確認)。教師床: occt13/15 は座面 100%、自己整合 0%、外形辺 14、面 7、リング最大 8
+- **occt16 は容量超過**: 外形辺 **40**(容量 32)、面 109〜118(容量 144 内)、リング最大 **52 辺**(容量 24)。
+  容量は個数でなく予算(哲学 2)なので、`EDGE_SLOTS` を環境変数 `WTOK_EDGE_SLOTS` で設定可能にし(既定 32 = 旧 ckpt 互換)、
+  5 族コーパスの学習・評価は **48** で回す。リング容量(面段)は 2b に進む時点で `FRING_SLOTS` を 64 に上げる
+- **PartMaker/synthetic_parts から CATIA 4 族(batch02/prod01/prod02/flange01)の原データが消えていた**(私は消していない)。
+  ワイヤーフレーム v4.5・変換済み部品・面教師・メッシュ npz は `runs/` に無傷。スペック(params)だけ再取得不能になったが、
+  15:43 のバンドルに 4807 件の表が残っていたので併合して復旧(`spec_vectors.json` 6607、バックアップ
+  `spec_vectors_backup_6607.json`)。**以後、CATIA 族は runs/ 内のデータが唯一の原本**
+- vast 4070 Ti に外形 1 ジョブ投入: 5 族 3650 部品(各族 30 ホールドアウト = `val_occt_150`)、1200 ep、`--train-filter ^o1`、
+  EDGE_SLOTS 48、ワーカー 12。6.9s/epoch → 約 2.3h。ローカルの学習はユーザー指示で停止

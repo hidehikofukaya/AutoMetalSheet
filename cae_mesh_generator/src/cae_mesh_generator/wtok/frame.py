@@ -23,7 +23,12 @@ from __future__ import annotations
 
 import numpy as np
 
-EDGE_SLOTS = 32         # max measured 26 (24 with the CATIA decomposition)
+import os as _os
+# CAPACITY, not a count (CLAUDE.md #2/#4). 32 covered every CATIA family (max 26);
+# occt16 (three_point_span, 2026-09-04) has 40 outline edges, so runs on that
+# corpus set WTOK_EDGE_SLOTS=48. Older checkpoints were trained at 32 -- keep the
+# default so they still load; set the variable for training AND evaluation alike.
+EDGE_SLOTS = int(_os.environ.get("WTOK_EDGE_SLOTS", 32))
 FRAME_CH = 12           # corner 3, arc bulge 3, is_arc 1, unused 1, normal 3, g1 1
 G1_CH = 11              # smoothness of the junction with the PREVIOUS edge
 G1_DEG = 3.0            # tangent angle below this is G1, not a corner (KB 18)
