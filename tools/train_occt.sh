@@ -6,7 +6,7 @@ set -u
 cd "$(dirname "$0")/.."
 export KMP_DUPLICATE_LIB_OK=TRUE PYTHONPATH="$PWD/cae_mesh_generator/src" WTOK_FACES_MODE=all WTOK_FACES=runs/wtok_synth_g1/face_targets
 TRAIN=${TRAIN:-1940}
-COMMON="--use-spec --rel-attn --seed 0 --dataset runs/mesh_synth --wtok runs/wtok_synth_g1 --val-list runs/wtok_synth_g1/val_occt_60.json --train-parts $TRAIN --val-parts 50 --dim 256 --layers 8 --heads 8 --cfg-scale 1.0 --probe-parts 16"
+COMMON="--use-spec --rel-attn --seed 0 --dataset runs/mesh_synth --wtok runs/wtok_synth_g1 --val-list runs/wtok_synth_g1/val_occt_60.json --train-parts $TRAIN --train-filter "^o1" --val-parts 50 --dim 256 --layers 8 --heads 8 --cfg-scale 1.0 --probe-parts 16"
 echo "=== spec rows: $(python -c "import json;print(len(json.load(open('runs/wtok_synth_g1/spec_vectors.json'))['spec']))")"
 echo "=== outline on OCCT $TRAIN parts"
 python -u -m cae_mesh_generator.wtok.staged --stage outline_frame $COMMON --output-dir runs/frame_occt --epochs 900 --batch-size 16 --probe-every 30 --max-hours 3.0 > runs/frame_occt.log 2>&1

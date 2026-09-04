@@ -1135,6 +1135,7 @@ def sample(model, cond, fix, ctx, n_pts, steps=24, scale=2.0, gen=None,
 
 import argparse
 import json
+import re
 import time
 
 from torch.utils.data import DataLoader
@@ -1350,7 +1351,17 @@ def train(args):
         # dataset (Kaggle) can still train them
         print(f"no mesh npz under {md} -- using all {len(parts)} parts", flush=True)
     vn = set(json.loads(pathlib.Path(args.val_list).read_text(encoding="utf-8")))
-    train_parts = [p for p in parts if p.name not in vn][: args.train_parts]
+    # --train-filter: a regex on the part name. Without it the training set is
+    # "the first N non-val parts in name order", which on a mixed-family corpus
+    # silently means the alphabetically first families (KB 21.21: the "OCCT"
+    # run of 2026-09-04 trained on 1807 CATIA parts + 133 occt11 parts).
+    tf = getattr(args, "train_filter", "")
+    pool = [p for p in parts if p.name not in vn and (not tf or re.search(tf, p.name))]
+    train_parts = pool[: args.train_parts]
+    if tf:
+        import collections
+        print(f"train filter {tf!r}: {len(pool)} parts match; by tag "
+              f"{dict(collections.Counter(q.name.split('__')[0] for q in train_parts))}", flush=True)
     val_parts = [p for p in parts if p.name in vn][: args.val_parts]
     print(f"stage {args.stage}: train {len(train_parts)} val {len(val_parts)}",
           flush=True)
@@ -1515,6 +1526,9 @@ def main():
                     help="face_ring: hand the part's other 2a descriptors to the "
                          "ring as context rows (KB 21.19), so shared edges can "
                          "agree. face_eval reads the flag from the checkpoint")
+    ap.add_argument("--train-filter", default="",
+                    help="regex on part names for the TRAINING pool (e.g. '^o1' = the "
+                         "OCCT families). Val parts come from --val-list regardless")
     ap.add_argument("--workers", type=int, default=0,
                     help="DataLoader workers (Linux/vast.ai: 8-12; Windows: 0)")
     ap.add_argument("--seed", type=int, default=0,

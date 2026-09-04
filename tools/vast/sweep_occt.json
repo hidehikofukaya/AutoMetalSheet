@@ -1,6 +1,60 @@
 [
-  {"tag": "2b_occt_base_s0", "stage": "face_ring", "epochs": 140, "seed": 0, "parts": 1940, "batch": 64, "rel": 1, "hours": 12},
-  {"tag": "2b_occt_sib_s0", "stage": "face_ring", "epochs": 140, "seed": 0, "parts": 1940, "batch": 64, "rel": 1, "extra": ["--sib-ctx"], "hours": 12},
-  {"tag": "2b_occt_base_s1", "stage": "face_ring", "epochs": 140, "seed": 1, "parts": 1940, "batch": 64, "rel": 1, "hours": 12},
-  {"tag": "2b_occt_sib_s1", "stage": "face_ring", "epochs": 140, "seed": 1, "parts": 1940, "batch": 64, "rel": 1, "extra": ["--sib-ctx"], "hours": 12}
+ {
+  "tag": "2b_occt_base_s0",
+  "stage": "face_ring",
+  "epochs": 140,
+  "seed": 0,
+  "parts": 1940,
+  "batch": 64,
+  "rel": 1,
+  "hours": 12,
+  "extra": [
+   "--train-filter",
+   "^o1"
+  ]
+ },
+ {
+  "tag": "2b_occt_sib_s0",
+  "stage": "face_ring",
+  "epochs": 140,
+  "seed": 0,
+  "parts": 1940,
+  "batch": 64,
+  "rel": 1,
+  "extra": [
+   "--sib-ctx",
+   "--train-filter",
+   "^o1"
+  ],
+  "hours": 12
+ },
+ {
+  "tag": "2b_occt_base_s1",
+  "stage": "face_ring",
+  "epochs": 140,
+  "seed": 1,
+  "parts": 1940,
+  "batch": 64,
+  "rel": 1,
+  "hours": 12,
+  "extra": [
+   "--train-filter",
+   "^o1"
+  ]
+ },
+ {
+  "tag": "2b_occt_sib_s1",
+  "stage": "face_ring",
+  "epochs": 140,
+  "seed": 1,
+  "parts": 1940,
+  "batch": 64,
+  "rel": 1,
+  "extra": [
+   "--sib-ctx",
+   "--train-filter",
+   "^o1"
+  ],
+  "hours": 12
+ }
 ]
