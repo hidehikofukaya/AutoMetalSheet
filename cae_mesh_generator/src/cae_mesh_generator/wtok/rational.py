@@ -271,20 +271,21 @@ def seat_project(x, frame, seat_pts, seat_axes, seat_r, margin=1.0):
     return x
 
 
-def seat_edge_project(x, frame, seat_pts, seat_axes, seat_r, margin=1.0):
+def seat_edge_project(x, frame, seat_pts, seat_axes, seat_r, margin=1.0, iters=8):
     """KB 21.24 (brush-up 3): corners outside the disc are not enough -- an EDGE
-    between two corners can still cut straight through the seat (occt12 tabs,
-    occt13: seat ratio 0.80-0.96 with every corner on the rim).
+    between two corners can still cut through the seat (occt12 tabs, occt13:
+    seat ratio 0.80-0.96 with every corner on the rim).
 
-    Applied ONCE after sampling, not inside the sampling constraint: run at
-    every flow step it also fires on the noisy intermediate states and bends the
-    whole trajectory (occt12 near 0.61 -> 3.0mm when it was inside `constrain`).
-
-    For each chord, take its closest point to the seat centre in the seat's
-    plane; if that point is inside the disc and within the sheet's slab, push
-    both endpoints outward along the in-plane normal until the chord clears the
-    rim. Chords only (the bulge of an arc is left as is); two passes settle the
-    neighbours."""
+    Works on the REALIZED edges (arcs drawn through their bulge, G1 enforced),
+    not on chords: a teacher outline rounding a seat tab has chords 4mm inside
+    the disc while the arc itself is exactly on the rim (calibration on the
+    teacher: chord version moved it 3-4mm and over-cleared to seat 1.15; this
+    version leaves it untouched). The measure is the one `score` uses -- 3D
+    distance from the fastener centre to the nearest outline point -- so a
+    violating point is pushed to the rim along that direction, carrying its
+    edge's two corners with it. Applied ONCE after sampling (inside the flow
+    it bends the trajectory: occt12 near 0.61 -> 3.0mm)."""
+    from .frame import realize_frame
     from .meshgen import to_frame
 
     x = x.copy()
@@ -293,38 +294,40 @@ def seat_edge_project(x, frame, seat_pts, seat_axes, seat_r, margin=1.0):
     n = len(live)
     if n < 3:
         return x
-    P = x[live, 0:3]
     sf, af = to_frame(seat_pts, seat_axes, frame)
     r = (seat_r * margin) / u
-    for _ in range(2):
+    per = 16
+    for _ in range(iters):
+        P = x[live, 0:3]
+        poly = realize_frame(x, per)
+        if len(poly) < n:
+            return x
+        moved = False
         for c, a in zip(sf, af):
-            a = a / max(np.linalg.norm(a), 1e-12)
-            for i in range(n):
-                j = (i + 1) % n
-                p0, p1 = P[i], P[j]
-                d = p1 - p0
-                dd = float(d @ d)
-                if dd < 1e-12:
-                    continue
-                s = float(np.clip(((c - p0) @ d) / dd, 0.0, 1.0))
-                if not (0.0 < s < 1.0):
-                    continue
-                q = p0 + s * d
-                w = q - c
-                hq = float(w @ a)
-                rad = w - hq * a
-                dist = float(np.linalg.norm(rad))
-                if dist < r and abs(hq) < r:
-                    dirn = rad / dist if dist > 1e-9 else np.cross(a, d)
-                    dirn = dirn - float(dirn @ a) * a
-                    nd = float(np.linalg.norm(dirn))
-                    if nd < 1e-9:
-                        continue
-                    dirn /= nd
-                    push = (r - dist) * dirn
-                    P[i] = p0 + push
-                    P[j] = p1 + push
-    x[live, 0:3] = P
+            d = np.linalg.norm(poly - c, axis=1)
+            k = int(np.argmin(d))
+            if d[k] >= r * (1.0 - 1e-3):
+                continue
+            q = poly[k]
+            # the edge this point belongs to: nearest chord segment
+            nxt = np.roll(P, -1, 0)
+            seg = nxt - P
+            ss = np.clip(np.einsum("ij,ij->i", q - P, seg) / np.maximum(np.einsum("ij,ij->i", seg, seg), 1e-12), 0, 1)
+            foot = P + ss[:, None] * seg
+            i = int(np.argmin(np.linalg.norm(foot - q, axis=1)))
+            j = (i + 1) % n
+            w = q - c
+            if d[k] > 1e-9:
+                dirn = w / d[k]
+            else:                      # centre exactly on the edge: push normal to it, in the seat plane
+                dirn = np.cross(a, seg[i])
+                dirn = dirn / max(np.linalg.norm(dirn), 1e-12)
+            push = (r - d[k]) * dirn
+            x[live[i], 0:3] += push
+            x[live[j], 0:3] += push
+            moved = True
+        if not moved:
+            break
     return x
 
 

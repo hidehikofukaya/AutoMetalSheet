@@ -27,7 +27,7 @@ from .faces import (FACE_CH, FACE_SLOTS, FRING_SLOTS, face_targets,
                     realize_face_ring)
 from .frame import EDGE_SLOTS, frame_target, realize_frame
 from .meshgen import fastener_frame
-from .rational import despike, rank, seat_project, seats
+from .rational import seat_edge_project, despike, rank, seat_project, seats
 from .rational_eval import load_model, part_inputs
 from .staged import curvature_field, sample
 
@@ -119,9 +119,9 @@ def gen_faces(p, models, device, steps=24, ring_k=1, ring_despike=False,
     draws = []
     for k in range(K_DRAWS):
         g = torch.Generator(device).manual_seed(1000 + k)
-        draws.append(despike(sample(m_out, cond, fix, None, EDGE_SLOTS, steps,
+        draws.append(seat_edge_project(despike(sample(m_out, cond, fix, None, EDGE_SLOTS, steps,
                      ta_out.get("cfg_scale", 1.0), gen=g, constrain=con
-                     )[0].cpu().numpy().astype(np.float64), t_u))
+                     )[0].cpu().numpy().astype(np.float64), t_u), fr, P, A, r))   # KB 21.24
     order, _ = rank(draws, fr, P, r, t)
     out_x = draws[order[0]]
     outline = realize_frame(out_x, 60)
