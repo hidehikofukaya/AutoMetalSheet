@@ -8,12 +8,16 @@ bend lines as unexplainable; with the right key it is 1.0%.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 
 import numpy as np
 
 _ROOT = pathlib.Path(__file__).resolve().parents[4]
-_WF = _ROOT / "runs" / "wtok_synth" / "wireframes"
+# runs/wtok_synth (v4.4) vanished on 2026-09-04; the v4.5 wireframes carry the
+# same source_stp for every part (4807), so the join lives there now
+_WF = pathlib.Path(os.environ.get(
+    "WTOK_SIDECAR_WF", _ROOT / "runs" / "wtok_synth_v45" / "wireframes"))
 _cache: dict = {}
 
 
@@ -47,7 +51,7 @@ SPEC_SCALE = np.array([2.0, 0.02, 0.05, 0.03, 0.03, 0.03, 0.1])
 import os
 # Kaggle sets WTOK_SPEC_FILE to the table inside its read-only input dataset
 _SPEC_FILE = pathlib.Path(os.environ.get(
-    "WTOK_SPEC_FILE", _ROOT / "runs" / "wtok_synth" / "spec_vectors.json"))
+    "WTOK_SPEC_FILE", _ROOT / "runs" / "wtok_synth_g1" / "spec_vectors.json"))
 _spec_table = None
 
 

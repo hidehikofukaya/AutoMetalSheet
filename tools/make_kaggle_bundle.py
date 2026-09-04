@@ -124,7 +124,8 @@ def main() -> None:
     if vl.exists():
         files.append((vl, "val_names_100.json"))
     # the per-family holdouts travel under their own names (KB 21.16)
-    for extra in ("val_names_130.json", "val_flange_30.json"):
+    for extra in ("val_names_130.json", "val_flange_30.json",
+                  "val_occt11_30.json", "val_occt12_30.json", "val_occt_60.json"):
         if (data / extra).exists():
             files.append((data / extra, extra))
     # the design spec lives in the PartMaker tree, which Kaggle cannot see, so
