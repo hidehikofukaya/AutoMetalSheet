@@ -1,0 +1,19 @@
+sequenceDiagram
+  participant S as サンプラ
+  participant M as StageFlow
+  participant K as 座面拘束 seat_project
+  participant P as 後処理
+  S->>S: x ← ノイズ 48×12(乱数種k)
+  loop 24ステップ(i=0..23, dt=1/24)
+    S->>M: (x, t=i·dt, 条件, 円板)
+    M-->>S: 速度 v
+    S->>S: 終点予測 x1_hat = x + v·(1-t)
+    S->>K: x1_hat
+    K-->>S: 角を座面円板の外へ射影した x1_hat'
+    S->>S: v ← (x1_hat' - x)/(1-t) 再照準
+    S->>S: x ← x + v·dt
+  end
+  S->>P: 完成テンソル
+  P->>P: despike(逆走した角を除去)
+  P->>P: seat_edge_project(実現辺で座面判定)
+  P-->>S: 候補 k

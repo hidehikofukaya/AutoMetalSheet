@@ -45,11 +45,21 @@ from .connect import densify, trace
 from .constants import safe_save, stable_seed
 from .dataset_curve import load_curve_parts
 from .evaluate_curve2 import one_way
+from .meshgen import fps_order
 from .plan_g import Block, RelBias
 from .train_curve import realized_q
 
 CLASSES = ("outer_boundary", "bend_line")
-BAND = 0.12          # frame units: only points this close to a curve are pulled
+BAND = 0.12       # frame units: displacement supervision is limited to this
+ON_CURVE = 0.03   # frame units: a point this close to a curve IS on it
+
+# A displacement alone cannot select. Almost every point on a sheet is within
+# 12% of the diagonal of SOME bend line -- GT curves have a median length of
+# 7.9mm and 98.6% sit within 8mm of a neighbour -- so thresholding |displacement|
+# kept 100% of points as both outline AND bend and projected the whole cloud
+# twice. Coverage cannot see that: carpeting a part covers every curve on it,
+# which is how that scored 10.26mm while drawing no wireframe at all. So the net
+# also says, per point and class, whether it is ON that curve.
 
 # Trained on perfect clouds this net reaches 1.51/1.99mm, but on GENERATED ones
 # it falls to 7.13/7.65 -- worse than the geometry it was meant to replace,
@@ -109,9 +119,31 @@ def corrupt(xyz, nrm, rng, strength=1.0):
     return idx, noisy
 
 
-def curve_points(part, cls):
+def resample_polyline(poly, step):
+    """Points every `step` along a polyline, whatever it was stored as.
+
+    An edge is stored the way its SHAPE needs: a LINE keeps two endpoints, an
+    ARC keeps enough to trace the curve. As a point set that is 35.7mm between
+    points on a straight run against 0.5mm on an arc -- a 70x density difference
+    that is an artefact of the storage, not of the shape. Anything that reads
+    these as a cloud sees dense arcs separated by empty straights.
+    """
+    seg = np.linalg.norm(np.diff(poly, axis=0), axis=1)
+    total = float(seg.sum())
+    if total < 1e-9:
+        return poly[:1]
+    n = max(2, int(np.ceil(total / step)) + 1)
+    s = np.concatenate([[0.0], np.cumsum(seg)])
+    want = np.linspace(0.0, total, n)
+    return np.stack([np.interp(want, s, poly[:, d]) for d in range(3)], axis=1)
+
+
+CURVE_STEP_MM = 1.8      # the average spacing the stored outline already had
+
+
+def curve_points(part, cls, step: float = CURVE_STEP_MM):
     q = realized_q(part, part.vertices, part.edges)
-    polys = [poly for poly in
+    polys = [resample_polyline(poly, step) for poly in
              (realize_edge(q, e) for e in part.edges if e.get("cls") == cls)
              if poly is not None and len(poly) >= 2]
     return np.concatenate(polys) if polys else np.zeros((0, 3))
@@ -119,10 +151,13 @@ def curve_points(part, cls):
 
 class RidgeDataset(Dataset):
     def __init__(self, parts, mesh_dir, n_pts, augment, base_seed=0,
-                 degrade_max=0.0):
+                 degrade_max=0.0, even=False):
         self.parts, self.dir, self.n_pts = parts, pathlib.Path(mesh_dir), n_pts
         self.augment, self.base_seed, self.epoch = augment, base_seed, 0
         self.degrade_max = degrade_max
+        # must match how the generator lays its points out, or the net is being
+        # trained on a distribution it will never see
+        self.even = even
         self.cache: dict = {}
 
     def set_epoch(self, e):
@@ -138,51 +173,65 @@ class RidgeDataset(Dataset):
             xyz = d["xyz"].astype(np.float64) * span + d["env_lo"]
             trees = [cKDTree(curve_points(part, c))
                      if len(curve_points(part, c)) else None for c in CLASSES]
+            order = (fps_order(xyz, min(len(xyz), 4 * self.n_pts))
+                     if self.even else None)
             tgt = np.zeros((len(xyz), len(CLASSES), 3))
             for ci, t in enumerate(trees):
                 if t is None:
                     tgt[:, ci] = xyz            # no such curve: zero displacement
                     continue
                 tgt[:, ci] = t.data[t.query(xyz)[1]]
-            self.cache[part.name] = (xyz, d["normal"].astype(np.float64), tgt)
+            self.cache[part.name] = (xyz, d["normal"].astype(np.float64), tgt,
+                                     order)
         return self.cache[part.name]
 
     def __getitem__(self, i):
         p = self.parts[i]
         rng = np.random.default_rng(
             stable_seed(self.base_seed + 999983 * self.epoch, p.name))
-        xyz, nrm, tgt = self.load(p)
-        take = rng.choice(len(xyz), min(self.n_pts, len(xyz)), replace=False)
-        x, n, t = xyz[take], nrm[take], tgt[take]
+        xyz, nrm, tgt, order = self.load(p)
+
+        # Corrupt the FULL cloud first, then draw the points. Doing it the other
+        # way round left holes as padding duplicates -- 300 of 512 slots were
+        # copies of surviving points, which is not what a sparse cloud looks
+        # like. This way a hole is simply a region with no points in it, and the
+        # net always gets n_pts real ones.
+        if self.degrade_max > 0:
+            idx, moved = corrupt(xyz, nrm, rng,
+                                 float(rng.uniform(0.0, self.degrade_max)))
+            pool_xyz, pool_nrm, pool_tgt = moved, nrm[idx], tgt[idx]
+            pool_order = None            # the FPS order no longer applies
+        else:
+            pool_xyz, pool_nrm, pool_tgt, pool_order = xyz, nrm, tgt, order
+
+        n = min(self.n_pts, len(pool_xyz))
+        if pool_order is not None and len(pool_order) >= n:
+            take = pool_order[:n]
+        elif self.even and len(pool_xyz) > n:
+            take = fps_order(pool_xyz, n)
+        else:
+            take = rng.choice(len(pool_xyz), n, replace=n > len(pool_xyz))
+        x, nn_, tt = pool_xyz[take], pool_nrm[take], pool_tgt[take]
+
         c = x.mean(0)
         s = float(np.linalg.norm(x - c, axis=1).max())
         if self.augment:                       # mirror in the local frame
             ax = int(rng.integers(0, 4)) - 1
             if ax >= 0:
-                x = x.copy(); n = n.copy(); t = t.copy()
+                x = x.copy(); nn_ = nn_.copy(); tt = tt.copy()
                 x[:, ax] = 2 * c[ax] - x[:, ax]
-                n[:, ax] = -n[:, ax]
-                t[:, :, ax] = 2 * c[ax] - t[:, :, ax]
-        if self.degrade_max > 0:
-            # holes and noise only; the targets stay on the ORIGINAL curves, so
-            # the net learns to restore the shape's wireframe from a damaged
-            # view of it
-            idx, x = corrupt(x, n, rng, float(rng.uniform(0.0, self.degrade_max)))
-            n, t = n[idx], t[idx]
-        c = x.mean(0)
-        s = float(np.linalg.norm(x - c, axis=1).max())
-        disp = (t - x[:, None, :]) / s          # displacement in frame units
-        feat = np.concatenate([(x - c) / s, n], 1).astype(np.float32)
+                nn_[:, ax] = -nn_[:, ax]
+                tt[:, :, ax] = 2 * c[ax] - tt[:, :, ax]
+
+        disp = (tt - x[:, None, :]) / s
+        feat = np.concatenate([(x - c) / s, nn_], 1).astype(np.float32)
         valid = np.ones(len(x), dtype=bool)
-        if len(x) < self.n_pts:        # holing leaves fewer points; pad and mask
+        if len(x) < self.n_pts:                # only if the part itself is small
             pad = self.n_pts - len(x)
-            take = rng.choice(len(x), pad, replace=True)
-            feat = np.concatenate([feat, feat[take]])
-            disp = np.concatenate([disp, disp[take]])
+            rep = rng.choice(len(x), pad, replace=True)
+            feat = np.concatenate([feat, feat[rep]])
+            disp = np.concatenate([disp, disp[rep]])
             valid = np.concatenate([valid, np.zeros(pad, dtype=bool)])
-        elif len(x) > self.n_pts:
-            sel = rng.choice(len(x), self.n_pts, replace=False)
-            feat, disp, valid = feat[sel], disp[sel], valid[sel]
         return {"x": torch.from_numpy(feat),
                 "disp": torch.from_numpy(disp.astype(np.float32)),
                 "valid": torch.from_numpy(valid),
@@ -198,7 +247,7 @@ class RidgeNet(nn.Module):
         self.inp = nn.Linear(6, dim)
         self.blocks = nn.ModuleList(Block(dim, heads) for _ in range(layers))
         self.norm = nn.LayerNorm(dim)
-        self.head = nn.Linear(dim, len(CLASSES) * 3)
+        self.head = nn.Linear(dim, len(CLASSES) * 4)   # 3 displacement + 1 logit
         self.rel = RelBias(heads)
         self.register_buffer("zero", torch.zeros(dim))
 
@@ -209,31 +258,45 @@ class RidgeNet(nn.Module):
         c = self.zero.expand(B, -1)
         for blk in self.blocks:
             h = blk(h, c, bias)
-        return self.head(self.norm(h)).reshape(B, N, len(CLASSES), 3)
+        out = self.head(self.norm(h)).reshape(B, N, len(CLASSES), 4)
+        return out[..., :3], out[..., 3]      # displacement, on-curve logit
 
 
 def loss_fn(model, batch):
-    pred = model(batch["x"])
+    pred, logit = model(batch["x"])
     tgt = batch["disp"]
     d = torch.linalg.norm(tgt, dim=-1)
+    valid = batch["valid"][..., None].float()
     # a point 200mm from the outline carries no information about where the
     # outline is; only supervise the band that does
-    w = (d < BAND).float() * batch["valid"][..., None].float()
+    w = (d < BAND).float() * valid
     err = ((pred - tgt) ** 2).mean(-1)
-    return (err * w).sum() / w.sum().clamp(min=1)
+    disp_loss = (err * w).sum() / w.sum().clamp(min=1)
+
+    # and separately: is this point ON that curve? Selecting by |displacement|
+    # alone kept every point for both classes and carpeted the part.
+    on = (d < ON_CURVE).float()
+    pos = on.mean().clamp(1e-3, 1.0 - 1e-3)
+    cw = torch.where(on > 0.5, 1.0 / pos, 1.0 / (1.0 - pos)) * valid
+    bce = (F.binary_cross_entropy_with_logits(logit, on, reduction="none")
+           * cw).sum() / cw.sum().clamp(min=1)
+    return disp_loss + 0.1 * bce
 
 
 @torch.no_grad()
-def score(model, parts, md, n_pts, device, max_parts=12, degrade_max=0.0):
+def score(model, parts, md, n_pts, device, max_parts=12, degrade_max=0.0,
+          even=False):
     """Restoration: from a holed and noisy view, did the net put out the
     wireframe of the shape underneath? Corruption of this kind is invertible, so
     the original curves are the right target."""
     ds = RidgeDataset(parts[:max_parts], md, n_pts, False, 555,
-                      degrade_max=degrade_max)
-    out = {"outline": [], "bend": [], "spur": [], "curves": []}
+                      degrade_max=degrade_max, even=even)
+    out = {"outline": [], "bend": [], "spur": [], "curves": [], "kept": []}
     for i in range(len(ds)):
         it = ds[i]
-        pred = model(it["x"][None].to(device))[0].cpu().numpy()
+        pr, lg = model(it["x"][None].to(device))
+        pred = pr[0].cpu().numpy()
+        conf = torch.sigmoid(lg[0]).cpu().numpy()
         s, c = float(it["scale"]), it["center"]
         pts = it["x"][:, :3].numpy() * s + c
         disp_gt = it["disp"].numpy()
@@ -242,7 +305,8 @@ def score(model, parts, md, n_pts, device, max_parts=12, degrade_max=0.0):
         drawn = []
         for ci in range(len(CLASSES)):
             disp = pred[:, ci] * s
-            keep = np.linalg.norm(disp, axis=1) < BAND * s
+            keep = conf[:, ci] > 0.5          # the net decides, not a radius
+            out["kept"].append(float(keep.mean()))
             if keep.sum() < 4:
                 drawn.append(np.zeros((0, 3)))
                 continue
@@ -289,12 +353,16 @@ def main():
     ap.add_argument("--dim", type=int, default=192)
     ap.add_argument("--layers", type=int, default=6)
     ap.add_argument("--heads", type=int, default=8)
+    ap.add_argument("--even", type=int, default=1,
+                    help="lay points out by farthest-point order, matching the "
+                         "generator")
     ap.add_argument("--degrade", type=float, default=0.0,
                     help="corrupt training clouds the way the generator does; "
                          "strength is drawn per item from [0, this]")
     ap.add_argument("--eval-every", type=int, default=5)
     ap.add_argument("--eval-parts", type=int, default=12)
     ap.add_argument("--max-hours", type=float, default=1.0)
+    ap.add_argument("--resume", action="store_true")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
     out = pathlib.Path(args.output_dir)
@@ -305,14 +373,30 @@ def main():
     md = pathlib.Path(args.dataset) / "parts"
     print(f"parts: train {len(train_parts)} val {len(val_parts)}  N={args.points}")
     tl = DataLoader(RidgeDataset(train_parts, md, args.points, True,
-                                 degrade_max=args.degrade),
+                                 degrade_max=args.degrade, even=bool(args.even)),
                     batch_size=args.batch_size, shuffle=True, drop_last=True)
     model = RidgeNet(args.dim, args.layers, args.heads).to(args.device)
     print(f"params: {sum(q.numel() for q in model.parameters())/1e6:.2f}M", flush=True)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs, args.lr * 0.05)
     hist, best, t0 = [], float("inf"), time.time()
-    for epoch in range(1, args.epochs + 1):
+    start = 1
+    last = out / "last.pt"
+    if args.resume and last.exists():
+        ck = torch.load(last, map_location=args.device, weights_only=False)
+        model.load_state_dict(ck["model"])
+        if "opt" in ck:
+            opt.load_state_dict(ck["opt"])
+        start = ck["epoch"] + 1
+        hp = out / "history.json"
+        if hp.exists():
+            hist = [r for r in json.loads(hp.read_text()) if r["epoch"] < start]
+            best = min((np.nanmean([r["outline"], r["bend"]])
+                        for r in hist if "outline" in r), default=float("inf"))
+        for _ in range(start - 1):
+            sched.step()
+        print(f"resumed at {start} (best {best:.2f}mm)", flush=True)
+    for epoch in range(start, args.epochs + 1):
         tl.dataset.set_epoch(epoch)
         model.train()
         te, tot, n = time.time(), 0.0, 0
@@ -332,15 +416,18 @@ def main():
         if epoch % args.eval_every == 0 or epoch == args.epochs:
             model.eval()
             row.update(score(model, val_parts, md, args.points, args.device,
-                             args.eval_parts, degrade_max=args.degrade))
+                             args.eval_parts, degrade_max=args.degrade,
+                             even=bool(args.even)))
             msg += (f" | outline {row['outline']:.2f}mm bend {row['bend']:.2f}mm "
-                    f"spur {row['spur']:.2f}mm")
+                    f"spur {row['spur']:.2f}mm kept {row['kept']*100:.0f}%")
             key = np.nanmean([row["outline"], row["bend"]])
             if key < best:
                 best = key
                 safe_save({"model": model.state_dict(), "args": vars(args),
                            "epoch": epoch}, out / "best.pt")
                 msg += " *best*"
+            safe_save({"model": model.state_dict(), "opt": opt.state_dict(),
+                       "args": vars(args), "epoch": epoch}, out / "last.pt")
         hist.append(row)
         (out / "history.json").write_text(json.dumps(hist), encoding="utf-8")
         print(msg, flush=True)

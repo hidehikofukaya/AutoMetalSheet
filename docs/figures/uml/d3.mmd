@@ -1,0 +1,18 @@
+sequenceDiagram
+  participant U as 締結点
+  participant M as StageFlow
+  participant C as 座面拘束
+  participant P as 後処理
+  participant R as 合理性ランク
+  U->>M: 条件行 + ガード円板
+  loop 9回(乱数種を変えて)
+    M->>M: 流れの積分 24ステップ
+    M->>C: 各ステップの状態
+    C-->>M: 角を座面円板の外へ射影
+    M->>P: 候補テンソル
+    P->>P: despike(逆走点を除去)
+    P->>P: 辺の座面射影(円弧込み)
+    P->>R: 候補
+  end
+  R->>R: 製造可能性→座面→余剰回転で並べる
+  R-->>U: 最良1本(+候補8本)

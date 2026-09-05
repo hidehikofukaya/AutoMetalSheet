@@ -1,0 +1,14 @@
+{
+  "source_stp": "experiments\\loss_smoothing\\body002_filled.stp",
+  "midsurface_ply": "experiments\\loss_smoothing\\body002_filled_midsurface.ply",
+  "dataset_h5": "experiments\\loss_smoothing\\body002_filled_dataset.h5",
+  "thickness_used_mm": 1.5188,
+  "n_vertices_total": 9124,
+  "n_vertices_valid": 9074,
+  "n_faces_midsurface": 18111,
+  "n_points": 8192,
+  "n_query": 14336,
+  "n_query_boundary": 4096,
+  "status": "ok",
+  "elapsed_s": 7.79
+}

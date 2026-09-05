@@ -1,0 +1,746 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>Part Viewer — AutoMetalSheet</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  display: flex;
+  height: 100vh;
+  overflow: hidden;
+  background: #1a1a1e;
+  color: #d4d4d8;
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  font-size: 13px;
+}
+
+/* ===== Sidebar ===== */
+#sidebar {
+  width: 260px;
+  min-width: 260px;
+  background: #1e1e24;
+  border-right: 1px solid #2e2e38;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.sidebar-header {
+  padding: 14px 16px 10px;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: #a1a1aa;
+  border-bottom: 1px solid #2e2e38;
+  text-transform: uppercase;
+}
+
+.section {
+  padding: 12px 16px;
+  border-bottom: 1px solid #2e2e38;
+}
+
+.section-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: #71717a;
+  text-transform: uppercase;
+  margin-bottom: 8px;
+}
+
+select {
+  width: 100%;
+  background: #27272a;
+  color: #d4d4d8;
+  border: 1px solid #3f3f46;
+  border-radius: 4px;
+  padding: 5px 8px;
+  font-size: 13px;
+  cursor: pointer;
+}
+select:focus { outline: none; border-color: #6366f1; }
+
+label.check-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+  cursor: pointer;
+  user-select: none;
+}
+label.check-row:hover { color: #f4f4f5; }
+label.check-row input[type=checkbox] { cursor: pointer; accent-color: #6366f1; }
+
+.slider-row {
+  margin-top: 6px;
+}
+.slider-row .slider-label {
+  display: flex;
+  justify-content: space-between;
+  color: #a1a1aa;
+  margin-bottom: 4px;
+  font-size: 12px;
+}
+input[type=range] {
+  width: 100%;
+  accent-color: #6366f1;
+}
+
+#meshInfo {
+  line-height: 1.8;
+  color: #a1a1aa;
+  font-size: 12px;
+}
+#meshInfo .val { color: #d4d4d8; }
+
+#holesList {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.hole-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 12px;
+  transition: background 0.1s;
+}
+.hole-item:hover { background: #27272a; }
+.hole-item .dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.dot-filled { background: #22c55e; }
+.dot-open { background: #ef4444; }
+.dot-skipped { background: #a78bfa; }
+.hole-meta { color: #71717a; font-size: 11px; margin-left: auto; white-space: nowrap; }
+
+#partMeta {
+  line-height: 1.8;
+  color: #a1a1aa;
+  font-size: 12px;
+}
+#partMeta .val { color: #d4d4d8; }
+
+.btn {
+  display: block;
+  width: 100%;
+  padding: 8px;
+  background: #4f46e5;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.btn:hover { background: #4338ca; }
+.btn:active { background: #3730a3; }
+
+.btn-secondary {
+  background: #27272a;
+  color: #d4d4d8;
+  border: 1px solid #3f3f46;
+  margin-top: 6px;
+}
+.btn-secondary:hover { background: #3f3f46; }
+
+#status-sidebar {
+  padding: 8px 16px;
+  font-size: 11px;
+  color: #71717a;
+  min-height: 28px;
+}
+
+/* ===== Viewport ===== */
+#viewport {
+  flex: 1;
+  position: relative;
+  background: #111116;
+}
+
+#viewport canvas {
+  display: block;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+#loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(17,17,22,0.8);
+  font-size: 15px;
+  color: #a1a1aa;
+  z-index: 10;
+  letter-spacing: 0.05em;
+}
+#loading.hidden { display: none; }
+
+#viewport-status {
+  position: absolute;
+  bottom: 10px;
+  left: 10px;
+  font-size: 11px;
+  color: #52525b;
+  pointer-events: none;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 3px; }
+</style>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+
+<body>
+<!-- ===== Sidebar ===== -->
+<aside id="sidebar">
+  <div class="sidebar-header">Part Viewer</div>
+
+  <div class="section">
+    <div class="section-title">Part</div>
+    <select id="partSelect"><option value="">— loading —</option></select>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Display</div>
+    <label class="check-row"><input type="checkbox" id="chkFilled" checked> Filled mesh</label>
+    <label class="check-row"><input type="checkbox" id="chkOriginal"> Original mesh</label>
+    <label class="check-row"><input type="checkbox" id="chkEdges" checked> Edges (wireframe)</label>
+    <label class="check-row"><input type="checkbox" id="chkAnnotations" checked> Holes</label>
+    <div class="slider-row">
+      <div class="slider-label">
+        <span>Edge angle</span>
+        <span><span id="edgeAngleVal">10</span>°</span>
+      </div>
+      <input type="range" id="edgeAngle" min="1" max="89" value="10">
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Part Info</div>
+    <div id="partMeta">—</div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Mesh Info</div>
+    <div id="meshInfo">—</div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Holes</div>
+    <div id="holesList">—</div>
+  </div>
+
+  <div class="section">
+    <button class="btn" id="screenshotBtn">Screenshot</button>
+    <button class="btn btn-secondary" id="resetCameraBtn">Reset Camera</button>
+  </div>
+
+  <div id="status-sidebar"></div>
+</aside>
+
+<!-- ===== 3D Viewport ===== -->
+<main id="viewport">
+  <div id="loading">Loading...</div>
+  <div id="viewport-status">Drag to rotate · Scroll to zoom · Right-drag to pan</div>
+</main>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ===== Scene Setup =====
+const viewport = document.getElementById('viewport');
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.shadowMap.enabled = false;
+renderer.setClearColor(0x111116);
+viewport.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 1e7);
+camera.position.set(0, 0, 3000);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.screenSpacePanning = true;
+
+// Lights
+const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+scene.add(ambient);
+const dir1 = new THREE.DirectionalLight(0xffffff, 0.8);
+dir1.position.set(1, 2, 3);
+scene.add(dir1);
+const dir2 = new THREE.DirectionalLight(0x8888cc, 0.4);
+dir2.position.set(-2, -1, -1);
+scene.add(dir2);
+
+// Groups
+const groups = {
+  filled: new THREE.Group(),
+  original: new THREE.Group(),
+  edges: new THREE.Group(),
+  annotations: new THREE.Group(),
+};
+Object.values(groups).forEach(g => scene.add(g));
+
+// ===== Materials =====
+const MAT = {
+  filled: new THREE.MeshPhongMaterial({
+    color: 0x4a7ab5,
+    specular: 0x224488,
+    shininess: 40,
+    side: THREE.DoubleSide,
+  }),
+  original: new THREE.MeshPhongMaterial({
+    color: 0x7a8a96,
+    specular: 0x334455,
+    shininess: 20,
+    side: THREE.DoubleSide,
+    transparent: true,
+    opacity: 0.55,
+    depthWrite: false,
+  }),
+  edgeLine: new THREE.LineBasicMaterial({ color: 0x1a2a3a }),
+  holeFilled: new THREE.MeshPhongMaterial({ color: 0x22c55e, emissive: 0x0a3a18, shininess: 60 }),
+  holeOpen: new THREE.MeshPhongMaterial({ color: 0xef4444, emissive: 0x3a0a0a, shininess: 60 }),
+  holeSkipped: new THREE.MeshPhongMaterial({ color: 0xa78bfa, emissive: 0x1a0a3a, shininess: 60 }),
+  normalArrow: new THREE.LineBasicMaterial({ color: 0xfbbf24 }),
+};
+
+// ===== State =====
+let currentPart = null;
+let currentHolesData = null;
+let currentMeshInfo = { filled: null, original: null };
+let edgeAngle = 10;
+
+// ===== Resize =====
+function resize() {
+  const w = viewport.clientWidth;
+  const h = viewport.clientHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+resize();
+new ResizeObserver(resize).observe(viewport);
+
+// ===== Animate =====
+(function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+})();
+
+// ===== Helpers =====
+function setStatus(msg) {
+  document.getElementById('status-sidebar').textContent = msg;
+}
+
+function showLoading(show) {
+  document.getElementById('loading').classList.toggle('hidden', !show);
+}
+
+function clearGroup(g) {
+  while (g.children.length) {
+    const c = g.children[0];
+    if (c.geometry) c.geometry.dispose();
+    if (c.material) c.material.dispose();
+    g.remove(c);
+  }
+}
+
+function buildGeometry(meshData) {
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position',
+    new THREE.Float32BufferAttribute(meshData.vertices, 3));
+  geo.setIndex(new THREE.Uint32BufferAttribute(meshData.indices, 1));
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function buildEdges(geo, angleDeg) {
+  const threshold = angleDeg * Math.PI / 180;
+  const edgesGeo = new THREE.EdgesGeometry(geo, angleDeg);
+  return new THREE.LineSegments(edgesGeo, MAT.edgeLine);
+}
+
+function fitCamera(bounds) {
+  const min = new THREE.Vector3(...bounds.min);
+  const max = new THREE.Vector3(...bounds.max);
+  const center = min.clone().add(max).multiplyScalar(0.5);
+  const size = max.clone().sub(min).length();
+
+  camera.near = size * 0.001;
+  camera.far = size * 20;
+  camera.updateProjectionMatrix();
+  camera.position.copy(center).addScaledVector(new THREE.Vector3(0.5, 0.3, 1).normalize(), size * 1.4);
+  controls.target.copy(center);
+  controls.update();
+}
+
+// ===== Load Mesh =====
+async function loadMesh(partId, type) {
+  const res = await fetch(`/api/mesh?part=${partId}&type=${type}`);
+  if (!res.ok) return null;
+  return await res.json();
+}
+
+async function loadHoles(partId) {
+  const res = await fetch(`/api/holes?part=${partId}`);
+  if (!res.ok) return null;
+  return await res.json();
+}
+
+// ===== Render Layers =====
+function renderFilled(data) {
+  clearGroup(groups.filled);
+  if (!data) return;
+  const geo = buildGeometry(data);
+  groups.filled.add(new THREE.Mesh(geo, MAT.filled));
+  currentMeshInfo.filled = { n_vertices: data.n_vertices, n_faces: data.n_faces };
+}
+
+function renderOriginal(data) {
+  clearGroup(groups.original);
+  if (!data) return;
+  const geo = buildGeometry(data);
+  groups.original.add(new THREE.Mesh(geo, MAT.original));
+  currentMeshInfo.original = { n_vertices: data.n_vertices, n_faces: data.n_faces };
+}
+
+function renderEdges(data) {
+  clearGroup(groups.edges);
+  if (!data) return;
+  const geo = buildGeometry(data);
+  const lines = buildEdges(geo, edgeAngle);
+  groups.edges.add(lines);
+  geo.dispose(); // geo for edges only - the lines keep their own copy
+}
+
+function renderAnnotations(holesData) {
+  clearGroup(groups.annotations);
+  if (!holesData) return;
+
+  const holes = holesData.holes || [];
+  holes.forEach(hole => {
+    const center = hole.center_xyz;
+    const normal = hole.normal_xyz;
+    const r = Math.max((hole.radius_mm || 5) * 0.4, 2);
+
+    // Sphere at hole center
+    let mat;
+    if (hole.status === 'filled') mat = MAT.holeFilled;
+    else if (hole.status === 'skipped') mat = MAT.holeSkipped;
+    else mat = MAT.holeOpen;
+
+    const sphere = new THREE.Mesh(
+      new THREE.SphereGeometry(r, 12, 8),
+      mat.clone()
+    );
+    sphere.position.set(...center);
+    groups.annotations.add(sphere);
+
+    // Normal arrow
+    if (normal) {
+      const dir = new THREE.Vector3(...normal).normalize();
+      const origin = new THREE.Vector3(...center);
+      const len = Math.max(r * 3, 8);
+      const arrow = new THREE.ArrowHelper(dir, origin, len, 0xfbbf24, len * 0.3, len * 0.2);
+      groups.annotations.add(arrow);
+    }
+  });
+}
+
+function updateMeshInfo(filledData) {
+  const el = document.getElementById('meshInfo');
+  if (!filledData) { el.textContent = '—'; return; }
+  el.innerHTML = `
+    Vertices: <span class="val">${filledData.n_vertices.toLocaleString()}</span><br>
+    Faces: <span class="val">${filledData.n_faces.toLocaleString()}</span>
+  `;
+}
+
+function updateHolesList(holesData) {
+  const el = document.getElementById('holesList');
+  if (!holesData || !holesData.holes?.length) { el.textContent = 'なし'; return; }
+
+  const holes = holesData.holes;
+  const n_filled = holes.filter(h => h.status === 'filled').length;
+  const n_open = holes.filter(h => h.status !== 'filled' && h.status !== 'skipped').length;
+  const n_skipped = holes.filter(h => h.status === 'skipped').length;
+
+  let html = `<div style="color:#a1a1aa;font-size:11px;margin-bottom:6px">
+    計 ${holes.length} 穴 — 埋済 <span style="color:#22c55e">${n_filled}</span>
+    ${n_open > 0 ? `/ 未埋 <span style="color:#ef4444">${n_open}</span>` : ''}
+    ${n_skipped > 0 ? `/ スキップ <span style="color:#a78bfa">${n_skipped}</span>` : ''}
+  </div>`;
+
+  holes.forEach(hole => {
+    const dotClass = hole.status === 'filled' ? 'dot-filled'
+                   : hole.status === 'skipped' ? 'dot-skipped'
+                   : 'dot-open';
+    const r = hole.radius_mm ? hole.radius_mm.toFixed(1) : '?';
+    const shape = hole.shape || '?';
+    const circ = hole.circularity != null ? hole.circularity.toFixed(2) : '';
+    html += `
+      <div class="hole-item">
+        <div class="dot ${dotClass}"></div>
+        <span>${hole.hole_id}</span>
+        <span style="color:#52525b">${shape}</span>
+        <span class="hole-meta">r${r} ${circ ? `c${circ}` : ''}</span>
+      </div>`;
+  });
+
+  el.innerHTML = html;
+}
+
+function updatePartMeta(partInfo) {
+  const el = document.getElementById('partMeta');
+  if (!partInfo) { el.textContent = '—'; return; }
+  const t = partInfo.thickness_mm != null ? partInfo.thickness_mm.toFixed(2) + ' mm' : '?';
+  const v = partInfo.volume_mm3 != null ? (partInfo.volume_mm3 / 1000).toFixed(0) + ' cm³' : '?';
+  const name = (partInfo.catia_name || '').split('\\').pop() || '—';
+  el.innerHTML = `
+    Tag: <span class="val">${partInfo.tag || '?'}</span><br>
+    Thickness: <span class="val">${t}</span><br>
+    Volume: <span class="val">${v}</span><br>
+    <span style="color:#52525b;font-size:11px;word-break:break-all">${name}</span>
+  `;
+}
+
+// ===== Load Part =====
+let _partsList = [];
+
+async function loadPart(partId) {
+  if (!partId) return;
+  currentPart = partId;
+  showLoading(true);
+  setStatus(`Loading ${partId}...`);
+
+  try {
+    const chkFilled = document.getElementById('chkFilled').checked;
+    const chkOriginal = document.getElementById('chkOriginal').checked;
+    const chkEdges = document.getElementById('chkEdges').checked;
+    const chkAnnotations = document.getElementById('chkAnnotations').checked;
+
+    // Parallel fetch
+    const [filledData, originalData, holesData] = await Promise.all([
+      loadMesh(partId, 'filled'),
+      chkOriginal ? loadMesh(partId, 'original') : Promise.resolve(null),
+      loadHoles(partId),
+    ]);
+
+    currentHolesData = holesData;
+
+    renderFilled(filledData);
+    renderOriginal(chkOriginal ? originalData : null);
+
+    if (chkEdges && filledData) {
+      renderEdges(filledData);
+    } else {
+      clearGroup(groups.edges);
+    }
+    if (chkAnnotations) {
+      renderAnnotations(holesData);
+    } else {
+      clearGroup(groups.annotations);
+    }
+
+    // Visibility
+    groups.filled.visible = chkFilled;
+    groups.original.visible = chkOriginal;
+    groups.edges.visible = chkEdges;
+    groups.annotations.visible = chkAnnotations;
+
+    // Camera fit
+    if (filledData) fitCamera(filledData.bounds);
+
+    // UI updates
+    updateMeshInfo(filledData);
+    updateHolesList(holesData);
+    const partInfo = _partsList.find(p => p.part_id === partId);
+    updatePartMeta(partInfo || null);
+
+    setStatus(`${partId} loaded`);
+  } catch (e) {
+    setStatus(`Error: ${e.message}`);
+    console.error(e);
+  } finally {
+    showLoading(false);
+  }
+}
+
+// ===== Parts list =====
+async function initPartsList() {
+  try {
+    const res = await fetch('/api/parts');
+    _partsList = await res.json();
+
+    const sel = document.getElementById('partSelect');
+    sel.innerHTML = '';
+    _partsList.forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = p.part_id;
+      const tag = p.tag ? ` [${p.tag}]` : '';
+      const holes = p.n_holes > 0
+        ? ` • ${p.n_filled}/${p.n_holes} holes`
+        : '';
+      opt.textContent = `${p.part_id}${tag}${holes}`;
+      if (!p.has_filled) opt.style.color = '#52525b';
+      sel.appendChild(opt);
+    });
+
+    // Default: first with filled
+    const first = _partsList.find(p => p.has_filled);
+    if (first) {
+      sel.value = first.part_id;
+      loadPart(first.part_id);
+    }
+  } catch (e) {
+    setStatus('Failed to load parts list');
+    console.error(e);
+  }
+}
+
+// ===== UI Events =====
+document.getElementById('partSelect').addEventListener('change', e => {
+  loadPart(e.target.value);
+});
+
+document.getElementById('chkFilled').addEventListener('change', e => {
+  groups.filled.visible = e.target.checked;
+});
+
+document.getElementById('chkOriginal').addEventListener('change', async e => {
+  if (e.target.checked && groups.original.children.length === 0 && currentPart) {
+    showLoading(true);
+    const data = await loadMesh(currentPart, 'original');
+    renderOriginal(data);
+    showLoading(false);
+  }
+  groups.original.visible = e.target.checked;
+});
+
+document.getElementById('chkEdges').addEventListener('change', async e => {
+  if (e.target.checked && groups.edges.children.length === 0 && currentPart) {
+    showLoading(true);
+    const data = await loadMesh(currentPart, 'filled');
+    if (data) renderEdges(data);
+    showLoading(false);
+  }
+  groups.edges.visible = e.target.checked;
+});
+
+document.getElementById('chkAnnotations').addEventListener('change', e => {
+  if (e.target.checked && groups.annotations.children.length === 0) {
+    renderAnnotations(currentHolesData);
+  }
+  groups.annotations.visible = e.target.checked;
+});
+
+// Edge angle slider — debounced rebuild
+let _edgeRebuildTimer = null;
+document.getElementById('edgeAngle').addEventListener('input', e => {
+  edgeAngle = parseInt(e.target.value, 10);
+  document.getElementById('edgeAngleVal').textContent = edgeAngle;
+
+  clearTimeout(_edgeRebuildTimer);
+  _edgeRebuildTimer = setTimeout(async () => {
+    if (!currentPart || !document.getElementById('chkEdges').checked) return;
+    const data = await loadMesh(currentPart, 'filled');
+    if (data) renderEdges(data);
+  }, 300);
+});
+
+document.getElementById('resetCameraBtn').addEventListener('click', () => {
+  // Refit camera to filled mesh bounds
+  const child = groups.filled.children[0];
+  if (child?.geometry?.boundingBox) {
+    child.geometry.computeBoundingBox();
+    const bb = child.geometry.boundingBox;
+    const bounds = {
+      min: bb.min.toArray(),
+      max: bb.max.toArray(),
+    };
+    fitCamera(bounds);
+  } else if (currentPart) {
+    loadMesh(currentPart, 'filled').then(data => { if (data) fitCamera(data.bounds); });
+  }
+});
+
+// ===== Screenshot =====
+document.getElementById('screenshotBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('screenshotBtn');
+  btn.disabled = true;
+  btn.textContent = 'Saving...';
+
+  try {
+    renderer.render(scene, camera);
+    const image = renderer.domElement.toDataURL('image/png');
+
+    const payload = {
+      image,
+      part_id: currentPart,
+      camera: {
+        position: camera.position.toArray(),
+        target: controls.target.toArray(),
+        fov: camera.fov,
+      },
+      display_state: {
+        filled: document.getElementById('chkFilled').checked,
+        original: document.getElementById('chkOriginal').checked,
+        edges: document.getElementById('chkEdges').checked,
+        annotations: document.getElementById('chkAnnotations').checked,
+        edge_angle: edgeAngle,
+      },
+      mesh_info: currentMeshInfo.filled,
+      holes_data: currentHolesData,
+    };
+
+    const res = await fetch('/api/screenshot', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const result = await res.json();
+    setStatus(`Saved: ${result.png.split('\\').pop()}`);
+  } catch (e) {
+    setStatus(`Screenshot error: ${e.message}`);
+    console.error(e);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Screenshot';
+  }
+});
+
+// ===== Init =====
+initPartsList();
+</script>
+</body>
+</html>

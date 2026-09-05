@@ -1,0 +1,24 @@
+flowchart TB
+  subgraph IN["入力(毎ステップ)"]
+    X["x_t: 途中状態のテンソル<br/>48スロット × 12ch"]
+    T["時刻 t ∈ [0,1]"]
+    CO["条件行<br/>締結点ごと1行 + 尺度 + spec"]
+    FX["ガード円板<br/>16行(座面点+法線)"]
+  end
+  X --> L1["Linear 12→256"] --> PE["+ ring_pe<br/>(周期的位置エンコード)"]
+  T --> TE["正弦時刻埋め込み → MLP"] --> C["時刻ベクトル c<br/>(全ブロックのゲートに)"]
+  CO --> L2["Linear 8→256"] --> MEM["memory<br/>= 条件行 ∪ 円板行"]
+  FX --> L3["Linear 6→256"] --> MEM
+  PE --> B1
+  subgraph BLK["Block × 8(AdaLN-Zero)"]
+    B1["LayerNorm × (1+γ)"] --> SA["相対注意 self-attention<br/>バイアス = 周期オフセット / 距離RBF /<br/>辺の平行度 / 弦の前後 (学習)"]
+    SA --> CA["cross-attention → memory<br/>締結点が入る唯一の経路"]
+    CA --> ML["MLP 256→1024→256"]
+  end
+  C -.ゲート.-> BLK
+  MEM --> CA
+  X -.現在の角座標と辺の向き.-> SA
+  ML --> HN["LayerNorm → Linear 256→12"]
+  HN --> V["速度 v: 48 × 12<br/>= 各スロットをどちらへ動かすか"]
+  style V fill:#fdebd0
+  style SA fill:#e8f0fe

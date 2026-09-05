@@ -1,0 +1,9 @@
+[project]
+name = "cae_mesh_generator"
+version = "0.1.0"
+description = "Prototype CAE-ready sheet-metal midsurface mesh generator"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

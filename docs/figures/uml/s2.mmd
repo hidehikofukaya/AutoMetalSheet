@@ -1,0 +1,14 @@
+flowchart LR
+  subgraph 学習の1ステップ
+    X1["教師テンソル x1<br/>(外形の正解)"] --> XT
+    X0["ノイズ x0 ~ N(0,1)"] --> XT["x_t = (1-t)·x0 + t·x1"]
+    TT["t ~ U(0,1)"] --> XT
+    XT --> M["StageFlow"] --> V["予測 v"]
+    X1 --> U["目標 u = x1 - x0<br/>(直線の流れ)"]
+    X0 --> U
+    V --> L["損失 = 重み付き MSE(v, u)<br/>角1.0 / 膨らみ0.2 / フラグ0.5 / 法線0.2 / G1 0.5"]
+    U --> L
+    D["10%の確率で memory を落とす<br/>(無条件枝を学ぶ = CFG用)"] -.-> M
+  end
+  L --> O["AdamW + コサイン減衰<br/>(+ EMA重み)"]
+  style L fill:#fdebd0

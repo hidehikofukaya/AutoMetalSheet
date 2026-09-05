@@ -1,0 +1,22 @@
+[
+ {
+  "tag": "frame_occt_all_ema",
+  "stage": "outline_frame",
+  "epochs": 1200,
+  "seed": 0,
+  "parts": 3650,
+  "batch": 16,
+  "rel": 1,
+  "probe_every": 30,
+  "hours": 10,
+  "extra": [
+   "--train-filter",
+   "^o1",
+   "--ema",
+   "0.999"
+  ],
+  "env": {
+   "WTOK_EDGE_SLOTS": "48"
+  }
+ }
+]
