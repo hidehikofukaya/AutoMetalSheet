@@ -1411,6 +1411,7 @@ def train(args):
         print(f"relational loss: D1 {W_D1}  D2 {W_D2}", flush=True)
     ds.chain_noise = float(getattr(args, "desc_noise", 0.0))
     ds.set_target = bool(getattr(args, "set_target", False))
+    ds.set_k = int(getattr(args, "set_k", 2))
     if ds.set_target:
         from .dataset_curve import CurvePart
         vdir = pathlib.Path(args.wtok) / "variants"
@@ -1580,6 +1581,9 @@ def main():
     ap.add_argument("--train-filter", default="",
                     help="regex on part names for the TRAINING pool (e.g. '^o1' = the "
                          "OCCT families). Val parts come from --val-list regardless")
+    ap.add_argument("--set-k", type=int, default=2,
+                    help="capacity of the target set per item (teacher + variants; padded by repeating the teacher). "
+                         "PartMaker now emits 5-7 variants per part, so 8")
     ap.add_argument("--set-target", action="store_true",
                     help="outline_frame: the loss target is chosen per sample from the part's "
                          "design-equivalent variants (runs/<wtok>/variants, roadmap 6.4)")
