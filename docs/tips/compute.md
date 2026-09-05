@@ -493,3 +493,8 @@ wtok だけで自己完結)。`convert.py` は constants を re-export するの
 
 コード zip 数十KB / データ zip **4.2 MB**(2,300部品 JSON、非圧縮27MB)。
 Kaggle Dataset の容量制限に対して余裕。チャンク追加時も再アップは数秒。
+
+## 2FA の注意(2026-09-05 追記)
+`!` プレフィックスでユーザーが実行した `vastai tfa login` は、Claude 側のシェルのセッションキーには反映されなかった
+(別環境で実行されるため)。手順: Claude が `vastai tfa send-sms` を実行して Secret を提示 → ユーザーは**コードの数字だけ**
+を返信 → Claude が自分のシェルで `tfa login` と `destroy` を続けて実行する。コードは 2〜3 分で失効する。
