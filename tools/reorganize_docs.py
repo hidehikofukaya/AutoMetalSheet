@@ -80,7 +80,10 @@ def main():
         out = D / new; out.parent.mkdir(parents=True, exist_ok=True)
         parts = [f"# {title}\n\n> 統合日 2026-09-05。以下は元文書を順に**そのまま**収録(見出し番号は元のまま。`KB 21.24` のような参照はこのファイル内を検索)。\n> 収録元: " + ", ".join(f"`{s.relative_to(D)}`" for s in srcs) + "\n"]
         for s in srcs:
-            body = s.read_text(encoding="utf-8")
+            try:
+                body = s.read_text(encoding="utf-8")
+            except UnicodeDecodeError:          # a few early docs were saved as cp932
+                body = s.read_text(encoding="cp932", errors="replace")
             parts.append(f"\n\n---\n\n<!-- 元文書: {s.relative_to(D)} -->\n\n" + body)
         out.write_text("".join(parts), encoding="utf-8")
         for s in srcs:
