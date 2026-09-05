@@ -724,3 +724,9 @@ Date: 2026-09-01
 **回答**: occt11/12/13 で各 100 部品 × 3 摂動(`<chunk>/perturb/`、json に moved_from/to、joints、faces changed/unchanged/added/removed)。
 occt15/16(011/014 型)は掃引アンカーが仮想点で実点を動かしても面が変わらないため**未対応**(アンカー再導出の逆問題が要る)。
 「1 点追加」も同理由で未着手。
+
+**受領数(ML 側で集計、2026-09-06)**: バリアント **21,083 成立 / 76 不成立**(1 部品あたり中央値 5〜7、occt11 は 375 部品・occt16 は
+150 部品が対象で部分適用)。knob の内訳: 2 曲げ = slack 721 / width 610 / bead 482 / フランジ 632、リブ族 = rib 1740 / width 1625、
+3 点族 = side・height・root_r・width、平板 = margin 1045 / corner_r 854、分岐 = arm_len 1800 / corner_r 1228、チャンネル = length 1619 /
+seat_depth 1478。摂動ペア 898(occt11 298、occt12 300、occt13 300)、変化面の差分ラベル付き。
+ML 側の取り込み(`tools/ingest_variants.py`)を開始。次の外形学習はこの集合で集合値教師を回す。
