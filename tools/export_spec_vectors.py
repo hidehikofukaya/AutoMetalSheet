@@ -35,6 +35,13 @@ def main():
         else:
             table[p.name] = [float(v) for v in s]
     out = pathlib.Path(a.wtok) / "spec_vectors.json"
+    # MERGE with the existing table: the CATIA families' PartMaker sources were deleted
+    # on 2026-09-04, so their spec can only come from the table already on disk
+    if out.exists():
+        old = json.loads(out.read_text()).get("spec", {})
+        kept = {k: v for k, v in old.items() if k not in table}
+        table = {**kept, **table}
+        print(f"kept {len(kept)} entries from the existing table")
     out.write_text(json.dumps({"keys": list(SPEC_KEYS), "spec": table}))
     print(f"{out}: {len(table)} parts with spec, {len(missing)} without"
           + (f" (e.g. {missing[:3]})" if missing else ""))

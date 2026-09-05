@@ -1,0 +1,44 @@
+[
+ {
+  "tag": "frame7_settarget_ema_s0",
+  "stage": "outline_frame",
+  "epochs": 1800,
+  "seed": 0,
+  "parts": 5160,
+  "batch": 16,
+  "rel": 1,
+  "probe_every": 30,
+  "hours": 9,
+  "extra": [
+   "--train-filter",
+   "^o1",
+   "--ema",
+   "0.999",
+   "--set-target"
+  ],
+  "env": {
+   "WTOK_EDGE_SLOTS": "48"
+  }
+ },
+ {
+  "tag": "frame7_settarget_ema_s1",
+  "stage": "outline_frame",
+  "epochs": 1800,
+  "seed": 1,
+  "parts": 5160,
+  "batch": 16,
+  "rel": 1,
+  "probe_every": 30,
+  "hours": 9,
+  "extra": [
+   "--train-filter",
+   "^o1",
+   "--ema",
+   "0.999",
+   "--set-target"
+  ],
+  "env": {
+   "WTOK_EDGE_SLOTS": "48"
+  }
+ }
+]
