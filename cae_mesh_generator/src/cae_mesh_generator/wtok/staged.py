@@ -494,6 +494,18 @@ class StageDataset(Dataset):
             x = r2b[cj]                    # always closed: a face boundary
         else:
             x = self._target(p, self.stage, self.n_pts, rng)
+        # KB roadmap 6.4: SET-VALUED target. The fastening points do not decide
+        # every design choice (flange side); PartMaker regenerates the part with
+        # the free choice flipped and each variant is an equally valid answer.
+        # All variants of this part travel with the item; flow_loss picks one.
+        x_set = None
+        if getattr(self, "set_target", False) and x is not None and self.stage == "outline_frame":
+            alts = [self._target(v, self.stage, self.n_pts, rng) for v in getattr(self, "variants", {}).get(p.name, [])]
+            alts = [a_ for a_ in alts if a_ is not None]
+            k_max = getattr(self, "set_k", 2)
+            cand = ([x] + alts)[:k_max]
+            cand = cand + [cand[0]] * (k_max - len(cand))      # pad by repeating the teacher
+            x_set = np.stack(cand).astype(np.float32)
         if x is None:                                  # no curve of this class
             x = np.zeros((self.n_pts, ch))
             x[:, -1] = 1.0                             # every slot unused
@@ -643,6 +655,7 @@ class StageDataset(Dataset):
             out = {
                 "x": torch.from_numpy(np.ascontiguousarray(ctx if False else
                                                            x.astype(np.float32))),
+                **({"x_set": torch.from_numpy(x_set)} if x_set is not None else {}),
                 "ctx": torch.from_numpy(np.ascontiguousarray(ctx)),
                 "n_ctx": n_ctx,
                 "cond": torch.from_numpy(cond),
@@ -1073,6 +1086,16 @@ def flow_loss(model, batch, p_drop: float = 0.0, n_pin: int = 0):
             w = base + [.5] * max(0, x1.shape[-1] - len(base))
         W_CH = torch.tensor(w[:x1.shape[-1]], device=x1.device)
     x0 = torch.randn_like(x1)
+    if "x_set" in batch:
+        # set-valued target (roadmap 6.4, step 1): among the design-equivalent
+        # variants pick, per sample, the one nearest to the noise it is paired
+        # with -- the minibatch-OT pairing rule, so the choice uses nothing
+        # learned and is stable from the first step. The model then commits to
+        # one valid design instead of averaging two.
+        xs = batch["x_set"]                              # (B, K, N, C)
+        d = (((xs - x0[:, None]) ** 2) * W_CH).sum((-1, -2))   # (B, K)
+        k = d.argmin(1)
+        x1 = xs[torch.arange(B, device=x1.device), k]
     t = torch.rand(B, device=x1.device)
     xt = (1 - t[:, None, None]) * x0 + t[:, None, None] * x1
     if n_pin:
@@ -1387,6 +1410,18 @@ def train(args):
     if W_D1 or W_D2:
         print(f"relational loss: D1 {W_D1}  D2 {W_D2}", flush=True)
     ds.chain_noise = float(getattr(args, "desc_noise", 0.0))
+    ds.set_target = bool(getattr(args, "set_target", False))
+    if ds.set_target:
+        from .dataset_curve import CurvePart
+        vdir = pathlib.Path(args.wtok) / "variants"
+        variants = {}
+        for f in sorted(vdir.glob("*.json")):
+            base = "__".join(f.stem.split("__")[:2])       # tag__id__side-1 -> tag__id
+            variants.setdefault(base, []).append(CurvePart(f))
+        ds.variants = variants
+        n_with = sum(1 for q in train_parts if q.name in variants)
+        print(f"set-valued target: {len(variants)} parts have variants ({sum(len(v) for v in variants.values())} files); "
+              f"{n_with}/{len(train_parts)} training parts covered", flush=True)
     ds.sib_ctx = bool(getattr(args, "sib_ctx", False))
     ds.cloud_drop = args.cloud_drop
     ds.surf_curv = bool(args.surf_curv)
@@ -1545,6 +1580,9 @@ def main():
     ap.add_argument("--train-filter", default="",
                     help="regex on part names for the TRAINING pool (e.g. '^o1' = the "
                          "OCCT families). Val parts come from --val-list regardless")
+    ap.add_argument("--set-target", action="store_true",
+                    help="outline_frame: the loss target is chosen per sample from the part's "
+                         "design-equivalent variants (runs/<wtok>/variants, roadmap 6.4)")
     ap.add_argument("--ema", type=float, default=0.0,
                     help="EMA decay of the weights for probing/saving (0 = off; "
                          "0.999 is the usual value at ~230 steps/epoch)")

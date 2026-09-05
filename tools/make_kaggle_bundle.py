@@ -136,6 +136,9 @@ def main() -> None:
     ct = data / "chain_targets"
     if ct.exists():
         files += [(f, f"chain_targets/{f.name}") for f in sorted(ct.glob("*.npz"))]
+    vr = data / "variants"                       # design-equivalent targets (roadmap 6.4)
+    if vr.exists():
+        files += [(f, f"variants/{f.name}") for f in sorted(vr.glob("*.json"))]
     fc = data / "face_targets"
     if fc.exists():
         files += [(f, f"face_targets/{f.name}") for f in sorted(fc.glob("*.npz"))]
