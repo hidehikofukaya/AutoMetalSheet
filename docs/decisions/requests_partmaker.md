@@ -704,3 +704,23 @@ Date: 2026-09-01
 
 推定の「面あたり約7本」は過大だった(実測4)。**2bリングは外形(16辺)よりさらに
 小さい**ことが確定。FACE_SLOTS=112 / FRING_SLOTS=16 は据え置きで十分。
+
+---
+
+<!-- 元文書: PartMaker/docs/REQUEST_variants_2026-09-06.md と REPLY_variants_2026-09-06.md の要約 -->
+
+# 依頼・回答: 設計等価バリアントの拡張と締結点摂動ペア(2026-09-06)
+
+**依頼 A(バリアント拡張)**: 締結点・座面半径・板厚・曲げRを固定し、生成器が自由に選べる knob を振った部品を 1 部品 4〜12 個。
+**回答**: 実装済み(`tools/emit_variants.py` 置換、`synthetic_generator/variants.py`)、全 8 チャンク 5400 部品に適用。
+- 自由度の棚卸し(族ごと): 2 曲げ = slack(折り位置)/width/bead/side・height・root_r、1 曲げ族 = width/bead/フランジ/rib(折り位置は
+  2 点と法線の交線で一意 → 振れない)、平板 = margin/corner_r、分岐 = corner_r/arm_len、チャンネル = length/seat_depth。
+  「締結点が動く選択」(折れ角、ハブ形、座面の側)は別入力の部品になるので不可
+- 契約: `<chunk>/variants/<part_id>__<knob>=<value>_mid.stp` + `variants/params/`・`variants/features/`(面ラベル付き)・`manifest.json`
+  (knob/value/changed/status)。連続量は分位点 15/50/85%、離散は反転、断面はサンプラーで引き直し。1 部品最大 8
+- 暫定ツールの `__side±1` は残置(同設計、削除可)
+
+**依頼 B(締結点摂動ペア)**: 締結点 1 つを面内で座面半径の 0.5〜2 倍動かして再生成し、変化面の差分を記録。
+**回答**: occt11/12/13 で各 100 部品 × 3 摂動(`<chunk>/perturb/`、json に moved_from/to、joints、faces changed/unchanged/added/removed)。
+occt15/16(011/014 型)は掃引アンカーが仮想点で実点を動かしても面が変わらないため**未対応**(アンカー再導出の逆問題が要る)。
+「1 点追加」も同理由で未着手。
