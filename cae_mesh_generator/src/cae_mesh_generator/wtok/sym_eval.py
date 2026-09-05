@@ -117,6 +117,7 @@ def main():
     ap.add_argument("--steps", type=int, default=24)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", default="")
+    ap.add_argument("--picture", default="", help="write an overlay PNG: grey teacher, blue best-matching reference, red generation")
     ap.add_argument("--variants", action="store_true",
                     help="also accept PartMaker design-equivalent variants (<chunk>/variants/<id>__*.stp, "
                          "flange side flipped) as references: min over {teacher, variants} x symmetry")
@@ -126,6 +127,7 @@ def main():
     names = set(json.load(open(wtok / a.val_list)))
     parts = [p for p in load_curve_parts(wtok) if p.name in names][: a.parts]
     rows = []
+    panels = []
     for p in parts:
         fr, cond, fix = part_inputs(p, targs.get("use_spec", False), a.device)
         xt = frame_target(p, fr)
@@ -145,7 +147,8 @@ def main():
             x = sample(model, cond, fix, None, EDGE_SLOTS, a.steps, targs.get("cfg_scale", 1.0), gen=g, constrain=con)
             draws.append(seat_edge_project(despike(x[0].cpu().numpy().astype(np.float64), t / u), fr, P, A, r))
         order, _ = rank(draws, fr, P, r, t)
-        gen = dens(realize_frame(draws[order[0]], 60), 1.0 / u)      # 1 mm spacing (habit A1)
+        gens_all = [dens(realize_frame(d_, 60), 1.0 / u) for d_ in draws]
+        gen = gens_all[order[0]]                                    # 1 mm spacing (habit A1)
         ref = dens(realize_frame(xt, 60), 1.0 / u)
         refs = [("teacher", ref)]
         if a.variants:
@@ -161,13 +164,21 @@ def main():
                 if best is None or d < best[0]:
                     best = (d, g, refg)
                     best_ref = label
+        # coverage of the design alternatives by the K candidates (roadmap 6.4: the
+        # set-valued teacher must not collapse onto one alternative)
+        cover = {}
+        for label, rf in refs:
+            trees = [cKDTree(rf @ g.T) for g in G]
+            cover[label] = int(sum(min(u * near(gd, tr) for tr in trees) < 3.0 for gd in gens_all))
         d_plain = u * near(gen, cKDTree(ref))
         tree = cKDTree(best[2])
         aligned, tmag, ang = icp_rigid(gen, tree, best[2])
         d_shape = u * near(aligned, tree)
+        if len(panels) < 12:
+            panels.append((p.name, ref * u, best[2] * u, gen * u, best_ref, best[0], d_plain))
         rows.append({"part": p.name, "near": d_plain, "near_sym": best[0], "near_shape": d_shape,
                      "n_sym": len(G), "sym_used": bool(not np.allclose(best[1], np.eye(3))),
-                     "n_refs": len(refs), "ref_used": best_ref,
+                     "n_refs": len(refs), "ref_used": best_ref, "cover": cover,
                      "align_t_mm": u * tmag, "align_deg": ang})
     med = lambda k: float(np.median([r[k] for r in rows]))
     print(f"ckpt {a.ckpt} ep {ep}  {len(rows)} parts  K={K_DRAWS}")
@@ -175,12 +186,39 @@ def main():
     print(f"{'near_sym (input symmetry)':<26}{med('near_sym'):>8.2f} mm   |G| median {med('n_sym'):.0f}; non-identity map won on {100*np.mean([r['sym_used'] for r in rows]):.0f}% of parts")
     if a.variants:
         print(f"{'design variants':<26}  refs/part median {med('n_refs'):.0f}; a variant won on {100*np.mean([r['ref_used'] != 'teacher' for r in rows]):.0f}% of parts")
+        multi = [r for r in rows if len(r["cover"]) > 1]
+        if multi:
+            both = np.mean([sum(v > 0 for v in r["cover"].values()) >= 2 for r in multi])
+            only_var = np.mean([r["cover"].get("teacher", 0) == 0 and any(v > 0 for k_, v in r["cover"].items() if k_ != "teacher") for r in multi])
+            print(f"{'candidate coverage':<26}  parts with >=2 alternatives: {len(multi)}; K draws cover BOTH teacher and a variant on {100*both:.0f}%, only a variant on {100*only_var:.0f}%")
     print(f"{'near_shape (rigid-aligned)':<26}{med('near_shape'):>8.2f} mm   alignment median |t| {med('align_t_mm'):.1f} mm, rot {med('align_deg'):.1f} deg")
     for thr in (2.0, 3.0):
         print(f"parts with near_sym < {thr}mm: {100*np.mean([r['near_sym'] < thr for r in rows]):.0f}%   (plain: {100*np.mean([r['near'] < thr for r in rows]):.0f}%, shape-only: {100*np.mean([r['near_shape'] < thr for r in rows]):.0f}%)")
     if a.out:
         pathlib.Path(a.out).parent.mkdir(parents=True, exist_ok=True)
         pathlib.Path(a.out).write_text(json.dumps(rows, indent=1))
+    if a.picture and panels:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        n = len(panels)
+        fig = plt.figure(figsize=(3.4 * 4, 3.2 * ((n + 3) // 4)))
+        for i, (name, teach, bestref, gen, label, d_sym, d_plain) in enumerate(panels):
+            ax = fig.add_subplot((n + 3) // 4, 4, i + 1, projection="3d")
+            # every point is drawn (habit C: draw all points, same weight for teacher and generation)
+            ax.scatter(teach[:, 0], teach[:, 1], teach[:, 2], s=0.6, c="0.75", depthshade=False)
+            if label != "teacher" or d_sym < d_plain - 1e-6:
+                ax.scatter(bestref[:, 0], bestref[:, 1], bestref[:, 2], s=0.6, c="tab:blue", depthshade=False)
+            ax.scatter(gen[:, 0], gen[:, 1], gen[:, 2], s=0.6, c="tab:red", depthshade=False)
+            ax.view_init(elev=28, azim=-55)
+            tag = "teacher" if label == "teacher" else ("variant" if "side" in label else label)
+            ax.set_title(f"{name[-4:]}  plain {d_plain:.1f} -> {d_sym:.1f}mm ({tag})", fontsize=7)
+            ax.set_axis_off()
+        fig.suptitle("grey = teacher as given | blue = best design-equivalent reference (variant / mirror) | red = generated (ranked pick)", fontsize=8)
+        fig.tight_layout()
+        pathlib.Path(a.picture).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(a.picture, dpi=150)
+        print(f"picture -> {a.picture}")
 
 
 if __name__ == "__main__":
