@@ -9,7 +9,7 @@ LIMIT=${LIMIT:-4807}
 echo "=== 1 build_synthetic (limit $LIMIT)"
 python -m cae_mesh_generator.wtok.build_synthetic --output-dir runs/wtok_synth_g1 --limit "$LIMIT" 2>&1 | grep -vE "Warning|^\s*$" | tail -15
 echo "=== 2 copy v4.5 wireframes"
-cp runs/wtok_synth_g1/wireframes/o1*.json runs/wtok_synth_v45/wireframes/ && echo "v45 now holds $(ls runs/wtok_synth_v45/wireframes | grep -c '^o1') occt wireframes"
+cp runs/wtok_synth_g1/wireframes/o*.json runs/wtok_synth_v45/wireframes/ && echo "v45 now holds $(ls runs/wtok_synth_v45/wireframes | grep -c '^o1') occt wireframes"
 echo "=== 3 mesh npz"
 python tools/build_mesh_dataset.py --wtok runs/wtok_synth_g1 --out runs/mesh_synth 2>&1 | tail -2
 echo "=== 4 face cache"
