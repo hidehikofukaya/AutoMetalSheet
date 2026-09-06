@@ -290,3 +290,10 @@ occt13 2.65 → 1.77mm。**「描けない 57%」「長期学習で未見族が�
   新 3 族の変種は PartMaker への依頼 A 待ち
 - 事故: スペック表の再エクスポートが CATIA 族を再び落とした(原本消失のため)→ `export_spec_vectors.py` を**既存表と併合**する
   仕様に変更(バックアップ `spec_vectors_backup_8207.json`)
+
+### 6.9 決定: CATIA 由来コーパス(2807 部品)を退役・削除(2026-09-06、ユーザー)
+
+理由: 学習は既に OCCT 族のみ(`--train-filter ^o1`)、教師品質(板厚未満辺 8.9%、ゴミ辺、B-spline 72%)、原本消失。
+`tools/retire_catia.py --apply` で `runs/catia_archive/` に移した後、整合(OCCT 6000 部品、CATIA タグ 0)を確認して**削除**。
+CATIA 用 val リスト(val_names_100/130/190、val_flange_30)も削除。取り込みコードから CATIA の族対応を除去。
+データは以後 PartMaker OCCT 族のみ(9 族 6000 部品、600 部品ずつ増える)。過去の CATIA 数値(knowledge/03〜07)は記録として残す。

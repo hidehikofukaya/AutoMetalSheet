@@ -230,7 +230,7 @@ def main():
     ap.add_argument("--outline", default="runs/frame_g1sm2/best.pt")
     ap.add_argument("--wtok", default="runs/wtok_synth_g1")
     ap.add_argument("--parts", type=int, default=30)
-    ap.add_argument("--val-list", default="val_names_100.json",
+    ap.add_argument("--val-list", default="val_occt_60.json",
                     help="name list under --wtok (val_flange_30.json = flange holdout)")
     ap.add_argument("--ring-k", type=int, default=1)
     ap.add_argument("--ring-despike", action="store_true")

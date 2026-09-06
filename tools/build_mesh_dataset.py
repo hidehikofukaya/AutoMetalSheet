@@ -37,14 +37,6 @@ SYN = pathlib.Path(r"C:\Users\hide2\IdeaBox\PartMaker\synthetic_parts")
 def source_dir(tag: str) -> pathlib.Path | None:
     """Part ids repeat across chunks -- the group tag, not the stem, picks the
     directory. Globbing the bare stem silently returns a different part."""
-    if tag == "batch02":
-        return SYN / "batch02"
-    if tag.startswith("p2c"):
-        return SYN / "prod02" / f"chunk_{int(tag[3:]):02d}"
-    if tag.startswith("c") and tag[1:].isdigit():
-        return SYN / "prod01" / f"chunk_{int(tag[1:]):02d}"
-    if tag.startswith("f") and tag[1:].isdigit():          # flange01 (2026-09-03)
-        return SYN / "flange01" / f"chunk_{int(tag[1:]):02d}"
     if tag.startswith("o") and "c" in tag:                 # occt11/occt12 (2026-09-04)
         fam, chunk = tag[1:].split("c")
         return SYN / f"occt{fam}" / f"chunk_{int(chunk):02d}"

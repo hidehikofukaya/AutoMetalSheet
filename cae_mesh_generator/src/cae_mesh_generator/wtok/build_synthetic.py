@@ -36,23 +36,12 @@ from .build_dataset import chamfer, source_scope_points  # noqa: E402
 SYNTH_BASE = pathlib.Path("C:/Users/hide2/IdeaBox/PartMaker/synthetic_parts")
 # (group_dir, tag). prod02/chunk_03 is still being generated -- do not add
 # it until the user confirms it is complete.
-GROUPS = ([("batch02", "batch02")]
-          + [(f"prod01/chunk_0{i}", f"c0{i}") for i in range(1, 7)]
-          + [("prod02/chunk_01", "p2c01"), ("prod02/chunk_02", "p2c02"),
-             ("prod02/chunk_03", "p2c03"), ("prod02/chunk_04", "p2c04")]
-          # flange01: a NEW part family (507 parts, 2026-09-03) -- the first
-          # data beyond the two-point bead family the whole project trained on
-          + [(f"flange01/chunk_0{i}", f"f0{i}") for i in range(1, 8)]
-          # occt11/occt12 (2026-09-04): PartMaker's OCCT backend (STEP-native,
-          # no CATIA). occt11 = bead/flange with 0-2 folds, occt12 = rib/plain
-          # with 0-1 folds -- the first parts with fewer than 2 folds
-          + [("occt11/chunk_01", "o11c01"), ("occt12/chunk_01", "o12c01")]
-          # occt13/15/16 (2026-09-04 夜): the first THREE-fastener families
-          # (three_point / three_point_tri / three_point_span, 600 each)
-          + [("occt13/chunk_01", "o13c01"), ("occt15/chunk_01", "o15c01"), ("occt16/chunk_01", "o16c01")]
-          # occt17/18/19 (2026-09-06): flat_plate (4-6 fasteners), branch (3-8), channel_seat (3-5)
-          + [("occt17/chunk_01", "o17c01"), ("occt18/chunk_01", "o18c01"), ("occt19/chunk_01", "o19c01")]
-          + [("occt20/chunk_01", "o20c01")])    # tab_bracket, 4-5 fasteners (2026-09-06)
+# CATIA-era groups (batch02, prod01 c0*, prod02 p2c*, flange01 f0*) were retired and deleted on
+# 2026-09-06 (user decision): sub-thickness edges, garbage edges, sources gone. OCCT families only.
+GROUPS = ([("occt11/chunk_01", "o11c01"), ("occt12/chunk_01", "o12c01"),
+           ("occt13/chunk_01", "o13c01"), ("occt15/chunk_01", "o15c01"), ("occt16/chunk_01", "o16c01"),
+           ("occt17/chunk_01", "o17c01"), ("occt18/chunk_01", "o18c01"), ("occt19/chunk_01", "o19c01"),
+           ("occt20/chunk_01", "o20c01")])
 
 
 def load_synth_joints(group_dir: pathlib.Path) -> dict[str, list[dict]]:
