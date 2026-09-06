@@ -1,0 +1,42 @@
+[
+ {
+  "tag": "frame_occt_all_ema2400_s0",
+  "stage": "outline_frame",
+  "epochs": 2400,
+  "seed": 0,
+  "parts": 3650,
+  "batch": 16,
+  "rel": 1,
+  "probe_every": 30,
+  "hours": 9,
+  "extra": [
+   "--train-filter",
+   "^o1",
+   "--ema",
+   "0.999"
+  ],
+  "env": {
+   "WTOK_EDGE_SLOTS": "48"
+  }
+ },
+ {
+  "tag": "frame_occt_all_ema2400_s1",
+  "stage": "outline_frame",
+  "epochs": 2400,
+  "seed": 1,
+  "parts": 3650,
+  "batch": 16,
+  "rel": 1,
+  "probe_every": 30,
+  "hours": 9,
+  "extra": [
+   "--train-filter",
+   "^o1",
+   "--ema",
+   "0.999"
+  ],
+  "env": {
+   "WTOK_EDGE_SLOTS": "48"
+  }
+ }
+]

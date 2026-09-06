@@ -51,7 +51,8 @@ GROUPS = ([("batch02", "batch02")]
           # (three_point / three_point_tri / three_point_span, 600 each)
           + [("occt13/chunk_01", "o13c01"), ("occt15/chunk_01", "o15c01"), ("occt16/chunk_01", "o16c01")]
           # occt17/18/19 (2026-09-06): flat_plate (4-6 fasteners), branch (3-8), channel_seat (3-5)
-          + [("occt17/chunk_01", "o17c01"), ("occt18/chunk_01", "o18c01"), ("occt19/chunk_01", "o19c01")])
+          + [("occt17/chunk_01", "o17c01"), ("occt18/chunk_01", "o18c01"), ("occt19/chunk_01", "o19c01")]
+          + [("occt20/chunk_01", "o20c01")])    # tab_bracket, 4-5 fasteners (2026-09-06)
 
 
 def load_synth_joints(group_dir: pathlib.Path) -> dict[str, list[dict]]:
